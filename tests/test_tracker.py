@@ -261,10 +261,54 @@ class SnapshotTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             HealthTracker.from_snapshot({"version": 99, "records": []})
 
+    def test_unversioned_snapshot_is_rejected(self) -> None:
+        """Without a version there is nothing to check the shape against."""
+        with self.assertRaises(ValueError):
+            HealthTracker.from_snapshot({"records": []})
+
+    def test_malformed_snapshot_is_rejected(self) -> None:
+        for payload in (
+            {"version": 2, "records": "nope"},
+            {"version": 2, "records": [["v", "answer", "q1", "nonsense", True]]},
+            {"version": 2, "records": [["v", "answer", "q1", True]]},
+            {"version": 2, "records": [], "weights": {"answer": "heavy"}},
+            {"version": 2, "records": [], "categories": {"v": 3}},
+            {"version": 2, "records": [], "baseline_epoch": 7},
+            {"version": 2, "records": [], "seed": "nope"},
+        ):
+            with self.assertRaises(ValueError):
+                HealthTracker.from_snapshot(payload)
+
     def test_invalid_record_is_rejected(self) -> None:
         tracker = HealthTracker()
         with self.assertRaises(ValueError):
             tracker.observe("", "answer", "q1", True, False)
+
+
+class SideValidationTest(unittest.TestCase):
+    """A side is a real result, a pending ``None`` or :data:`ERROR` — nothing else."""
+
+    def test_non_binary_sides_are_rejected(self) -> None:
+        tracker = HealthTracker(**FAST)
+        for junk in ("yes", "", 1, 0, "pending"):
+            with self.assertRaises(ValueError):
+                tracker.observe("v", "answer", "q1", junk, True)
+            with self.assertRaises(ValueError):
+                tracker.observe("v", "answer", "q1", True, junk)
+        self.assertEqual(len(tracker), 0)
+
+    def test_coverage_agrees_with_every_other_counter(self) -> None:
+        """One record is paired, pending or errored in exactly one place."""
+        tracker = HealthTracker(**FAST)
+        tracker.observe("v", "answer", "q1", False, True)
+        tracker.observe("v", "answer", "q2", False, None)
+        tracker.observe("v", "answer", "q3", False, ERROR)
+        coverage = tracker.coverage()[0]
+        self.assertEqual(coverage.paired, tracker.paired)
+        self.assertEqual(coverage.pending, tracker.pending)
+        self.assertEqual(coverage.errored, tracker.errored)
+        self.assertEqual(coverage.paired, sum(cell.pairs for cell in tracker.cells()))
+        self.assertEqual(coverage.paired + coverage.pending + coverage.errored, len(tracker))
 
 
 class ErroredStateTest(unittest.TestCase):
@@ -385,6 +429,19 @@ class MergeGuardTest(unittest.TestCase):
         other = HealthTracker(weights={"answer": 2.0})
         primary.merge(other, prefer="self")
         self.assertEqual(primary.weights, {"answer": 5.0})
+
+    def test_merge_keeps_a_real_value_over_an_error(self) -> None:
+        primary = HealthTracker(**FAST)
+        primary.observe("v", "answer", "q1", False, ERROR)
+        secondary = HealthTracker(**FAST)
+        secondary.observe("v", "answer", "q1", False, True)
+        primary.merge(secondary)
+        self.assertEqual(primary.errored, 0)
+        self.assertEqual(primary.paired, 1)
+
+    def test_merge_rejects_an_unknown_epoch_policy(self) -> None:
+        with self.assertRaises(ValueError):
+            HealthTracker().merge(HealthTracker(), on_epoch_mismatch="maybe")  # type: ignore[arg-type]
 
 
 if __name__ == "__main__":

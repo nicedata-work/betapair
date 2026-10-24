@@ -69,16 +69,92 @@ CellKey = tuple[str, str]
 Pair = tuple[Side, Side]
 
 
-def _errored(value: Side) -> bool:
+#: One record's state. The single predicate every counter uses, so
+#: ``coverage()``, ``cells()`` and the ``paired``/``pending``/``errored``
+#: properties can never disagree about a record.
+State = Literal["paired", "pending", "errored"]
+
+
+def _errored(value: object) -> bool:
     return isinstance(value, _Errored)
+
+
+def _state(baseline: Side, candidate: Side) -> State:
+    """A record is ``paired`` only when both sides are real results."""
+    if _errored(baseline) or _errored(candidate):
+        return "errored"
+    if baseline is None or candidate is None:
+        return "pending"
+    return "paired"
+
+
+def _check_side(value: object, field: str) -> Side:
+    """Narrow a caller-supplied side, rejecting anything off the type.
+
+    @raise ValueError: If ``value`` is not ``True``, ``False``, ``None`` or
+        :data:`ERROR`.
+    """
+    if value is None or isinstance(value, bool) or _errored(value):
+        return value  # type: ignore[return-value]
+    raise ValueError(f"{field} must be True, False, None or ERROR, got {value!r}")
 
 
 def _serialise_side(value: Side) -> object:
     return "error" if _errored(value) else value
 
 
-def _parse_side(value: object) -> Side:
-    return ERROR if value == "error" else value  # type: ignore[return-value]
+def _parse_side(value: object, field: str = "side") -> Side:
+    if value == "error":
+        return ERROR
+    return _check_side(value, field)
+
+
+def _text_or_none(value: object, field: str) -> str | None:
+    if value is None or isinstance(value, str):
+        return value
+    raise ValueError(f"snapshot {field} must be a string or null, got {value!r}")
+
+
+def _number_mapping(value: object, field: str) -> dict[str, float]:
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError(f"snapshot {field} must be an object, got {value!r}")
+    out: dict[str, float] = {}
+    for name, raw in value.items():
+        if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+            raise ValueError(f"snapshot {field}[{name!r}] must be a number, got {raw!r}")
+        out[str(name)] = float(raw)
+    return out
+
+
+def _string_mapping(value: object, field: str) -> dict[str, str]:
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError(f"snapshot {field} must be an object, got {value!r}")
+    out: dict[str, str] = {}
+    for name, raw in value.items():
+        if not isinstance(raw, str):
+            raise ValueError(f"snapshot {field}[{name!r}] must be a string, got {raw!r}")
+        out[str(name)] = raw
+    return out
+
+
+def _record_rows(value: object) -> list[list[object]]:
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise ValueError(f"snapshot records must be a list, got {value!r}")
+    rows: list[list[object]] = []
+    for raw in value:
+        if not isinstance(raw, list) or len(raw) != 5:
+            raise ValueError(
+                "snapshot records must be [stratum, outcome, item, baseline, candidate], "
+                f"got {raw!r}"
+            )
+        rows.append(list(raw))
+    return rows
 
 
 def _generate_seed() -> int:
@@ -182,7 +258,10 @@ class HealthTracker:
         if not stratum or not outcome or not item:
             raise ValueError("stratum, outcome and item must be non-empty")
         cell = self._records.setdefault((stratum, outcome), {})
-        cell[item] = (baseline, candidate)
+        cell[item] = (
+            _check_side(baseline, "baseline"),
+            _check_side(candidate, "candidate"),
+        )
 
     def set_category(self, stratum: str, category: str | None) -> None:
         """Bind (or clear) the category of one stratum.
@@ -303,57 +382,43 @@ class HealthTracker:
         self.baseline_epoch = baseline_epoch or self.candidate_epoch
         self.candidate_epoch = candidate_epoch
 
-    @property
-    def pending(self) -> int:
-        """Records waiting for an outcome that has not been produced yet."""
+    def _count(self, state: State) -> int:
         return sum(
             1
             for items in self._records.values()
             for baseline, candidate in items.values()
-            if not _errored(baseline)
-            and not _errored(candidate)
-            and (baseline is None or candidate is None)
+            if _state(baseline, candidate) == state
         )
+
+    @property
+    def pending(self) -> int:
+        """Records waiting for an outcome that has not been produced yet."""
+        return self._count("pending")
 
     @property
     def errored(self) -> int:
         """Records where an evaluation failed on either side."""
-        return sum(
-            1
-            for items in self._records.values()
-            for baseline, candidate in items.values()
-            if _errored(baseline) or _errored(candidate)
-        )
+        return self._count("errored")
 
     @property
     def paired(self) -> int:
-        return sum(
-            1
-            for items in self._records.values()
-            for baseline, candidate in items.values()
-            if isinstance(baseline, bool) and isinstance(candidate, bool)
-        )
+        return self._count("paired")
 
     def coverage(self) -> list[CellCoverage]:
         """Per-cell resolved/pending/errored counts, sorted for determinism."""
         out: list[CellCoverage] = []
         for (stratum, outcome), items in sorted(self._records.items()):
-            paired = pending = errored = 0
+            counts: dict[State, int] = {"paired": 0, "pending": 0, "errored": 0}
             for baseline, candidate in items.values():
-                if _errored(baseline) or _errored(candidate):
-                    errored += 1
-                elif baseline is None or candidate is None:
-                    pending += 1
-                else:
-                    paired += 1
+                counts[_state(baseline, candidate)] += 1
             out.append(
                 CellCoverage(
                     stratum=stratum,
                     outcome=outcome,
                     category=self.categories.get(stratum),
-                    paired=paired,
-                    pending=pending,
-                    errored=errored,
+                    paired=counts["paired"],
+                    pending=counts["pending"],
+                    errored=counts["errored"],
                 )
             )
         return out
@@ -364,7 +429,7 @@ class HealthTracker:
         for (stratum, outcome), items in sorted(self._records.items()):
             pairs = improved = regressed = passed = 0
             for baseline, candidate in items.values():
-                if not isinstance(baseline, bool) or not isinstance(candidate, bool):
+                if _state(baseline, candidate) != "paired":
                     continue
                 pairs += 1
                 passed += int(bool(candidate))
@@ -455,30 +520,38 @@ class HealthTracker:
 
         @param payload: Parsed :meth:`snapshot` mapping.
         @param config: Extra keyword arguments forwarded to ``__init__``.
-        @raise ValueError: If the snapshot version is not supported.
+        @raise ValueError: If the snapshot version is missing or not supported,
+            or a record is not a five-element ``[stratum, outcome, item,
+            baseline, candidate]`` list with valid sides.
         """
-        version = payload.get("version", SNAPSHOT_VERSION)
+        version = payload.get("version")
         if version != SNAPSHOT_VERSION:
-            raise ValueError(f"unsupported snapshot version {version!r}")
+            raise ValueError(
+                f"unsupported snapshot version {version!r}; expected {SNAPSHOT_VERSION}"
+            )
         seed = config.pop("seed", payload.get("seed"))
+        if seed is not None and not isinstance(seed, int):
+            raise ValueError(f"snapshot seed must be an integer or null, got {seed!r}")
         tracker = cls(
-            weights=dict(payload.get("weights") or {}),  # type: ignore[arg-type]
-            category_weights=dict(payload.get("category_weights") or {}),  # type: ignore[arg-type]
-            categories=dict(payload.get("categories") or {}),  # type: ignore[arg-type]
-            default_category=payload.get("default_category", DEFAULT_CATEGORY),  # type: ignore[arg-type]
-            seed=seed,  # type: ignore[arg-type]
-            baseline_epoch=payload.get("baseline_epoch"),  # type: ignore[arg-type]
-            candidate_epoch=payload.get("candidate_epoch"),  # type: ignore[arg-type]
+            weights=_number_mapping(payload.get("weights"), "weights"),
+            category_weights=_number_mapping(payload.get("category_weights"), "category_weights"),
+            categories=_string_mapping(payload.get("categories"), "categories"),
+            default_category=_text_or_none(
+                payload.get("default_category", DEFAULT_CATEGORY), "default_category"
+            ),
+            seed=seed,
+            baseline_epoch=_text_or_none(payload.get("baseline_epoch"), "baseline_epoch"),
+            candidate_epoch=_text_or_none(payload.get("candidate_epoch"), "candidate_epoch"),
             **config,  # type: ignore[arg-type]
         )
-        for raw in payload.get("records") or []:  # type: ignore[union-attr]
+        for raw in _record_rows(payload.get("records")):
             stratum, outcome, item, baseline, candidate = raw
             tracker.observe(
                 str(stratum),
                 str(outcome),
                 str(item),
-                _parse_side(baseline),
-                _parse_side(candidate),
+                _parse_side(baseline, "baseline"),
+                _parse_side(candidate, "candidate"),
             )
         return tracker
 
