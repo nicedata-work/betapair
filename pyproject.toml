@@ -1,0 +1,39 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "pydfba"
+version = "0.1.0"
+description = "Dependency-light Bayesian analysis of paired binary outcomes: a Python port of DFBA's McNemar test with hierarchical multi-strata pooling."
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "nicedata" }]
+keywords = [
+    "bayesian",
+    "mcnemar",
+    "dfba",
+    "paired",
+    "statistics",
+    "hierarchical",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Mathematics",
+]
+dependencies = ["pydantic>=2.0"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "ruff>=0.6"]
+
+[project.urls]
+Repository = "https://example.invalid/nicedata/pydfba"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/pydfba"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

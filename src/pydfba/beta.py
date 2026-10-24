@@ -1,0 +1,200 @@
+"""Beta-distribution numerics for the health metric — stdlib ``math`` only.
+
+The health metric is a conjugate Bayesian model, so every quantity it needs is
+a beta density, a beta tail probability, a beta quantile or a beta-binomial
+marginal likelihood. ``scipy``/``numpy``/``pandas`` are deliberately not
+imported: the eval worker and the web API already run in a constrained
+container, and this module is a few hundred lines of ``math`` calls.
+
+Numerics follow the textbook recipes (Abramowitz & Stegun 26.5.8 for the
+regularized incomplete beta continued fraction; Marsaglia–Tsang for gamma
+sampling). The continued fraction is iterated to ``1e-14`` with a hard
+iteration cap, which reproduces ``DFBA::dfba_mcnemar``'s published output to
+every printed digit (see ``mcnemar_test.py``).
+"""
+
+from __future__ import annotations
+
+import math
+import random
+
+#: Continued-fraction convergence tolerance and denominator floor.
+_FP_EPS = 3e-14
+_FP_MIN = 1e-300
+#: Hard iteration cap for the continued fraction.
+_CF_ITMAX = 400
+#: Bisection steps for :func:`beta_ppf`.
+_PPF_ITMAX = 64
+#: Clamp keeping sampled rates strictly inside (0, 1); see :func:`beta_sample`.
+_SAMPLE_EPS = 1e-12
+
+
+def log_beta(a: float, b: float) -> float:
+    """``ln B(a, b)`` — via ``lgamma`` so large shape parameters stay finite."""
+    return math.lgamma(a) + math.lgamma(b) - math.lgamma(a + b)
+
+
+def log_choose(n: int, k: int) -> float:
+    """``ln C(n, k)`` without ever materialising the binomial coefficient."""
+    return math.lgamma(n + 1.0) - math.lgamma(k + 1.0) - math.lgamma(n - k + 1.0)
+
+
+def beta_pdf(x: float, a: float, b: float) -> float:
+    """Beta density; the closed-form limit is used at the two boundaries.
+
+    @raise ValueError: If either shape parameter is not positive.
+    """
+    if a <= 0 or b <= 0:
+        raise ValueError(f"shape parameters must be positive, got a={a}, b={b}")
+    if x < 0.0 or x > 1.0:
+        return 0.0
+    if x == 0.0:
+        if a < 1.0:
+            return math.inf
+        return float(b) if a == 1.0 else 0.0
+    if x == 1.0:
+        if b < 1.0:
+            return math.inf
+        return float(a) if b == 1.0 else 0.0
+    return math.exp((a - 1.0) * math.log(x) + (b - 1.0) * math.log1p(-x) - log_beta(a, b))
+
+
+def beta_log_pdf(x: float, a: float, b: float) -> float:
+    """Log density; ``-inf`` where the density is zero or infinite."""
+    density = beta_pdf(x, a, b)
+    if density <= 0.0 or math.isinf(density):
+        return -math.inf
+    return math.log(density)
+
+
+def _beta_cf(x: float, a: float, b: float) -> float:
+    """Continued fraction for the incomplete beta function (Lentz's method).
+
+    @note: Iterated to :data:`_FP_EPS` with a hard :data:`_CF_ITMAX` cap. A
+        vanishing denominator is floored at :data:`_FP_MIN` instead of being
+        divided through, which keeps the recursion finite on extreme shapes.
+    """
+    qab = a + b
+    qap = a + 1.0
+    qam = a - 1.0
+    c = 1.0
+    d = 1.0 - qab * x / qap
+    d = 1.0 / (d if abs(d) > _FP_MIN else _FP_MIN)
+    h = d
+    for m in range(1, _CF_ITMAX + 1):
+        m2 = 2 * m
+        numerator = m * (b - m) * x / ((qam + m2) * (a + m2))
+        d = 1.0 + numerator * d
+        d = 1.0 / (d if abs(d) > _FP_MIN else _FP_MIN)
+        c = 1.0 + numerator / c
+        c = c if abs(c) > _FP_MIN else _FP_MIN
+        h *= d * c
+        numerator = -(a + m) * (qab + m) * x / ((a + m2) * (qap + m2))
+        d = 1.0 + numerator * d
+        d = 1.0 / (d if abs(d) > _FP_MIN else _FP_MIN)
+        c = 1.0 + numerator / c
+        c = c if abs(c) > _FP_MIN else _FP_MIN
+        delta = d * c
+        h *= delta
+        if abs(delta - 1.0) < _FP_EPS:
+            break
+    return h
+
+
+def beta_cdf(x: float, a: float, b: float) -> float:
+    """Regularized incomplete beta ``I_x(a, b)`` — the beta CDF.
+
+    @note: The continued fraction converges fastest on the smaller of ``x`` and
+        ``1 - x``, so the larger side is evaluated by reflection about .5.
+    @raise ValueError: If either shape parameter is not positive.
+    """
+    if a <= 0 or b <= 0:
+        raise ValueError(f"shape parameters must be positive, got a={a}, b={b}")
+    if x <= 0.0:
+        return 0.0
+    if x >= 1.0:
+        return 1.0
+    log_front = (
+        math.lgamma(a + b) - math.lgamma(a) - math.lgamma(b) + a * math.log(x) + b * math.log1p(-x)
+    )
+    if x < (a + 1.0) / (a + b + 2.0):
+        return math.exp(log_front) * _beta_cf(x, a, b) / a
+    return 1.0 - math.exp(log_front) * _beta_cf(1.0 - x, b, a) / b
+
+
+def beta_ppf(p: float, a: float, b: float) -> float:
+    """Beta quantile by bisection on :func:`beta_cdf` (monotone, robust).
+
+    @note: :data:`_PPF_ITMAX` halvings leave the bracket below double
+        resolution, so the midpoint is as sharp as the CDF allows.
+    @raise ValueError: If ``p`` is not strictly inside (0, 1).
+    """
+    if not 0.0 < p < 1.0:
+        raise ValueError(f"p must be in (0, 1), got {p}")
+    low, high = 0.0, 1.0
+    for _ in range(_PPF_ITMAX):
+        mid = 0.5 * (low + high)
+        if beta_cdf(mid, a, b) < p:
+            low = mid
+        else:
+            high = mid
+    return 0.5 * (low + high)
+
+
+def beta_mean(a: float, b: float) -> float:
+    return a / (a + b)
+
+
+def beta_var(a: float, b: float) -> float:
+    total = a + b
+    return a * b / (total * total * (total + 1.0))
+
+
+def log_beta_binomial(k: int, n: int, a: float, b: float) -> float:
+    """Log marginal likelihood of ``k`` successes in ``n`` trials under Beta(a, b).
+
+    This is the closed form the hierarchical model integrates cells with —
+    no quadrature, no sampling, so a fit is cheap and deterministic.
+    """
+    if n < 0 or k < 0 or k > n:
+        raise ValueError(f"invalid binomial counts k={k}, n={n}")
+    return log_choose(n, k) + log_beta(a + k, b + n - k) - log_beta(a, b)
+
+
+def _gamma_sample(rng: random.Random, shape: float) -> float:
+    """Marsaglia–Tsang gamma draw (shape >= 1)."""
+    d = shape - 1.0 / 3.0
+    c = 1.0 / math.sqrt(9.0 * d)
+    while True:
+        x = rng.gauss(0.0, 1.0)
+        v = (1.0 + c * x) ** 3
+        if v <= 0.0:
+            continue
+        u = rng.random()
+        if math.log(u) < 0.5 * x * x + d - d * v + d * math.log(v):
+            return d * v
+
+
+def gamma_sample(rng: random.Random, shape: float) -> float:
+    """Gamma(shape, 1) draw, including shape < 1 via the boost identity."""
+    if shape <= 0.0:
+        raise ValueError(f"gamma shape must be positive, got {shape}")
+    if shape < 1.0:
+        return gamma_sample(rng, shape + 1.0) * rng.random() ** (1.0 / shape)
+    return _gamma_sample(rng, shape)
+
+
+def beta_sample(rng: random.Random, a: float, b: float) -> float:
+    """Beta(a, b) draw via the gamma ratio — used for posterior intervals.
+
+    @note: The ratio is clamped to :data:`_SAMPLE_EPS` inside (0, 1). A gamma
+        draw for a very small shape can underflow to exactly 0, and an
+        unclamped 0 or 1 would make downstream log-odds infinite.
+    """
+    left = gamma_sample(rng, a)
+    right = gamma_sample(rng, b)
+    total = left + right
+    if total <= 0.0:  # pragma: no cover - both draws underflowed
+        return min(max(a / (a + b), _SAMPLE_EPS), 1.0 - _SAMPLE_EPS)
+    ratio = left / total
+    return min(max(ratio, _SAMPLE_EPS), 1.0 - _SAMPLE_EPS)
