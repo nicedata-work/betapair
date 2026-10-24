@@ -23,8 +23,16 @@ from pydfba.hierarchy import (
 
 
 def cells(pattern: list[tuple[int, int]], stratum: str = "view") -> list[Cell]:
+    """Cells where every pair moved: ``pairs == improved + regressed``."""
     return [
-        Cell(stratum=f"{stratum}_{index}", outcome="answer", improved=k, regressed=r, pairs=k + r)
+        Cell(
+            stratum=f"{stratum}_{index}",
+            outcome="answer",
+            improved=k,
+            regressed=r,
+            passed=k,
+            pairs=k + r,
+        )
         for index, (k, r) in enumerate(pattern)
     ]
 
@@ -46,6 +54,28 @@ class CellTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             Cell(stratum="s", outcome="o", improved=4, regressed=4, pairs=5)
 
+    def test_incoherent_pass_counts_are_rejected(self) -> None:
+        """``baseline_passed`` must stay a count, never a negative pass rate."""
+        with self.assertRaises(ValueError):
+            # passed=0 cannot contain the four 0 -> 1 switches.
+            Cell(stratum="s", outcome="o", improved=4, regressed=1, pairs=20)
+        with self.assertRaises(ValueError):
+            # passed=20 leaves no room for the five 1 -> 0 switches.
+            Cell(stratum="s", outcome="o", improved=0, regressed=5, passed=20, pairs=20)
+        # The boundary cases are legal.
+        self.assertEqual(
+            Cell(
+                stratum="s", outcome="o", improved=4, regressed=1, passed=4, pairs=20
+            ).baseline_passed,
+            1,
+        )
+        self.assertEqual(
+            Cell(
+                stratum="s", outcome="o", improved=0, regressed=5, passed=15, pairs=20
+            ).baseline_passed,
+            20,
+        )
+
     def test_pooled_counts(self) -> None:
         self.assertEqual(pooled_counts(cells([(14, 6), (2, 18)])), (16, 24))
 
@@ -62,7 +92,7 @@ class FitTest(unittest.TestCase):
     def test_unchanged_pairs_do_not_dilute_the_fit(self) -> None:
         """The fit is over discordant pairs only — bank size must not move ``mu``."""
         short = [
-            Cell(stratum=f"v{i}", outcome="answer", improved=14, regressed=6, pairs=20)
+            Cell(stratum=f"v{i}", outcome="answer", improved=14, regressed=6, passed=14, pairs=20)
             for i in range(10)
         ]
         long = [
@@ -111,7 +141,7 @@ class CellPosteriorTest(unittest.TestCase):
     def test_small_sample_is_shrunk_towards_the_layer(self) -> None:
         payload = [
             *cells([(14, 6)] * 9),
-            Cell(stratum="tiny", outcome="answer", improved=3, regressed=1, pairs=4),
+            Cell(stratum="tiny", outcome="answer", improved=3, regressed=1, passed=3, pairs=4),
         ]
         result = fit(payload)
         posterior = cell_posteriors(result, payload, draws=128, seed=1)
@@ -124,7 +154,11 @@ class CellPosteriorTest(unittest.TestCase):
     def test_p_improved_is_monotone_in_improvements(self) -> None:
         previous = -1.0
         for k in range(0, 11):
-            payload = [Cell(stratum="s", outcome="answer", improved=k, regressed=10 - k, pairs=10)]
+            payload = [
+                Cell(
+                    stratum="s", outcome="answer", improved=k, regressed=10 - k, passed=k, pairs=10
+                )
+            ]
             value = fit(payload).cell_p_improved(payload[0])
             self.assertGreater(value, previous)
             previous = value
@@ -219,6 +253,7 @@ class HomogeneityGuardrailTest(unittest.TestCase):
                         outcome="answer",
                         improved=improved,
                         regressed=discordant - improved,
+                        passed=improved,
                         pairs=discordant + 40,
                     )
                 )

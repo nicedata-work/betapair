@@ -80,6 +80,11 @@ class Cell:
     ``pairs`` the number of items observed in both epochs. ``category`` is the
     criticality tier the stratum (semantic view) belongs to — a label, never
     used by the statistics themselves; the report turns it into a weight.
+
+    The counts must describe one coherent set of paired items: ``passed``
+    contains every ``improved`` pair and the candidate-epoch failures contain
+    every ``regressed`` pair, so ``baseline_passed`` stays inside
+    ``[0, pairs]``.
     """
 
     stratum: str
@@ -97,6 +102,18 @@ class Cell:
             raise ValueError(f"passed={self.passed} out of range for pairs={self.pairs}")
         if self.discordant > self.pairs:
             raise ValueError(f"discordant pairs exceed pairs: {self}")
+        # ``passed`` counts candidate-epoch passes and must therefore contain
+        # every 0 -> 1 switch; the candidate-epoch failures must contain every
+        # 1 -> 0 switch. Otherwise ``baseline_passed`` can go negative.
+        if self.passed < self.improved:
+            raise ValueError(
+                f"passed={self.passed} cannot be below improved={self.improved}: {self}"
+            )
+        if self.pairs - self.passed < self.regressed:
+            raise ValueError(
+                f"candidate failures={self.pairs - self.passed} cannot be below "
+                f"regressed={self.regressed}: {self}"
+            )
 
     @property
     def key(self) -> tuple[str, str]:
