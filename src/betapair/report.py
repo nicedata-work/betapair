@@ -43,8 +43,8 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
-from pydfba.beta import beta_cdf, log_beta
-from pydfba.hierarchy import (
+from betapair.beta import beta_cdf, log_beta
+from betapair.hierarchy import (
     DRAWS,
     PPC_DRAWS,
     Cell,
@@ -54,7 +54,7 @@ from pydfba.hierarchy import (
     homogeneity_ppc,
     pooled_counts,
 )
-from pydfba.mcnemar import mcnemar
+from betapair.mcnemar import mcnemar, switch_evidence
 
 #: Bumped when the JSON shape changes — reports are persisted per refresh.
 REPORT_VERSION = 3
@@ -357,7 +357,7 @@ def regression_model(
         z1 = 1e-300
     log_ratio: dict[tuple[str, str], float] = {}
     for cell in cells:
-        test = mcnemar(cell.improved, cell.regressed, a0=a0, b0=b0)
+        test = switch_evidence(cell.improved, cell.regressed, a0=a0, b0=b0)
         discordant = test.discordant
         if discordant <= 0:
             log_ratio[cell.key] = 0.0
@@ -444,7 +444,6 @@ def verdicts_from_model(
     *,
     a0: float = 1.0,
     b0: float = 1.0,
-    prob_interval: float = 0.95,
     improving_prob: float = 0.95,
 ) -> dict[tuple[str, str], CellVerdict]:
     """Turn a fitted :class:`RegressionModel` into per-cell verdicts.
@@ -456,7 +455,7 @@ def verdicts_from_model(
     """
     verdicts: dict[tuple[str, str], CellVerdict] = {}
     for cell in cells:
-        test = mcnemar(cell.improved, cell.regressed, a0=a0, b0=b0, prob_interval=prob_interval)
+        test = switch_evidence(cell.improved, cell.regressed, a0=a0, b0=b0)
         if test.discordant and test.p_improved >= improving_prob:
             verdict: Literal["improving", "stable", "regressing"] = "improving"
         elif cell.key in model.flagged:
@@ -476,7 +475,6 @@ def cell_verdicts(
     *,
     a0: float = 1.0,
     b0: float = 1.0,
-    prob_interval: float = 0.95,
     improving_prob: float = 0.95,
     fdr: float = 0.05,
     weights: dict[tuple[str, str], float] | None = None,
@@ -513,7 +511,6 @@ def cell_verdicts(
         model,
         a0=a0,
         b0=b0,
-        prob_interval=prob_interval,
         improving_prob=improving_prob,
     )
 
@@ -811,7 +808,6 @@ def build_report(
         model,
         a0=a0,
         b0=b0,
-        prob_interval=prob_interval,
         improving_prob=1.0 - alpha,
     )
 
@@ -866,7 +862,6 @@ def build_report(
         tier_of,
         a0=a0,
         b0=b0,
-        prob_interval=prob_interval,
         alpha=alpha,
         rope=epsilon,
         category_delta_draws=category_delta_draws,
@@ -1089,7 +1084,6 @@ def _categories(
     *,
     a0: float,
     b0: float,
-    prob_interval: float,
     alpha: float,
     rope: float,
     category_delta_draws: dict[str | None, list[float]],
@@ -1127,7 +1121,7 @@ def _categories(
             score, baseline_score, delta = None, None, None
         improved = sum(cell.improved for cell in group)
         regressed = sum(cell.regressed for cell in group)
-        pooled = mcnemar(improved, regressed, a0=a0, b0=b0, prob_interval=prob_interval)
+        pooled = switch_evidence(improved, regressed, a0=a0, b0=b0)
         p_improved = pooled.p_improved if pooled.discordant > 0 else None
         group_flagged = [
             f"{cell.stratum}/{cell.outcome}"

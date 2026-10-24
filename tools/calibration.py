@@ -26,7 +26,7 @@ import argparse
 import random
 from pathlib import Path
 
-from pydfba import Cell, build_report, cell_verdicts
+from betapair import Cell, build_report, cell_verdicts
 
 TRIALS = 400
 DISCORDANT = 20

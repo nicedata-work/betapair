@@ -6,7 +6,7 @@ import json
 import random
 import unittest
 
-from pydfba import ERROR, HealthTracker, PairRecord
+from betapair import ERROR, HealthTracker, PairRecord
 
 FAST = {"draws": 96, "ppc_draws": 96}
 
@@ -247,7 +247,7 @@ class SnapshotTest(unittest.TestCase):
         second.observe_many(list(reversed(records())))
         self.assertEqual(first.to_json(), second.to_json())
         payload = json.loads(first.to_json())
-        self.assertEqual(payload["version"], 2)
+        self.assertEqual(payload["version"], 3)
         self.assertEqual(len(payload["records"]), 12)
 
     def test_snapshot_survives_a_json_round_trip_through_text(self) -> None:
@@ -256,6 +256,11 @@ class SnapshotTest(unittest.TestCase):
         restored = HealthTracker.from_snapshot(json.loads(tracker.to_json()))
         self.assertEqual(restored.pending, 1)
         self.assertIsNone(restored._records[("v", "answer")]["q1"][0])
+
+    def test_a_payload_without_a_timeline_still_loads(self) -> None:
+        """The score history is an additive key; a payload that predates it is fine."""
+        restored = HealthTracker.from_snapshot({"version": 3, "records": []})
+        self.assertEqual(restored.timeline, [])
 
     def test_unknown_snapshot_version_is_rejected(self) -> None:
         with self.assertRaises(ValueError):
@@ -268,15 +273,17 @@ class SnapshotTest(unittest.TestCase):
 
     def test_malformed_snapshot_is_rejected(self) -> None:
         for payload in (
-            {"version": 2, "records": "nope"},
-            {"version": 2, "records": [["v", "answer", "q1", "nonsense", True]]},
-            {"version": 2, "records": [["v", "answer", "q1", True]]},
-            {"version": 2, "records": [], "weights": {"answer": "heavy"}},
-            {"version": 2, "records": [], "weights": "heavy"},
-            {"version": 2, "records": [], "categories": {"v": 3}},
-            {"version": 2, "records": [], "categories": "heavy"},
-            {"version": 2, "records": [], "baseline_epoch": 7},
-            {"version": 2, "records": [], "seed": "nope"},
+            {"version": 3, "records": "nope"},
+            {"version": 3, "records": [["v", "answer", "q1", "nonsense", True]]},
+            {"version": 3, "records": [["v", "answer", "q1", True]]},
+            {"version": 3, "records": [], "weights": {"answer": "heavy"}},
+            {"version": 3, "records": [], "weights": "heavy"},
+            {"version": 3, "records": [], "categories": {"v": 3}},
+            {"version": 3, "records": [], "categories": "heavy"},
+            {"version": 3, "records": [], "baseline_epoch": 7},
+            {"version": 3, "records": [], "seed": "nope"},
+            {"version": 3, "records": [], "timeline": "nope"},
+            {"version": 3, "records": [], "timeline": [{"score": "high"}]},
         ):
             with self.assertRaises(ValueError):
                 HealthTracker.from_snapshot(payload)
@@ -444,6 +451,62 @@ class MergeGuardTest(unittest.TestCase):
     def test_merge_rejects_an_unknown_epoch_policy(self) -> None:
         with self.assertRaises(ValueError):
             HealthTracker().merge(HealthTracker(), on_epoch_mismatch="maybe")  # type: ignore[arg-type]
+
+
+class TimelineTest(unittest.TestCase):
+    """The tracker must keep enough history for :meth:`score_band`."""
+
+    def test_advance_records_the_finished_epoch(self) -> None:
+        tracker = HealthTracker(**FAST)
+        tracker.observe("v", "answer", "q1", False, True)
+        tracker.observe("v", "answer", "q2", False, False)
+        tracker.advance(baseline_epoch="r1", candidate_epoch="r2")
+        self.assertEqual(len(tracker.timeline), 1)
+        self.assertAlmostEqual(tracker.timeline[0].score, 50.0)
+        self.assertEqual(tracker.timeline[0].pairs, 2.0)
+        self.assertEqual(tracker.timeline[0].epoch, "r1")
+        self.assertEqual(tracker.baseline_epoch, "r1")
+        self.assertEqual(tracker.candidate_epoch, "r2")
+
+    def test_recording_is_optional_on_advance(self) -> None:
+        tracker = HealthTracker(**FAST)
+        tracker.observe("v", "answer", "q1", False, True)
+        tracker.advance(record=False)
+        self.assertEqual(tracker.timeline, [])
+
+    def test_an_empty_epoch_is_not_a_data_point(self) -> None:
+        tracker = HealthTracker(**FAST)
+        self.assertIsNone(tracker.record_score())
+        tracker.observe("v", "answer", "q1", None, True)  # baseline still pending
+        self.assertIsNone(tracker.record_score())
+        self.assertEqual(tracker.timeline, [])
+
+    def test_muted_cells_are_not_a_data_point(self) -> None:
+        tracker = HealthTracker(weights={"answer": 0.0}, **FAST)
+        tracker.observe("v", "answer", "q1", False, True)
+        self.assertIsNone(tracker.record_score())
+
+    def test_band_over_a_recorded_series(self) -> None:
+        tracker = HealthTracker(**FAST)
+        for epoch, passes in (("r1", 3), ("r2", 5), ("r3", 4)):
+            for index in range(10):
+                tracker.observe("v", "answer", f"q{index}", False, index < passes)
+            tracker.advance(baseline_epoch=epoch, candidate_epoch=f"{epoch}+1")
+        band = tracker.score_band()
+        self.assertEqual(band.points, 3)
+        self.assertAlmostEqual(band.center, (30.0 + 50.0 + 40.0) / 3.0)
+
+    def test_empty_timeline_has_no_band(self) -> None:
+        with self.assertRaises(ValueError):
+            HealthTracker(**FAST).score_band()
+
+    def test_timeline_survives_a_snapshot(self) -> None:
+        tracker = HealthTracker(seed=0, **FAST)
+        tracker.observe("v", "answer", "q1", False, True)
+        tracker.advance(baseline_epoch="r1", candidate_epoch="r2")
+        restored = HealthTracker.from_json(tracker.to_json(), **FAST)
+        self.assertEqual(restored.timeline, tracker.timeline)
+        self.assertEqual(restored.snapshot(), tracker.snapshot())
 
 
 if __name__ == "__main__":

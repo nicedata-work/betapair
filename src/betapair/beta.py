@@ -15,6 +15,7 @@ every printed digit (see ``tests/test_mcnemar.py``).
 
 from __future__ import annotations
 
+import functools
 import math
 import random
 
@@ -25,6 +26,11 @@ _FP_MIN = 1e-300
 _CF_ITMAX = 400
 #: Bisection steps for :func:`beta_ppf`.
 _PPF_ITMAX = 64
+#: Cap on the memoised tail evaluations in :func:`beta_sf`. The model only
+#: ever asks for ``P(X > .5)`` on a fixed ``(mu, kappa)`` grid plus integer
+#: counts, so the same shapes recur on every refresh; the bound stops a
+#: long-running service from accumulating keys without limit.
+_SF_CACHE_SIZE = 16384
 #: Smallest/largest rates :func:`beta_sample` returns — the limits of double
 #: precision, so the tail keeps its spread and downstream log-odds stay finite.
 _MIN_RATE = math.ulp(0.0)
@@ -114,6 +120,26 @@ def beta_cdf(x: float, a: float, b: float) -> float:
     if x < (a + 1.0) / (a + b + 2.0):
         return math.exp(log_front) * _beta_cf(x, a, b) / a
     return 1.0 - math.exp(log_front) * _beta_cf(1.0 - x, b, a) / b
+
+
+@functools.lru_cache(maxsize=_SF_CACHE_SIZE)
+def beta_sf(x: float, a: float, b: float) -> float:
+    """Upper tail ``P(X > x)`` for ``X ~ Beta(a, b)``, memoised.
+
+    ``.5`` is the null switch rate, so this is the per-cell evidence the
+    verdicts and the hierarchical mixture read: on every streaming refresh the
+    same ``(x, a, b)`` triple comes back for a cell whose counts have not
+    changed. Caching the tail (rather than the whole posterior) keeps the
+    expensive continued fraction out of that repeated path.
+
+    @note: The shapes are reconstructed from the same grid arithmetic on
+        every fit, so a hit is bit-identical to a fresh evaluation — the cache
+        cannot change a reported number.
+    @raise ValueError: If either shape parameter is not positive.
+    """
+    if a <= 0.0 or b <= 0.0:
+        raise ValueError(f"shape parameters must be positive, got a={a}, b={b}")
+    return 1.0 - beta_cdf(x, a, b)
 
 
 def beta_ppf(p: float, a: float, b: float) -> float:

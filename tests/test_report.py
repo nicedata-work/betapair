@@ -5,9 +5,9 @@ from __future__ import annotations
 import random
 import unittest
 
-from pydfba import DEFAULT_CATEGORY
-from pydfba.hierarchy import Cell
-from pydfba.report import (
+from betapair import DEFAULT_CATEGORY
+from betapair.hierarchy import Cell
+from betapair.report import (
     CellCoverage,
     HealthReport,
     build_report,

@@ -11,7 +11,7 @@ from __future__ import annotations
 import random
 import unittest
 
-from pydfba import Cell, build_report, cell_verdicts
+from betapair import Cell, build_report, cell_verdicts
 
 
 def _draw(rng: random.Random, n: int, q: float) -> tuple[int, int]:

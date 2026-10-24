@@ -16,7 +16,9 @@ counts, which buys three properties a service needs:
   half-finished stream never reads as a regression;
 * **epoch rollover** — :meth:`HealthTracker.advance` promotes the candidate
   epoch to baseline and clears the other side, so a periodic refresh reuses
-  the same tracker with memory bounded by one epoch of items.
+  the same tracker with memory bounded by one epoch of items, while
+  :attr:`HealthTracker.timeline` keeps one :class:`~betapair.series.ScorePoint`
+  per finished epoch for :meth:`HealthTracker.score_band`.
 
 Batching is :meth:`observe_many` (many records at once) plus :meth:`merge`
 (fold a second tracker's snapshot in, e.g. one produced by another worker).
@@ -40,10 +42,16 @@ import random
 from dataclasses import dataclass
 from typing import Literal
 
-from pydfba.hierarchy import DRAWS, PPC_DRAWS, Cell
-from pydfba.report import DEFAULT_CATEGORY, CellCoverage, HealthReport, build_report
+from betapair.hierarchy import DRAWS, PPC_DRAWS, Cell
+from betapair.report import DEFAULT_CATEGORY, CellCoverage, HealthReport, build_report, weighting
+from betapair.series import ScoreBand, ScorePoint, score_band
 
-SNAPSHOT_VERSION = 2
+#: Snapshot *format* version — internal to the JSON payload and independent
+#: of the package version in ``pyproject.toml``. It moves when the payload
+#: shape changes (v3 added the score ``timeline``); :meth:`from_snapshot`
+#: rejects any other version. Within a version, additive keys are fine:
+#: a v3 payload with no ``timeline`` still loads, defaulted to empty.
+SNAPSHOT_VERSION = 3
 
 
 class _Errored:
@@ -233,6 +241,7 @@ class HealthTracker:
         self.baseline_epoch = baseline_epoch
         self.candidate_epoch = candidate_epoch
         self._records: dict[CellKey, dict[str, Pair]] = {}
+        self.timeline: list[ScorePoint] = []
 
     def observe(
         self,
@@ -310,6 +319,10 @@ class HealthTracker:
         @param prefer: Whose value to keep when both sides have one;
             ``"other"`` (default) is the fresher in-flight evaluation.
         @param on_epoch_mismatch: What to do when the epochs differ.
+        @note: Only current records and config are folded in. Each tracker
+            keeps its own :attr:`timeline`; merging histories is the caller's
+            decision, because only the caller knows whether the two series
+            describe the same epochs.
         @raise ValueError: If the epochs differ and ``on_epoch_mismatch`` is
             ``"raise"`` (the default).
         """
@@ -359,15 +372,25 @@ class HealthTracker:
         *,
         baseline_epoch: str | None = None,
         candidate_epoch: str | None = None,
+        record: bool = True,
     ) -> None:
         """Roll the epoch: candidate becomes baseline, the candidate side clears.
 
         Call this at a refresh boundary. Rows that carry no values at all are
         dropped, so memory stays proportional to one epoch's item count.
 
+        @param baseline_epoch: Label of the epoch that just finished; defaults
+            to the current candidate label.
+        @param candidate_epoch: Label of the next candidate epoch.
+        @param record: Append the finished epoch's score to :attr:`timeline`
+            before rolling, so a chain of advances preserves the history a
+            :meth:`score_band` needs.
         @note: Only a real result can become the next baseline; a pending or
             errored candidate has nothing to promote.
         """
+        if record:
+            finished = self.candidate_epoch if baseline_epoch is None else baseline_epoch
+            self.record_score(epoch=finished)
         rolled: dict[CellKey, dict[str, Pair]] = {}
         for key, items in self._records.items():
             kept: dict[str, Pair] = {}
@@ -379,6 +402,52 @@ class HealthTracker:
         self._records = rolled
         self.baseline_epoch = baseline_epoch or self.candidate_epoch
         self.candidate_epoch = candidate_epoch
+
+    def _score_point(self, epoch: str | None = None) -> ScorePoint | None:
+        """Current epoch's level with its effective pair count, or ``None``.
+
+        Cheap on purpose: it re-uses the report's weighting policy but runs no
+        sampling, so :meth:`advance` can record a point without paying for a
+        full :meth:`report`.
+        """
+        cells = self.cells()
+        if not cells:
+            return None
+        policy = weighting(
+            cells,
+            weights=self.weights,
+            category_weights=self.category_weights,
+            default_category=self.default_category,
+        )
+        pairs = sum(policy.weight(cell) * cell.pairs for cell in cells)
+        if pairs <= 0.0:
+            return None
+        passed = sum(policy.weight(cell) * cell.passed for cell in cells)
+        return ScorePoint(
+            score=100.0 * passed / pairs,
+            epoch=self.candidate_epoch if epoch is None else epoch,
+            pairs=pairs,
+        )
+
+    def record_score(self, *, epoch: str | None = None) -> ScorePoint | None:
+        """Append the current epoch's score to :attr:`timeline`.
+
+        Returns the recorded point, or ``None`` when there is nothing paired
+        to score — an empty or fully pending epoch is not a data point. Use
+        this for refresh-based series; :meth:`advance` calls it for you at an
+        epoch boundary.
+        """
+        point = self._score_point(epoch)
+        if point is not None:
+            self.timeline.append(point)
+        return point
+
+    def score_band(self, *, window: int | None = None, level: float = 0.95) -> ScoreBand:
+        """Reference band over :attr:`timeline`; see :func:`betapair.series.score_band`.
+
+        @raise ValueError: If the timeline is empty (no epoch recorded yet).
+        """
+        return score_band(self.timeline, window=window, level=level)
 
     def _count(self, state: State) -> int:
         return sum(
@@ -508,6 +577,7 @@ class HealthTracker:
             "baseline_epoch": self.baseline_epoch,
             "candidate_epoch": self.candidate_epoch,
             "records": records,
+            "timeline": [point.snapshot() for point in self.timeline],
         }
 
     @classmethod
@@ -549,6 +619,10 @@ class HealthTracker:
                 _parse_side(baseline, "baseline"),
                 _parse_side(candidate, "candidate"),
             )
+        raw_timeline = payload.get("timeline", [])
+        if not isinstance(raw_timeline, list):
+            raise ValueError(f"snapshot timeline must be a list, got {raw_timeline!r}")
+        tracker.timeline.extend(ScorePoint.from_snapshot(point) for point in raw_timeline)
         return tracker
 
     def to_json(self, *, indent: int | None = None) -> str:

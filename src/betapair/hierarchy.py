@@ -35,15 +35,16 @@ regression in one stratum behind improvements in the others.
 
 from __future__ import annotations
 
+import bisect
 import math
 import random
 from dataclasses import dataclass
 
-from pydfba.beta import (
-    beta_cdf,
+from betapair.beta import (
     beta_mean,
     beta_pdf,
     beta_sample,
+    beta_sf,
     log_beta_binomial,
 )
 
@@ -166,12 +167,17 @@ class Fit:
         return total
 
     def cell_p_improved(self, cell: Cell) -> float:
-        """``P(phi_cell > .5 | data)`` — exact mixture, no sampling noise."""
+        """``P(phi_cell > .5 | data)`` — exact mixture, no sampling noise.
+
+        @note: The grid is already pruned to the points that carry mass, and
+            each per-point tail is memoised by :func:`beta_sf`, so refreshing
+            a report whose cells have not changed re-uses the whole mixture.
+        """
         total = 0.0
         for mu, kappa, weight in self.points:
             a = mu * kappa + cell.improved
             b = (1.0 - mu) * kappa + cell.regressed
-            total += weight * (1.0 - beta_cdf(0.5, a, b))
+            total += weight * beta_sf(0.5, a, b)
         return total
 
 
@@ -267,9 +273,12 @@ def fit(
     @note: The likelihood uses the **discordant** pair count as the binomial
         ``n`` (McNemar). Using ``cell.pairs`` would count every unchanged item
         as a failed switch and dilute ``mu`` toward 0 on a real question bank.
-    @note: Every reported number is summarised on the full grid *before*
-        points below :data:`GRID_WEIGHT_FLOOR` are pruned, so pruning cannot
-        move them — it only shrinks ``points``.
+    @note: Every grid-level number (the ``mu``/``kappa`` summaries) is
+        computed on the full grid *before* points below
+        :data:`GRID_WEIGHT_FLOOR` are pruned, so pruning cannot move them. The
+        per-cell summaries in :meth:`Fit.cell_mean` / :meth:`Fit.cell_p_improved`
+        read the pruned points directly — the dropped mass is below 1e-9, and
+        the smaller loop is what keeps a many-cell fit cheap.
     @return: The fitted posterior, with ``points`` already pruned.
     @raise ValueError: If the grid is degenerate (fewer than 2x2 points or an
         invalid ``kappa`` span).
@@ -338,8 +347,10 @@ def fit(
 def _sample_params(fit: Fit, draws: int, rng: random.Random) -> list[tuple[float, float]]:
     """Draw ``(mu, kappa)`` pairs from the grid posterior (inverse-CDF).
 
-    @note: The grid is small, so the linear scan over the cumulative weights
-        beats rebuilding a bisect structure on every call.
+    @note: :func:`bisect.bisect_left` picks the first point whose cumulative
+        weight reaches the draw, exactly as a linear scan would, in
+        ``O(log n)`` instead of ``O(n)``. A single-cell fit keeps most of the
+        grid, so the scan is the whole cost of drawing at that size.
     """
     cumulative: list[float] = []
     running = 0.0
@@ -350,14 +361,10 @@ def _sample_params(fit: Fit, draws: int, rng: random.Random) -> list[tuple[float
     sampled: list[tuple[float, float]] = []
     for _ in range(draws):
         target = rng.random() * total
-        for index, bound in enumerate(cumulative):
-            if target <= bound:
-                mu, kappa, _ = fit.points[index]
-                sampled.append((mu, kappa))
-                break
-        else:  # pragma: no cover - cumulative[-1] >= target by construction
-            mu, kappa, _ = fit.points[-1]
-            sampled.append((mu, kappa))
+        index = bisect.bisect_left(cumulative, target)
+        # ``target < total`` because ``random() < 1``, so the index is in range.
+        mu, kappa, _ = fit.points[index]
+        sampled.append((mu, kappa))
     return sampled
 
 

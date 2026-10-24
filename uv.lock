@@ -772,7 +772,7 @@ wheels = [
 ]
 
 [[package]]
-name = "pydfba"
+name = "betapair"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [

@@ -13,7 +13,8 @@ import math
 import random
 import unittest
 
-from pydfba.hierarchy import (
+from betapair.beta import beta_sf
+from betapair.hierarchy import (
     Cell,
     cell_posteriors,
     fit,
@@ -162,6 +163,16 @@ class CellPosteriorTest(unittest.TestCase):
             value = fit(payload).cell_p_improved(payload[0])
             self.assertGreater(value, previous)
             previous = value
+
+    def test_p_improved_reuses_the_cached_tails(self) -> None:
+        """A refresh whose cells have not changed pays no tail evaluations."""
+        payload = cells([(10, 5), (5, 10), (8, 8)])
+        fit(payload).cell_p_improved(payload[0])
+        before = beta_sf.cache_info()
+        fit(payload).cell_p_improved(payload[0])
+        after = beta_sf.cache_info()
+        self.assertGreater(after.hits, before.hits)
+        self.assertEqual(after.misses, before.misses)
 
     def test_draws_are_correlated_across_cells(self) -> None:
         payload = cells([(10, 5), (5, 10), (8, 8)])

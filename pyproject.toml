@@ -3,7 +3,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "pydfba"
+name = "betapair"
 version = "0.1.0"
 description = "Dependency-light Bayesian analysis of paired binary outcomes: a Python port of DFBA's McNemar test with hierarchical multi-strata pooling."
 readme = "README.md"
@@ -36,10 +36,10 @@ dev = [
 ]
 
 # [project.urls]
-# Repository = "https://github.com/<owner>/pydfba"
+# Repository = "https://github.com/<owner>/betapair"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/pydfba"]
+packages = ["src/betapair"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -51,7 +51,7 @@ strict = true
 files = ["src", "tools"]
 
 [tool.coverage.run]
-source = ["src/pydfba"]
+source = ["src/betapair"]
 
 [tool.coverage.report]
 show_missing = true

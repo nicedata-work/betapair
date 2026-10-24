@@ -6,12 +6,13 @@ import math
 import random
 import unittest
 
-from pydfba.beta import (
+from betapair.beta import (
     beta_cdf,
     beta_mean,
     beta_pdf,
     beta_ppf,
     beta_sample,
+    beta_sf,
     log_beta_binomial,
     log_choose,
 )
@@ -102,6 +103,31 @@ class BetaSamplingTest(unittest.TestCase):
         # collapsing every draw below the old 1e-12 clamp onto one value.
         self.assertGreater(len(set(tail)), 1)
         self.assertLess(min(draws), 1e-20)
+
+
+class BetaSurvivalTest(unittest.TestCase):
+    """The memoised upper tail the per-cell verdicts read."""
+
+    def test_matches_the_cdf_complement(self) -> None:
+        for a, b in ((0.5, 0.5), (2.0, 5.0), (18.0, 3.0), (101.0, 101.0)):
+            for x in (0.1, 0.5, 0.9):
+                self.assertAlmostEqual(beta_sf(x, a, b), 1.0 - beta_cdf(x, a, b), places=12)
+
+    def test_reflection(self) -> None:
+        self.assertAlmostEqual(beta_sf(0.3, 2.0, 7.0), beta_cdf(0.7, 7.0, 2.0), places=12)
+
+    def test_repeat_calls_are_served_from_cache(self) -> None:
+        beta_sf.cache_clear()
+        beta_sf(0.5, 12.0, 7.0)
+        before = beta_sf.cache_info()
+        self.assertEqual(beta_sf(0.5, 12.0, 7.0), beta_sf(0.5, 12.0, 7.0))
+        after = beta_sf.cache_info()
+        self.assertGreater(after.hits, before.hits)
+        self.assertEqual(after.misses, before.misses)
+
+    def test_invalid_shapes(self) -> None:
+        with self.assertRaises(ValueError):
+            beta_sf(0.5, 0.0, 1.0)
 
 
 class BetaBinomialTest(unittest.TestCase):

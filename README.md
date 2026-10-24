@@ -1,11 +1,11 @@
-# pydfba
+# betapair
 
 One question, answered:
 
 > We ran the same set of items before and after a change. Did anything really
 > get better or worse, and which groups are responsible?
 
-`pydfba` takes paired pass/fail results (each item measured twice), works out
+`betapair` takes paired pass/fail results (each item measured twice), works out
 whether the change is real, and points at the groups that moved. It is small
 and dependency-light: the maths uses only Python's built-in `math` and
 `random`, and `pydantic` is used just to save reports as JSON.
@@ -16,7 +16,7 @@ and dependency-light: the maths uses only Python's built-in `math` and
   same items.
 * **Watching many groups at once** — classes, models, datasets, customers.
 * **Not letting a good average hide a bad group**: if one group gets much worse
-  while the rest improve, `pydfba` says so.
+  while the rest improve, `betapair` says so.
 * **Streaming**: add results as they arrive and ask for a fresh report at any
   time.
 
@@ -25,7 +25,7 @@ and dependency-light: the maths uses only Python's built-in `math` and
 Not published on PyPI yet, so install from a git URL or a checkout:
 
 ```bash
-uv add "pydfba @ git+https://github.com/<owner>/pydfba"
+uv add "betapair @ git+https://github.com/<owner>/betapair"
 # or, inside a clone:
 uv sync --extra dev
 ```
@@ -35,7 +35,7 @@ uv sync --extra dev
 If you already have the totals, `mcnemar()` turns them into an answer.
 
 ```python
-from pydfba import mcnemar
+from betapair import mcnemar
 
 # 12 items went from fail to pass; 3 went from pass to fail.
 result = mcnemar(n_improved=12, n_regressed=3)
@@ -60,7 +60,7 @@ Usually you have several groups and several items. `HealthTracker` collects the
 results and `report()` sums them up.
 
 ```python
-from pydfba import HealthTracker
+from betapair import HealthTracker
 
 tracker = HealthTracker()
 
@@ -103,11 +103,11 @@ guardrail  : ok
 
 ## Catching a group that got worse
 
-A good average can hide a broken group. `pydfba` checks for that and names the
+A good average can hide a broken group. `betapair` checks for that and names the
 group.
 
 ```python
-from pydfba import HealthTracker
+from betapair import HealthTracker
 
 tracker = HealthTracker()
 for q in range(10):
@@ -133,12 +133,58 @@ The average did not move at all, but `group_b` clearly got worse, so the report
 is `regressing` and `flagged` names the culprit. This is the most important
 safety feature.
 
+## Watching the score move over time
+
+A single report says what the score is now. Across epochs, `advance()` keeps
+one score per finished epoch, and `score_band()` turns that history into a
+range: how much the score moves once sampling noise is taken out.
+
+```python
+from betapair import HealthTracker
+
+tracker = HealthTracker()
+for rate in (0.70, 0.71, 0.69, 0.70):
+    for q in range(200):
+        tracker.observe("group_a", "quiz", f"q{q}", baseline=False, candidate=q < rate * 200)
+    tracker.advance()
+
+band = tracker.score_band(window=3)
+print("avg score   :", round(band.center, 1))
+print("likely range:", round(band.low, 1), "to", round(band.high, 1))
+print("noise       :", round(band.within_sd, 2), "pp")
+print("movement    :", round(band.between_sd, 2), "pp")
+```
+
+```
+avg score   : 70.0
+likely range: 63.7 to 76.3
+noise       : 3.22 pp
+movement    : 0.0 pp
+```
+
+`within_sd` is the per-epoch sampling noise — it shrinks as more items run —
+and `between_sd` is real epoch-to-epoch movement. When the whole observed
+spread is explained by noise, `between_sd` is 0 and the band is just the
+noise; a volatile metric widens it. `window=3` keeps the band responsive to a
+recent regime change. A series can also be passed to `score_band()` directly,
+as percentages or as reports:
+
+```python
+from betapair import score_band
+
+band = score_band([70.0, 72.0, 69.5, 85.0])
+print(round(band.low, 1), "to", round(band.high, 1))  # 59.8 to 88.5
+```
+
+You can record a point without rolling the epoch with `tracker.record_score()`,
+and the timeline survives `to_json()`/`from_json()`.
+
 ## Everyday extras
 
 **Add many results at once** with `PairRecord`:
 
 ```python
-from pydfba import HealthTracker, PairRecord
+from betapair import HealthTracker, PairRecord
 
 tracker = HealthTracker()
 tracker.observe_many(
@@ -160,7 +206,7 @@ print(tracker.pending)  # 1
 **A failed evaluation.** Use `ERROR` (different from "not run yet"):
 
 ```python
-from pydfba import ERROR
+from betapair import ERROR
 
 tracker.observe("group_a", "quiz", "q4", baseline=False, candidate=ERROR)
 print(tracker.errored)  # 1
@@ -223,10 +269,6 @@ uv run ruff check .     # lint
 uv run ruff format .    # format
 uv run mypy             # type-check
 ```
-
-The `mcnemar()` function is a Python port of the R package `DFBA`'s
-`dfba_mcnemar()`. The decisions behind the report, and the simulations that
-check them, are documented in `docs/validation.md`.
 
 ## License
 

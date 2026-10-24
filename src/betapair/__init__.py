@@ -1,18 +1,18 @@
-"""pydfba — dependency-light Bayesian analysis of paired binary outcomes.
+"""betapair — dependency-light Bayesian analysis of paired binary outcomes.
 
 This package ports the statistical core of ``DFBA::dfba_mcnemar()`` to Python
 and extends it to many strata at once:
 
-* :mod:`pydfba.beta` — stdlib beta / beta-binomial numerics (no numpy/scipy);
-* :mod:`pydfba.mcnemar` — ``mcnemar()``, a faithful port of ``dfba_mcnemar``;
-* :mod:`pydfba.hierarchy` — hierarchical (multi-strata) pooling and a
+* :mod:`betapair.beta` — stdlib beta / beta-binomial numerics (no numpy/scipy);
+* :mod:`betapair.mcnemar` — ``mcnemar()``, a faithful port of ``dfba_mcnemar``;
+* :mod:`betapair.hierarchy` — hierarchical (multi-strata) pooling and a
   posterior predictive homogeneity guardrail;
-* :mod:`pydfba.report` — the assembled report models and ``build_report()``;
-* :mod:`pydfba.tracker` — streaming/batch accumulation and JSON snapshots.
+* :mod:`betapair.report` — the assembled report models and ``build_report()``;
+* :mod:`betapair.tracker` — streaming/batch accumulation and JSON snapshots.
 
 The intended surface is small::
 
-    from pydfba import HealthTracker, PairRecord
+    from betapair import HealthTracker, PairRecord
 
     tracker = HealthTracker(weights={"answer": 1.0}, category_weights={"tier-1": 3.0})
     tracker.observe("model_a", "answer", "q1", baseline=False, candidate=True)
@@ -21,11 +21,11 @@ The intended surface is small::
     report.score, report.delta_pp, report.contributions, report.guardrail
 
 Nothing in the numeric core imports numpy/scipy/pandas; ``pydantic`` is used
-only by :mod:`pydfba.report` for the serialisable report models.
+only by :mod:`betapair.report` for the serialisable report models.
 """
 
-from pydfba.beta import beta_cdf, beta_pdf, beta_ppf
-from pydfba.hierarchy import (
+from betapair.beta import beta_cdf, beta_pdf, beta_ppf, beta_sf
+from betapair.hierarchy import (
     Cell,
     CellPosterior,
     CellPosteriors,
@@ -36,8 +36,8 @@ from pydfba.hierarchy import (
     homogeneity_ppc,
     pooled_counts,
 )
-from pydfba.mcnemar import McNemarResult, mcnemar
-from pydfba.report import (
+from betapair.mcnemar import McNemarResult, SwitchEvidence, mcnemar, switch_evidence
+from betapair.report import (
     DEFAULT_CATEGORY,
     REPORT_VERSION,
     CategorySummary,
@@ -60,7 +60,8 @@ from pydfba.report import (
     verdicts_from_model,
     weighting,
 )
-from pydfba.tracker import ERROR, HealthTracker, PairRecord
+from betapair.series import ScoreBand, ScorePoint, score_band
+from betapair.tracker import ERROR, HealthTracker, PairRecord
 
 __all__ = [
     "DEFAULT_CATEGORY",
@@ -84,11 +85,15 @@ __all__ = [
     "McNemarSummary",
     "PairRecord",
     "RegressionModel",
+    "ScoreBand",
+    "ScorePoint",
     "Status",
+    "SwitchEvidence",
     "Weighting",
     "beta_cdf",
     "beta_pdf",
     "beta_ppf",
+    "beta_sf",
     "build_report",
     "cell_posteriors",
     "cell_verdicts",
@@ -99,6 +104,8 @@ __all__ = [
     "parse_category_weights",
     "pooled_counts",
     "regression_model",
+    "score_band",
+    "switch_evidence",
     "verdicts_from_model",
     "weighting",
 ]

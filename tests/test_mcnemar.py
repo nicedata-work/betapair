@@ -5,7 +5,14 @@ from __future__ import annotations
 import math
 import unittest
 
-from pydfba.mcnemar import McNemarResult, mcnemar
+from betapair.mcnemar import (
+    McNemarResult,
+    SwitchEvidence,
+    _mcnemar,
+    _switch_evidence,
+    mcnemar,
+    switch_evidence,
+)
 
 
 class DfbaConformanceTest(unittest.TestCase):
@@ -82,6 +89,47 @@ class McNemarPropertiesTest(unittest.TestCase):
         self.assertIsInstance(result, McNemarResult)
         with self.assertRaises(AttributeError):
             result.n_improved = 6  # type: ignore[misc]
+
+
+class SwitchEvidenceTest(unittest.TestCase):
+    """The cheap, memoised subset of the posterior the report reads."""
+
+    def test_matches_mcnemar_fields(self) -> None:
+        for n_improved, n_regressed in ((17, 2), (0, 0), (4, 9), (30, 1)):
+            evidence = switch_evidence(n_improved, n_regressed)
+            result = mcnemar(n_improved, n_regressed)
+            self.assertEqual(evidence.discordant, result.discordant)
+            self.assertEqual(evidence.p_improved, result.p_improved)
+
+    def test_repeat_calls_are_served_from_cache(self) -> None:
+        _switch_evidence.cache_clear()
+        switch_evidence(7, 3)
+        before = _switch_evidence.cache_info()
+        switch_evidence(7, 3)
+        after = _switch_evidence.cache_info()
+        self.assertGreater(after.hits, before.hits)
+        self.assertEqual(after.misses, before.misses)
+
+    def test_mcnemar_is_memoised(self) -> None:
+        _mcnemar.cache_clear()
+        mcnemar(9, 4)
+        before = _mcnemar.cache_info()
+        mcnemar(9, 4)
+        after = _mcnemar.cache_info()
+        self.assertGreater(after.hits, before.hits)
+        self.assertEqual(after.misses, before.misses)
+
+    def test_invalid_input(self) -> None:
+        with self.assertRaises(ValueError):
+            switch_evidence(-1, 2)
+        with self.assertRaises(ValueError):
+            switch_evidence(1, 2, a0=0.0)
+
+    def test_result_is_frozen(self) -> None:
+        evidence = switch_evidence(5, 1)
+        self.assertIsInstance(evidence, SwitchEvidence)
+        with self.assertRaises(AttributeError):
+            evidence.discordant = 2  # type: ignore[misc]
 
 
 if __name__ == "__main__":
