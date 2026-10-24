@@ -147,19 +147,19 @@ class HomogeneityGuardrailTest(unittest.TestCase):
     def test_identical_cells_are_homogeneous(self) -> None:
         check = homogeneity_ppc(cells([(14, 6)] * 10), draws=192, seed=0)
         assert check is not None
-        self.assertGreater(check.p_value, 0.05)
+        self.assertGreater(check.ppc, 0.05)
         self.assertFalse(check.heterogeneous)
 
     def test_global_regression_stays_homogeneous(self) -> None:
         check = homogeneity_ppc(cells([(6, 14)] * 10), draws=192, seed=0)
         assert check is not None
-        self.assertGreater(check.p_value, 0.05)
+        self.assertGreater(check.ppc, 0.05)
 
     def test_masked_regression_is_flagged(self) -> None:
         """Nine views improve, one collapses: the pooled rate looks fine at ~.58."""
         check = homogeneity_ppc(cells([(14, 6)] * 9 + [(2, 18)]), draws=192, seed=0)
         assert check is not None
-        self.assertLess(check.p_value, 0.05)
+        self.assertLess(check.ppc, 0.05)
         self.assertTrue(check.heterogeneous)
         self.assertGreater(check.observed, check.expected)
 
@@ -179,18 +179,18 @@ class HomogeneityGuardrailTest(unittest.TestCase):
         )
         check = homogeneity_ppc([*healthy, broken], draws=192, seed=0)
         assert check is not None
-        self.assertLess(check.p_value, 0.05)
+        self.assertLess(check.ppc, 0.05)
         self.assertTrue(check.heterogeneous)
 
     def test_mild_heterogeneity_is_not_overflagged(self) -> None:
         check = homogeneity_ppc(cells([(12, 8)] * 9 + [(8, 12)]), draws=192, seed=0)
         assert check is not None
-        self.assertGreater(check.p_value, 0.05)
+        self.assertGreater(check.ppc, 0.05)
 
     def test_single_cell_cannot_test_homogeneity(self) -> None:
         check = homogeneity_ppc(cells([(14, 6)]), draws=192, seed=0)
         assert check is not None
-        self.assertGreater(check.p_value, 0.05)
+        self.assertGreater(check.ppc, 0.05)
         self.assertEqual(check.cells, 1)
 
     def test_no_pairs_returns_none(self) -> None:
@@ -198,7 +198,7 @@ class HomogeneityGuardrailTest(unittest.TestCase):
         self.assertIsNone(homogeneity_ppc([Cell(stratum="s", outcome="answer")], draws=64))
 
     def test_calibration_under_the_null(self) -> None:
-        """Homogeneous data must not trip the guardrail: p-values stay usable.
+        """Homogeneous data must not trip the guardrail: tails stay usable.
 
         A real calibration check, not a smoke test: 200 trials with realistic
         banks (most questions unchanged), fixed seeds so it is deterministic,
@@ -206,7 +206,7 @@ class HomogeneityGuardrailTest(unittest.TestCase):
         """
         rng = random.Random(2024)
         trials = 200
-        p_values: list[float] = []
+        tails: list[float] = []
         for trial in range(trials):
             switch_rate = rng.uniform(0.35, 0.65)
             payload = []
@@ -224,11 +224,30 @@ class HomogeneityGuardrailTest(unittest.TestCase):
                 )
             check = homogeneity_ppc(payload, draws=128, seed=trial)
             assert check is not None
-            p_values.append(check.p_value)
-        flagged = sum(1 for value in p_values if value < 0.05)
+            tails.append(check.ppc)
+        flagged = sum(1 for value in tails if value < 0.05)
         # Binomial(200, .05) puts 10% far in the upper tail; nominal is 5%.
         self.assertLessEqual(flagged, 20, f"false positives: {flagged}/{trials}")
-        self.assertGreater(sum(p_values) / len(p_values), 0.3)
+        self.assertGreater(sum(tails) / len(tails), 0.3)
+
+
+class DiscordanceDrawTest(unittest.TestCase):
+    """The delta model must carry how much moved, not only which way."""
+
+    def test_discordance_draws_shrink_as_pairs_grow(self) -> None:
+        small = [Cell(stratum="s", outcome="o", improved=0, regressed=0, pairs=10)]
+        big = [Cell(stratum="s", outcome="o", improved=0, regressed=0, pairs=10000)]
+        posterior_small = cell_posteriors(fit(small), small, draws=64, seed=0)
+        posterior_big = cell_posteriors(fit(big), big, draws=64, seed=0)
+        self.assertEqual(len(posterior_small.discordance_draws), 64)
+        self.assertEqual(len(posterior_small.discordance_draws[0]), 1)
+        mean_small = sum(posterior_small.discordance_draws[0]) / 64
+        mean_big = sum(posterior_big.discordance_draws[0]) / 64
+        self.assertLess(mean_big, mean_small)
+
+    def test_discordance_prior_validation(self) -> None:
+        with self.assertRaises(ValueError):
+            cell_posteriors(fit(cells([(1, 1)])), cells([(1, 1)]), a_d=0.0)
 
 
 if __name__ == "__main__":

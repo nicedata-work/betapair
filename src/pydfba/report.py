@@ -37,11 +37,13 @@ stream never looks like a regression — the tracker reports those as
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Literal
 
 from pydantic import BaseModel, Field
 
+from pydfba.beta import beta_cdf, log_beta
 from pydfba.hierarchy import (
     DRAWS,
     PPC_DRAWS,
@@ -52,10 +54,10 @@ from pydfba.hierarchy import (
     homogeneity_ppc,
     pooled_counts,
 )
-from pydfba.mcnemar import McNemarResult, mcnemar
+from pydfba.mcnemar import mcnemar
 
 #: Bumped when the JSON shape changes — reports are persisted per refresh.
-REPORT_VERSION = 1
+REPORT_VERSION = 3
 
 #: The tier an untagged view falls back to **when tiers are in use at all**.
 #: The vocabulary is fixed: ``tier-1`` critical, ``tier-2`` dependent,
@@ -64,6 +66,33 @@ REPORT_VERSION = 1
 #: comparison carries a tier, nothing is defaulted and every cell weighs the
 #: same (the uniform case).
 DEFAULT_CATEGORY = "tier-2"
+
+#: Layer/tier verdict vocabulary. ``mixed`` is the honest middle when the
+#: pooled movement is positive but the strata credibly disagree: neither a
+#: clean improvement nor a regression, and not stable either.
+Status = Literal["improving", "stable", "regressing", "mixed", "insufficient"]
+
+
+@dataclass(frozen=True)
+class CellCoverage:
+    """Resolved/pending/errored item counts for one cell.
+
+    The tracker owns item-level state, so it is the only layer that can tell
+    ``pending`` (not evaluated yet) from ``errored`` (evaluation failed). The
+    report consumes this to gate on coverage: a crashing view must not make
+    health look better by shrinking its own denominator.
+    """
+
+    stratum: str
+    outcome: str
+    category: str | None = None
+    paired: int = 0
+    pending: int = 0
+    errored: int = 0
+
+    @property
+    def unresolved(self) -> int:
+        return self.pending + self.errored
 
 
 class McNemarSummary(BaseModel):
@@ -99,17 +128,18 @@ class Guardrail(BaseModel):
     """Homogeneity check across strata, plus the cells it flags."""
 
     status: Literal["ok", "heterogeneous", "insufficient"]
-    p_value: float | None = None
-    """Posterior predictive p-value; small means the strata disagree."""
+    ppc: float | None = None
+    """Posterior predictive tail probability; small means the strata disagree.
+    A Bayesian model-check quantity, not a sampling p-value."""
     dispersion: float | None = None
     expected_dispersion: float | None = None
     draws: int = 0
     flagged: list[str] = Field(default_factory=list)
     """Cells with a credible regression, as ``stratum/outcome``.
 
-    A cell is listed when its own exact McNemar test rejects at a Holm-corrected
-    family-wise level (see :func:`cell_verdicts`), so a wide layer does not
-    manufacture a regression by chance.
+    A cell is listed when the spike-and-slab regression model puts it in the
+    posterior-FDR-controlled flag set (see :func:`regression_model`), so a wide
+    layer does not manufacture a regression by chance.
     """
     reason: str = ""
 
@@ -135,7 +165,22 @@ class CategorySummary(BaseModel):
     discordant: int = 0
     p_improved: float | None = None
     """Pooled McNemar ``P(phi > .5)`` for this tier alone."""
-    status: Literal["improving", "stable", "regressing", "insufficient"] = "insufficient"
+    status: Status = "insufficient"
+    delta_p_improved: float | None = None
+    """Weighted ``P(delta > 0)`` for this tier, from the hierarchical draws."""
+
+
+class Coverage(BaseModel):
+    """How much of the comparison actually resolved, and whether that is enough."""
+
+    paired: int = 0
+    pending: int = 0
+    errored: int = 0
+    unresolved_share: float = 0.0
+    critical_unresolved: int = 0
+    """Pending/errored items in the highest-criticality tier present."""
+    complete: bool = True
+    reason: str = ""
 
 
 class CellContribution(BaseModel):
@@ -160,24 +205,45 @@ class CellContribution(BaseModel):
     delta_pp_low: float
     delta_pp_high: float
     p_improved: float
+    p_regressed: float = 0.0
+    """Posterior probability this cell is a true regression, from the
+    spike-and-slab model (see :func:`regression_model`)."""
     logit_shift: float
     """Shrunken log-odds shift of this cell against the pooled layer."""
     verdict: Literal["improving", "stable", "regressing"]
+    delta_pp_contribution: float = 0.0
+    """This cell's additive share of ``delta_pp``: ``100 * w * (n01 - n10) /
+    sum(w * pairs)``. Summing this field over every contribution reproduces
+    ``delta_pp`` exactly, even when cells offset (which is when a normalised
+    ``share`` breaks down)."""
     share: float | None = None
-    """Fraction of the layer's net change attributable to this cell."""
+    """Deprecated: ``delta_pp_contribution / delta_pp``. Unstable and can
+    exceed +/-1 when contributions offset; prefer ``delta_pp_contribution``."""
 
 
 class HealthReport(BaseModel):
     """The assembled paired-comparison report, ready to persist or serve as JSON."""
 
     version: int = REPORT_VERSION
-    status: Literal["improving", "stable", "regressing", "insufficient"]
+    status: Status
     score: float | None = None
     """Paired candidate-epoch pass rate, 0-100."""
     baseline_score: float | None = None
     delta_pp: float | None = None
     delta_pp_low: float | None = None
     delta_pp_high: float | None = None
+    delta_p_improved: float | None = None
+    """Weighted ``P(delta_pp > 0)`` from the hierarchical draws — the
+    probability behind the layer verdict. ``p_improved`` below is the
+    unweighted pooled exact test, kept as a diagnostic only."""
+    p_no_regression: float | None = None
+    """``P(no cell truly regressed | data)`` from the spike-and-slab model."""
+    bfdr: float | None = None
+    """Posterior expected false discovery rate of the flagged set."""
+    pi_mean: float | None = None
+    """Posterior mean share of cells that truly regressed."""
+    rope_pp: float = 0.0
+    """ROPE half-width in percentage points used for the verdict."""
     p_improved: float | None = None
     pairs: int = 0
     pending: int = 0
@@ -191,6 +257,8 @@ class HealthReport(BaseModel):
     default_category: str | None = DEFAULT_CATEGORY
     tiered: bool = False
     """True when at least one cell declared a tier, so weighting was applied."""
+    coverage: Coverage = Field(default_factory=Coverage)
+    """Resolved/pending/errored accounting and whether the status was gated."""
     categories: list[CategorySummary] = Field(default_factory=list)
     guardrail: Guardrail = Field(
         default_factory=lambda: Guardrail(status="insufficient", reason="not computed")
@@ -199,11 +267,212 @@ class HealthReport(BaseModel):
 
 
 @dataclass(frozen=True)
+class RegressionModel:
+    """Bayesian two-group (spike-and-slab) posterior over which cells regressed.
+
+    Each cell's switch rate is either exactly ``.5`` (the spike: no regression)
+    or drawn from a Beta slab on ``[0, .5]``. The mixture weight ``pi`` gets a
+    Beta hyperprior and is integrated out, so no empirical-Bayes plug-in is
+    needed. ``flagged`` is the largest set whose posterior expected false
+    discovery rate is within the target, which is the Bayesian counterpart of
+    a multiplicity correction.
+    """
+
+    p_regressed: dict[tuple[str, str], float]
+    """``P(cell is a true regression | data)`` for every cell."""
+    flagged: frozenset[tuple[str, str]]
+    bfdr: float
+    """Posterior expected false discovery rate of ``flagged``."""
+    p_no_regression: float
+    """``P(no cell in the layer truly regressed | data)``."""
+    pi_mean: float
+    """Posterior mean of the mixture weight (share of true regressions)."""
+
+
+@dataclass(frozen=True)
 class CellVerdict:
     """A cell's exact McNemar evidence and the verdict drawn from it."""
 
     p_improved: float
+    """DFBA ``P(phi > .5)`` — the Bayesian evidence of improvement."""
+    p_regressed: float
+    """Posterior probability this cell is a true regression, from the
+    spike-and-slab model (see :func:`regression_model`)."""
     verdict: Literal["improving", "stable", "regressing"]
+
+
+def _log1p_exp(value: float) -> float:
+    """``log(1 + exp(value))`` without overflow."""
+    if value > 0.0:
+        return value + math.log1p(math.exp(-value))
+    return math.log1p(math.exp(value))
+
+
+def _sigmoid(value: float) -> float:
+    """Logistic function, stable in both tails."""
+    if value >= 0.0:
+        return 1.0 / (1.0 + math.exp(-value))
+    exponential = math.exp(value)
+    return exponential / (1.0 + exponential)
+
+
+def regression_model(
+    cells: list[Cell],
+    *,
+    a0: float = 1.0,
+    b0: float = 1.0,
+    fdr: float = 0.05,
+    weights: dict[tuple[str, str], float] | None = None,
+    pi_prior: tuple[float, float] = (1.0, 1.0),
+    pi_points: int = 199,
+) -> RegressionModel:
+    """Fit the spike-and-slab model and pick the flag set by Bayesian FDR.
+
+    For each cell the Bayes factor of "regressed" (slab on ``[0, .5]``) against
+    "not regressed" (point spike at ``.5``) is computed in closed form from the
+    beta-binomial marginal, so this needs no sampling and stays in the stdlib
+    ``math`` core::
+
+        r_c = [m_c * P(phi_c <= .5 | data) / Z1] / [C(n, k) * .5**n]
+
+    ``pi ~ Beta(*pi_prior)`` is integrated out on a grid, and the per-cell
+    posterior odds are multiplied by the cell's normalised effective weight, so
+    a critical cell starts with a higher prior odds of having regressed. The
+    flag set is the largest prefix of cells ordered by ``P(regressed | data)``
+    whose posterior expected FDR stays within ``fdr``. A cell with weight 0 is
+    muted and can never be flagged.
+
+    @note: The decision is Bayesian end to end: ``fdr`` is a posterior expected
+        FDR, not a frequentist family-wise error rate, and no p-value enters.
+    @return: The fitted :class:`RegressionModel`.
+    @raise ValueError: If ``fdr`` is outside (0, 1), a prior shape is not
+        positive, or ``pi_points`` is below 2.
+    """
+    if not 0.0 < fdr < 1.0:
+        raise ValueError(f"fdr must be in (0, 1), got {fdr}")
+    if pi_prior[0] <= 0.0 or pi_prior[1] <= 0.0:
+        raise ValueError(f"pi_prior shapes must be positive, got {pi_prior}")
+    if pi_points < 2:
+        raise ValueError(f"pi_points must be at least 2, got {pi_points}")
+
+    keys = [cell.key for cell in cells]
+    z1 = beta_cdf(0.5, a0, b0)
+    if z1 <= 0.0:
+        z1 = 1e-300
+    log_ratio: dict[tuple[str, str], float] = {}
+    for cell in cells:
+        test = mcnemar(cell.improved, cell.regressed, a0=a0, b0=b0)
+        discordant = test.discordant
+        if discordant <= 0:
+            log_ratio[cell.key] = 0.0
+            continue
+        p_low = 1.0 - test.p_improved
+        if p_low <= 0.0:
+            log_ratio[cell.key] = -math.inf
+            continue
+        log_ratio[cell.key] = (
+            log_beta(a0 + cell.improved, b0 + cell.regressed)
+            - log_beta(a0, b0)
+            + math.log(p_low)
+            - math.log(z1)
+            - discordant * math.log(0.5)
+        )
+
+    raw = {
+        key: (max(0.0, float(weights.get(key, 1.0))) if weights is not None else 1.0)
+        for key in keys
+    }
+    mean_weight = sum(raw.values()) / len(raw) if raw else 1.0
+    log_multiplier = {
+        key: (math.log(value / mean_weight) if value > 0.0 and mean_weight > 0.0 else -math.inf)
+        for key, value in raw.items()
+    }
+
+    grid = [(index + 0.5) / pi_points for index in range(pi_points)]
+    log_prior = [
+        (pi_prior[0] - 1.0) * math.log(pi)
+        + (pi_prior[1] - 1.0) * math.log1p(-pi)
+        - log_beta(pi_prior[0], pi_prior[1])
+        for pi in grid
+    ]
+    log_posterior: list[float] = []
+    for pi, prior in zip(grid, log_prior):
+        base = math.log(pi / (1.0 - pi))
+        value = prior
+        for key in keys:
+            value += _log1p_exp(base + log_multiplier[key] + log_ratio[key])
+            value -= _log1p_exp(base + log_multiplier[key])
+        log_posterior.append(value)
+    peak = max(log_posterior)
+    mass = [math.exp(value - peak) for value in log_posterior]
+    total = sum(mass)
+    posterior = [value / total for value in mass]
+
+    p_regressed: dict[tuple[str, str], float] = {}
+    for key in keys:
+        accumulator = 0.0
+        for weight, pi in zip(posterior, grid):
+            log_odds = math.log(pi / (1.0 - pi)) + log_multiplier[key] + log_ratio[key]
+            accumulator += weight * _sigmoid(log_odds)
+        p_regressed[key] = accumulator
+
+    p_no_regression = 0.0
+    for weight, pi in zip(posterior, grid):
+        base = math.log(pi / (1.0 - pi))
+        product = 1.0
+        for key in keys:
+            product *= math.exp(-_log1p_exp(base + log_multiplier[key] + log_ratio[key]))
+        p_no_regression += weight * product
+
+    ordered = sorted(keys, key=lambda key: -p_regressed[key])
+    cumulative = 0.0
+    best = 0
+    for index, key in enumerate(ordered, start=1):
+        cumulative += 1.0 - p_regressed[key]
+        if cumulative / index <= fdr:
+            best = index
+    flagged = frozenset(ordered[:best])
+    bfdr = sum(1.0 - p_regressed[key] for key in flagged) / len(flagged) if flagged else 0.0
+    return RegressionModel(
+        p_regressed=p_regressed,
+        flagged=flagged,
+        bfdr=bfdr,
+        p_no_regression=p_no_regression,
+        pi_mean=sum(weight * pi for weight, pi in zip(posterior, grid)),
+    )
+
+
+def verdicts_from_model(
+    cells: list[Cell],
+    model: RegressionModel,
+    *,
+    a0: float = 1.0,
+    b0: float = 1.0,
+    prob_interval: float = 0.95,
+    regression_prob: float = 0.95,
+) -> dict[tuple[str, str], CellVerdict]:
+    """Turn a fitted :class:`RegressionModel` into per-cell verdicts.
+
+    ``improving`` and ``stable`` come from the cell's own DFBA posterior at
+    ``regression_prob``; ``regressing`` is membership of the model's FDR-
+    controlled flag set. Separated from :func:`regression_model` so the report
+    fits the model once and still has the global quantities to hand.
+    """
+    verdicts: dict[tuple[str, str], CellVerdict] = {}
+    for cell in cells:
+        test = mcnemar(cell.improved, cell.regressed, a0=a0, b0=b0, prob_interval=prob_interval)
+        if test.discordant and test.p_improved >= regression_prob:
+            verdict: Literal["improving", "stable", "regressing"] = "improving"
+        elif cell.key in model.flagged:
+            verdict = "regressing"
+        else:
+            verdict = "stable"
+        verdicts[cell.key] = CellVerdict(
+            p_improved=test.p_improved,
+            p_regressed=model.p_regressed[cell.key],
+            verdict=verdict,
+        )
+    return verdicts
 
 
 def cell_verdicts(
@@ -213,67 +482,90 @@ def cell_verdicts(
     b0: float = 1.0,
     prob_interval: float = 0.95,
     regression_prob: float = 0.95,
+    fdr: float = 0.05,
+    weights: dict[tuple[str, str], float] | None = None,
+    pi_prior: tuple[float, float] = (1.0, 1.0),
+    pi_points: int = 199,
 ) -> dict[tuple[str, str], CellVerdict]:
-    """Exact per-cell McNemar result and its verdict.
+    """Per-cell verdict from the Bayesian two-group regression model.
 
-    ``improving`` and ``stable`` come from the cell's own exact test at
-    ``regression_prob``. ``regressing`` is the safety-critical direction and is
-    **Holm-corrected across the comparison** at family-wise level ``1 -
-    regression_prob``: without that control a layer of ~60 drifting cells would
-    produce a spurious "regressing" verdict in ~97% of reports. A single cell
-    is its own family, so its threshold is unchanged. The reported
-    ``p_improved`` is always the cell's own exact value — only the decision is
-    corrected, so a cell's evidence is never borrowed from its neighbours.
+    ``improving`` and ``stable`` come from the cell's own DFBA posterior at
+    ``regression_prob``. ``regressing`` is the FDR-controlled flag set of
+    :func:`regression_model` — a Bayesian multiplicity correction, so a wide
+    layer does not manufacture regressions by chance and a critical cell is
+    not drowned by a field of auxiliary ones. ``weights`` is the effective
+    importance of each cell; it multiplies the prior odds that the cell
+    regressed (normalised so the overall sparsity is unchanged), and a weight
+    of 0 mutes the cell.
+
+    @note: Unlike the previous weighted-Holm gate, nothing here is a p-value
+        or a family-wise error rate: the flag is a posterior decision under an
+        explicit spike-and-slab model. See ``docs/validation.md`` for the
+        frequentist operating characteristics of the procedure.
     """
-    alpha = 1.0 - regression_prob
-    tests: dict[tuple[str, str], McNemarResult] = {
-        cell.key: mcnemar(cell.improved, cell.regressed, a0=a0, b0=b0, prob_interval=prob_interval)
-        for cell in cells
-    }
-    ordered = sorted(
-        (key for key, test in tests.items() if test.discordant > 0),
-        key=lambda key: tests[key].p_improved,
+    model = regression_model(
+        cells,
+        a0=a0,
+        b0=b0,
+        fdr=fdr,
+        weights=weights,
+        pi_prior=pi_prior,
+        pi_points=pi_points,
     )
-    regressing: set[tuple[str, str]] = set()
-    family = len(ordered)
-    for rank, key in enumerate(ordered):
-        if tests[key].p_improved <= alpha / (family - rank):
-            regressing.add(key)
-        else:
-            break
-    verdicts: dict[tuple[str, str], CellVerdict] = {}
-    for key, test in tests.items():
-        if test.discordant and test.p_improved >= regression_prob:
-            verdict: Literal["improving", "stable", "regressing"] = "improving"
-        elif key in regressing:
-            verdict = "regressing"
-        else:
-            verdict = "stable"
-        verdicts[key] = CellVerdict(p_improved=test.p_improved, verdict=verdict)
-    return verdicts
+    return verdicts_from_model(
+        cells,
+        model,
+        a0=a0,
+        b0=b0,
+        prob_interval=prob_interval,
+        regression_prob=regression_prob,
+    )
 
 
-def layer_status(
-    pooled_p: float | None,
-    flagged: list[str] | set[str] | tuple[str, ...],
+def delta_status(
+    delta_draws: list[float] | tuple[float, ...],
+    *,
+    rope: float,
     alpha: float,
-) -> Literal["improving", "stable", "regressing", "insufficient"]:
-    """The layer's verdict from its pooled test plus any credible regression.
+    flagged: bool = False,
+    heterogeneous: bool = False,
+) -> Status:
+    """The layer/tier verdict from the weighted posterior of its delta.
 
     One function so the report, the tier roll-up and the web timeline cannot
-    drift apart: a credible regression anywhere in ``flagged`` is a regression
-    for the layer even when the pooled trend says otherwise.
+    drift apart. The verdict is a Bayesian region-of-practical-equivalence
+    decision on the *weighted* delta draws, which is the same quantity the
+    headline ``delta_pp`` reports:
 
-    @note: This is the invariant that keeps one bad view from being averaged
-        away by improvements elsewhere in the layer.
+    * ``regressing`` when a credible per-cell regression exists anywhere in
+      the layer (``flagged``), or ``P(delta < -rope) >= 1 - alpha``;
+    * ``improving`` when ``P(delta > rope) >= 1 - alpha`` — downgraded to
+      ``mixed`` when the homogeneity guardrail says the strata disagree;
+    * ``stable`` when ``P(|delta| <= rope) >= 1 - alpha``;
+    * ``insufficient`` when the draws do not support any of the above.
+
+    @note: Because the draws include the discordance-rate posterior, an
+        unchanged bank is not automatically ``insufficient``: as the pair
+        count grows the delta concentrates inside the ROPE, which is how
+        "20,000 items and nothing moved" becomes positive evidence of
+        stability.
+    @note: A credible regression always wins, even if the weighted net is
+        positive — that is the invariant that keeps one bad view from being
+        averaged away.
     """
-    if pooled_p is None:
+    if not delta_draws:
         return "insufficient"
-    if pooled_p <= alpha or flagged:
+    total = len(delta_draws)
+    p_up = sum(1 for value in delta_draws if value > rope) / total
+    p_down = sum(1 for value in delta_draws if value < -rope) / total
+    p_rope = sum(1 for value in delta_draws if -rope <= value <= rope) / total
+    if flagged or p_down >= 1.0 - alpha:
         return "regressing"
-    if pooled_p >= 1.0 - alpha:
-        return "improving"
-    return "stable"
+    if p_up >= 1.0 - alpha:
+        return "mixed" if heterogeneous else "improving"
+    if p_rope >= 1.0 - alpha:
+        return "stable"
+    return "insufficient"
 
 
 def _quantile(sorted_values: list[float], prob: float) -> float:
@@ -296,10 +588,22 @@ class Weighting:
     tiered: bool
     default_category: str | None
     weights: dict[tuple[str, str], float]
+    family_weights: dict[tuple[str, str], float]
+    """Effective importance, used as a prior-odds multiplier by the gate.
+
+    This is the same outcome x tier weight that moves the score and the
+    delta, so one number governs both how much a cell matters and how much of
+    a head start it gets in the spike-and-slab regression model. A cell with
+    weight 0 is muted everywhere: excluded from the score and unable to be
+    flagged.
+    """
     categories: dict[tuple[str, str], str | None]
 
     def weight(self, cell: Cell) -> float:
         return self.weights[cell.key]
+
+    def family_weight(self, cell: Cell) -> float:
+        return self.family_weights[cell.key]
 
     def category(self, cell: Cell) -> str | None:
         return self.categories[cell.key]
@@ -329,18 +633,22 @@ def weighting(
             raise ValueError(f"weight for {name!r} must be >= 0, got {value}")
     tiered = any(cell.category is not None for cell in cells)
     cell_weights: dict[tuple[str, str], float] = {}
+    cell_family_weights: dict[tuple[str, str], float] = {}
     cell_categories: dict[tuple[str, str], str | None] = {}
     for cell in cells:
         category = cell.category
         if category is None and tiered:
             category = default_category
         tier = tier_of.get(category, 1.0) if category is not None else 1.0
-        cell_weights[cell.key] = weight_of.get(cell.outcome, 1.0) * tier
+        effective = weight_of.get(cell.outcome, 1.0) * tier
+        cell_weights[cell.key] = effective
+        cell_family_weights[cell.key] = effective
         cell_categories[cell.key] = category
     return Weighting(
         tiered=tiered,
         default_category=default_category,
         weights=cell_weights,
+        family_weights=cell_family_weights,
         categories=cell_categories,
     )
 
@@ -353,13 +661,20 @@ def build_report(
     default_category: str | None = DEFAULT_CATEGORY,
     a0: float = 1.0,
     b0: float = 1.0,
+    a_d: float = 1.0,
+    b_d: float = 1.0,
     prob_interval: float = 0.95,
     draws: int = DRAWS,
     ppc_draws: int = PPC_DRAWS,
     seed: int = 0,
     alpha: float = 0.05,
-    regression_prob: float = 0.95,
+    regression_prob: float | None = None,
+    rope_pp: float = 1.0,
+    pi_prior: tuple[float, float] = (1.0, 1.0),
+    pi_points: int = 199,
     pending: int = 0,
+    coverage: list[CellCoverage] | None = None,
+    max_unresolved_share: float = 0.25,
     baseline_epoch: str | None = None,
     candidate_epoch: str | None = None,
 ) -> HealthReport:
@@ -369,34 +684,60 @@ def build_report(
     the category a cell's stratum belongs to. Categories are applied only when
     at least one cell declares one: an uncategorised cell then falls back to
     ``default_category``, while a comparison with no category anywhere stays
-    uniform (every cell weighs 1.0).
-    ``alpha`` is the tail probability used for the pooled trend and the
-    heterogeneity check. A cell's reported ``p_improved`` is its own exact
-    McNemar test and the hierarchical posterior supplies the shrunken
-    ``logit_shift`` and the delta interval. ``regression_prob`` is the
-    posterior probability a cell must reach to be called improving
-    (``>= regression_prob``); the regressing direction is the same exact test
-    but Holm-corrected across cells (family-wise level ``1 - regression_prob``)
-    so a wide layer does not manufacture a regression by chance. See
-    :func:`cell_verdicts`.
+    uniform (every cell weighs 1.0). The category weight also multiplies the
+    prior odds that a cell truly regressed in the spike-and-slab gate (see
+    :func:`regression_model`), so a critical view is not drowned by a wide
+    field of auxiliary cells.
 
-    @note: The global delta interval is built from draws that share one
-        ``(mu, kappa)`` replicate across all cells, so it carries the
-        hierarchical correlation instead of pretending the cells are
-        independent.
-    @note: A cell's verdict comes from its own exact DFBA test, never from the
-        borrowed-strength hierarchy estimate: pooling is for ranking and
-        intervals, and letting the layer pull a small cell's verdict would be
-        exactly the masking the guardrail exists to prevent. The hierarchy
-        still shapes ``logit_shift`` and the delta interval.
+    ``alpha`` is the single posterior threshold behind every decision: the
+    homogeneity check, the per-cell improving threshold (``>= 1 - alpha``),
+    the weighted delta ROPE, and the posterior FDR target for the regression
+    gate. ``regression_prob`` is accepted only for backwards compatibility and
+    must equal ``1 - alpha`` if supplied. ``pi_prior`` is the Beta hyperprior
+    on the share of cells that truly regressed, gridded at ``pi_points``.
+
+    ``rope_pp`` is the region of practical equivalence for the layer verdict,
+    in percentage points: a net movement under this size counts as ``stable``
+    rather than improving/regressing. The per-cell regression flag is
+    unaffected — a credible regression in any view still forces ``regressing``.
+
+    ``coverage`` carries per-cell pending/errored counts from the tracker; when
+    the unresolved share exceeds ``max_unresolved_share``, or any item in the
+    most critical tier present is unresolved, the status is gated to
+    ``insufficient`` so a crashing view cannot improve health by shrinking its
+    own denominator.
+
+    @note: The layer verdict is derived from the *weighted* hierarchical delta
+        draws — the same quantity as the headline ``delta_pp`` — not from the
+        unweighted pooled test. ``p_improved`` is kept as an unweighted pooled
+        diagnostic; ``delta_p_improved`` is the probability behind the verdict.
+    @note: The delta draws multiply the switch rate by a discordance-rate draw,
+        so the interval and the ROPE are statements about the population, not
+        reconstructions of the observed sample delta.
+    @note: A cell's improving/stable evidence comes from its own exact DFBA
+        posterior, never from the borrowed-strength hierarchy estimate; the
+        regression flag comes from the layer-wide spike-and-slab model. The
+        hierarchy still shapes ``logit_shift`` and the delta interval.
     @return: The assembled :class:`HealthReport`.
-    @raise ValueError: If ``alpha`` is outside (0, 0.5) or ``regression_prob``
-        is outside (0.5, 1).
+    @raise ValueError: If ``alpha`` is outside (0, 0.5), ``regression_prob`` is
+        supplied and disagrees with ``1 - alpha``, ``rope_pp`` is negative, or
+        ``max_unresolved_share`` is outside [0, 1].
     """
     if not 0.0 < alpha < 0.5:
         raise ValueError(f"alpha must be in (0, 0.5), got {alpha}")
-    if not 0.5 < regression_prob < 1.0:
+    if regression_prob is None:
+        regression_prob = 1.0 - alpha
+    elif not 0.5 < regression_prob < 1.0:
         raise ValueError(f"regression_prob must be in (0.5, 1), got {regression_prob}")
+    elif abs(regression_prob - (1.0 - alpha)) > 1e-9:
+        raise ValueError(
+            "regression_prob and alpha are two names for the same threshold; "
+            f"expected regression_prob={1.0 - alpha}, got {regression_prob}"
+        )
+    if rope_pp < 0.0:
+        raise ValueError(f"rope_pp must be >= 0, got {rope_pp}")
+    if not 0.0 <= max_unresolved_share <= 1.0:
+        raise ValueError(f"max_unresolved_share must be in [0, 1], got {max_unresolved_share}")
     tier_of = dict(category_weights or {})
     active = [cell for cell in cells if cell.pairs > 0]
     policy = weighting(
@@ -409,6 +750,13 @@ def build_report(
     outcomes = sorted({cell.outcome for cell in active})
     strata = len({cell.stratum for cell in active})
     pairs = sum(cell.pairs for cell in active)
+    cov = _coverage(
+        coverage,
+        tier_of,
+        pending=pending,
+        pairs=pairs,
+        max_unresolved_share=max_unresolved_share,
+    )
 
     if pairs == 0 or not active:
         return HealthReport(
@@ -420,6 +768,7 @@ def build_report(
             candidate_epoch=candidate_epoch,
             category_weights=dict(tier_of),
             default_category=default_category,
+            coverage=cov,
             guardrail=Guardrail(status="insufficient", reason="no paired items yet"),
         )
 
@@ -435,6 +784,7 @@ def build_report(
             category_weights=dict(tier_of),
             default_category=default_category,
             tiered=tiered,
+            coverage=cov,
             guardrail=Guardrail(status="insufficient", reason="all outcome weights are zero"),
         )
 
@@ -443,28 +793,44 @@ def build_report(
         sum(policy.weight(cell) * cell.baseline_passed for cell in active) / weighted_pairs
     )
     observed_delta = level - baseline_level
+    epsilon = rope_pp / 100.0
 
     hierarchy_fit = fit(active, a0=a0, b0=b0)
-    posteriors = cell_posteriors(hierarchy_fit, active, draws=draws, seed=seed)
+    posteriors = cell_posteriors(hierarchy_fit, active, draws=draws, seed=seed, a_d=a_d, b_d=b_d)
 
     delta_draws: list[float] = []
     per_cell_delta: dict[tuple[str, str], list[float]] = {cell.key: [] for cell in posteriors.cells}
-    for row in posteriors.phi_draws:
+    for row, discordance in zip(posteriors.phi_draws, posteriors.discordance_draws):
         total = 0.0
         for position, cell in enumerate(posteriors.cells):
             weight = policy.weight(cell)
-            cell_delta = (2.0 * row[position] - 1.0) * cell.discordant / cell.pairs
+            cell_delta = (2.0 * row[position] - 1.0) * discordance[position]
             total += weight * cell.pairs * cell_delta
             per_cell_delta[cell.key].append(cell_delta)
         delta_draws.append(total / weighted_pairs)
     delta_draws.sort()
+    delta_p_improved = sum(1 for value in delta_draws if value > 0.0) / len(delta_draws)
 
-    n_improved, n_regressed = pooled_counts(active)
+    # Muted cells (weight 0) are excluded from the score, so they are also
+    # excluded from the pooled diagnostic and the homogeneity check: a view
+    # that does not count cannot make the layer look inconsistent.
+    stat_cells = [cell for cell in active if policy.weight(cell) > 0.0]
+    n_improved, n_regressed = pooled_counts(stat_cells)
     pooled = mcnemar(n_improved, n_regressed, a0=a0, b0=b0, prob_interval=prob_interval)
     pooled_p = pooled.p_improved if pooled.discordant > 0 else None
 
-    verdicts = cell_verdicts(
+    model = regression_model(
         active,
+        a0=a0,
+        b0=b0,
+        fdr=alpha,
+        weights=policy.family_weights,
+        pi_prior=pi_prior,
+        pi_points=pi_points,
+    )
+    verdicts = verdicts_from_model(
+        active,
+        model,
         a0=a0,
         b0=b0,
         prob_interval=prob_interval,
@@ -484,6 +850,7 @@ def build_report(
         if verdict == "regressing":
             flagged.append(f"{cell.stratum}/{cell.outcome}")
         share = None if net_change == 0 else weight * (cell.improved - cell.regressed) / net_change
+        contribution = 100.0 * weight * (cell.improved - cell.regressed) / weighted_pairs
         contributions.append(
             CellContribution(
                 stratum=cell.stratum,
@@ -501,8 +868,10 @@ def build_report(
                 delta_pp_low=100.0 * _quantile(interval, 0.025),
                 delta_pp_high=100.0 * _quantile(interval, 0.975),
                 p_improved=cell_test.p_improved,
+                p_regressed=cell_test.p_regressed,
                 logit_shift=summary.logit_shift,
                 verdict=verdict,
+                delta_pp_contribution=contribution,
                 share=share,
             )
         )
@@ -515,6 +884,7 @@ def build_report(
     )
     flagged.sort()
 
+    category_delta_draws = _category_delta_draws(active, policy, per_cell_delta, len(delta_draws))
     categories = _categories(
         active,
         policy,
@@ -523,14 +893,32 @@ def build_report(
         b0=b0,
         prob_interval=prob_interval,
         alpha=alpha,
+        rope=epsilon,
+        category_delta_draws=category_delta_draws,
+        verdicts=verdicts,
     )
 
-    heterogeneity = homogeneity_ppc(active, a0=a0, b0=b0, draws=ppc_draws, seed=seed)
+    heterogeneity = homogeneity_ppc(stat_cells, a0=a0, b0=b0, draws=ppc_draws, seed=seed)
     guardrail = _guardrail(
-        heterogeneity, flagged, pooled_p, alpha, cells=len(active), discordant=pooled.discordant
+        heterogeneity,
+        flagged,
+        pooled_p,
+        alpha,
+        cells=len(stat_cells),
+        discordant=pooled.discordant,
     )
 
-    status = layer_status(pooled_p, flagged, alpha)
+    verdict = delta_status(
+        delta_draws,
+        rope=epsilon,
+        alpha=alpha,
+        flagged=bool(flagged),
+        heterogeneous=guardrail.status == "heterogeneous",
+    )
+    # Coverage gates everything except a credible regression: incomplete data
+    # must not manufacture health, but it must never bury a flagged regression
+    # either.
+    status: Status = "insufficient" if not cov.complete and verdict != "regressing" else verdict
 
     return HealthReport(
         status=status,
@@ -539,9 +927,15 @@ def build_report(
         delta_pp=100.0 * observed_delta,
         delta_pp_low=100.0 * _quantile(delta_draws, 0.025),
         delta_pp_high=100.0 * _quantile(delta_draws, 0.975),
+        delta_p_improved=delta_p_improved,
+        p_no_regression=model.p_no_regression,
+        bfdr=model.bfdr,
+        pi_mean=model.pi_mean,
+        rope_pp=rope_pp,
         p_improved=pooled_p,
         pairs=pairs,
         pending=pending,
+        coverage=cov,
         strata=strata,
         outcomes=outcomes,
         baseline_epoch=baseline_epoch,
@@ -607,6 +1001,112 @@ def parse_category_weights(text: str | None) -> dict[str, float]:
     return weights
 
 
+def _coverage(
+    coverage: list[CellCoverage] | None,
+    category_weights: dict[str, float],
+    *,
+    pending: int,
+    pairs: int,
+    max_unresolved_share: float,
+) -> Coverage:
+    """Decide whether the comparison resolved enough to be judged.
+
+    With no per-cell coverage (a direct :func:`build_report` caller) this
+    falls back to the scalar pending count over the paired count. The tracker
+    supplies per-cell counts so the critical tier can be held to a stricter
+    standard: any unresolved item in the most critical tier present gates the
+    verdict regardless of the global share.
+    """
+    if coverage is None:
+        total = pairs + pending
+        share = pending / total if total > 0 else 0.0
+        complete = share <= max_unresolved_share
+        reason = (
+            ""
+            if complete
+            else f"{pending} of {total} items unresolved ({share:.0%} > {max_unresolved_share:.0%})"
+        )
+        return Coverage(
+            paired=pairs,
+            pending=pending,
+            errored=0,
+            unresolved_share=share,
+            complete=complete,
+            reason=reason,
+        )
+
+    paired = sum(item.paired for item in coverage)
+    pend = sum(item.pending for item in coverage)
+    errored = sum(item.errored for item in coverage)
+    total = paired + pend + errored
+    share = (pend + errored) / total if total > 0 else 0.0
+
+    # Detect the critical tier from the coverage itself, not from the active
+    # cells: a tier-1 view that is entirely pending/errored has no active cell,
+    # and that is exactly the case the gate must catch.
+    critical_unresolved = 0
+    tier_weights = {
+        item.category: category_weights.get(item.category, 1.0)
+        for item in coverage
+        if item.category is not None
+    }
+    if tier_weights:
+        top = max(tier_weights.values())
+        if top > 0.0:
+            critical_unresolved = sum(
+                item.unresolved
+                for item in coverage
+                if item.category is not None and tier_weights[item.category] == top
+            )
+
+    reasons: list[str] = []
+    if share > max_unresolved_share:
+        reasons.append(
+            f"{pend + errored} of {total} items unresolved ({share:.0%} > {max_unresolved_share:.0%})"
+        )
+    if critical_unresolved:
+        reasons.append(f"{critical_unresolved} unresolved items in the most critical tier")
+    return Coverage(
+        paired=paired,
+        pending=pend,
+        errored=errored,
+        unresolved_share=share,
+        critical_unresolved=critical_unresolved,
+        complete=not reasons,
+        reason="; ".join(reasons),
+    )
+
+
+def _category_delta_draws(
+    cells: list[Cell],
+    policy: Weighting,
+    per_cell_delta: dict[tuple[str, str], list[float]],
+    draws: int,
+) -> dict[str | None, list[float]]:
+    """Aggregate the per-cell delta draws into a weighted draw per tier.
+
+    The tier's own category weight is constant inside the group and cancels,
+    but the outcome weights do not, so a tier with two differently-weighted
+    outcomes is summarised with the same weighting as the layer.
+    """
+    grouped: dict[str | None, list[Cell]] = {}
+    for cell in cells:
+        grouped.setdefault(policy.category(cell), []).append(cell)
+    out: dict[str | None, list[float]] = {}
+    for category, group in grouped.items():
+        denominator = sum(policy.weight(cell) * cell.pairs for cell in group)
+        if denominator <= 0.0:
+            continue
+        out[category] = [
+            sum(
+                policy.weight(cell) * cell.pairs * per_cell_delta[cell.key][index] for cell in group
+            )
+            / denominator
+            for index in range(draws)
+        ]
+    return out
+
+
 def _categories(
     cells: list[Cell],
     policy: Weighting,
@@ -616,15 +1116,19 @@ def _categories(
     b0: float,
     prob_interval: float,
     alpha: float,
+    rope: float,
+    category_delta_draws: dict[str | None, list[float]],
+    verdicts: dict[tuple[str, str], CellVerdict],
 ) -> list[CategorySummary]:
     """Per-tier roll-up of the same cells the layer score is built from.
 
     Numbers are comparable across tiers because the tier's own weight is a
-    constant inside the group and cancels. ``status`` comes from the tier's
-    pooled McNemar test; per-cell escalation (``contributions``) names the
-    views when a tier is heterogeneous.
+    constant inside the group and cancels. ``status`` comes from the tier's own
+    weighted delta draws via :func:`delta_status`, and includes the tier's own
+    flagged cells — a tier with a credible regression can never read
+    ``improving`` while that regression sits inside it.
 
-    @note: Per-cell escalation stays at the layer level, so a tier's verdict is
+    @note: Per-cell escalation stays inside the tier, so a tier's verdict is
         never driven by a cell outside it.
     """
     grouped: dict[str | None, list[Cell]] = {}
@@ -650,7 +1154,18 @@ def _categories(
         regressed = sum(cell.regressed for cell in group)
         pooled = mcnemar(improved, regressed, a0=a0, b0=b0, prob_interval=prob_interval)
         p_improved = pooled.p_improved if pooled.discordant > 0 else None
-        status = layer_status(p_improved, [], alpha)
+        group_flagged = [
+            f"{cell.stratum}/{cell.outcome}"
+            for cell in group
+            if verdicts[cell.key].verdict == "regressing"
+        ]
+        draws = category_delta_draws.get(category, [])
+        delta_p_improved = sum(1 for value in draws if value > 0.0) / len(draws) if draws else None
+        status: Status = (
+            delta_status(draws, rope=rope, alpha=alpha, flagged=bool(group_flagged))
+            if draws
+            else "insufficient"
+        )
         summaries.append(
             CategorySummary(
                 category=category,
@@ -665,6 +1180,7 @@ def _categories(
                 discordant=improved + regressed,
                 p_improved=p_improved,
                 status=status,
+                delta_p_improved=delta_p_improved,
             )
         )
     summaries.sort(key=lambda summary: (-summary.weight, summary.category or ""))
@@ -694,27 +1210,27 @@ def _guardrail(
         return Guardrail(
             status="insufficient", flagged=flagged, reason="homogeneity check unavailable"
         )
-    p_value = heterogeneity.p_value
+    ppc = heterogeneity.ppc
     observed = heterogeneity.observed
     expected = heterogeneity.expected
     draws = heterogeneity.draws
-    if p_value < alpha:
+    if ppc < alpha:
         return Guardrail(
             status="heterogeneous",
-            p_value=p_value,
+            ppc=ppc,
             dispersion=observed,
             expected_dispersion=expected,
             draws=draws,
             flagged=flagged,
             reason=(
                 "stratum switch rates are not homogeneous"
-                f" (posterior predictive p={p_value:.3f}, alpha={alpha})"
+                f" (posterior predictive tail={ppc:.3f}, alpha={alpha})"
             ),
         )
     if flagged and pooled_p is not None and pooled_p > alpha:
         return Guardrail(
             status="heterogeneous",
-            p_value=p_value,
+            ppc=ppc,
             dispersion=observed,
             expected_dispersion=expected,
             draws=draws,
@@ -726,7 +1242,7 @@ def _guardrail(
         )
     return Guardrail(
         status="ok",
-        p_value=p_value,
+        ppc=ppc,
         dispersion=observed,
         expected_dispersion=expected,
         draws=draws,

@@ -6,7 +6,7 @@ import json
 import random
 import unittest
 
-from pydfba import HealthTracker, PairRecord
+from pydfba import ERROR, HealthTracker, PairRecord
 
 FAST = {"draws": 96, "ppc_draws": 96}
 
@@ -34,9 +34,9 @@ def records() -> list[PairRecord]:
 class StreamingTest(unittest.TestCase):
     def test_batch_and_streaming_agree(self) -> None:
         payload = records()
-        batch = HealthTracker(**FAST)
+        batch = HealthTracker(seed=0, **FAST)
         batch.observe_many(payload)
-        streamed = HealthTracker(**FAST)
+        streamed = HealthTracker(seed=0, **FAST)
         for record in reversed(payload):
             streamed.observe(
                 record.stratum, record.outcome, record.item, record.baseline, record.candidate
@@ -241,13 +241,13 @@ class SnapshotTest(unittest.TestCase):
         self.assertEqual(restored.baseline_epoch, "2026-06-30")
 
     def test_snapshot_is_deterministic_and_sorted(self) -> None:
-        first = HealthTracker()
+        first = HealthTracker(seed=0)
         first.observe_many(records())
-        second = HealthTracker()
+        second = HealthTracker(seed=0)
         second.observe_many(list(reversed(records())))
         self.assertEqual(first.to_json(), second.to_json())
         payload = json.loads(first.to_json())
-        self.assertEqual(payload["version"], 1)
+        self.assertEqual(payload["version"], 2)
         self.assertEqual(len(payload["records"]), 12)
 
     def test_snapshot_survives_a_json_round_trip_through_text(self) -> None:
@@ -265,6 +265,126 @@ class SnapshotTest(unittest.TestCase):
         tracker = HealthTracker()
         with self.assertRaises(ValueError):
             tracker.observe("", "answer", "q1", True, False)
+
+
+class ErroredStateTest(unittest.TestCase):
+    def test_error_is_distinct_from_pending(self) -> None:
+        tracker = HealthTracker(**FAST)
+        tracker.observe("v", "answer", "q1", False, ERROR)
+        self.assertEqual(tracker.errored, 1)
+        self.assertEqual(tracker.pending, 0)
+        self.assertEqual(tracker.paired, 0)
+        report = tracker.report()
+        self.assertEqual(report.coverage.errored, 1)
+        self.assertEqual(report.status, "insufficient")
+
+    def test_error_does_not_count_as_a_pair(self) -> None:
+        tracker = HealthTracker(**FAST)
+        tracker.observe("v", "answer", "q1", False, ERROR)
+        tracker.observe("v", "answer", "q2", False, True)
+        self.assertEqual(tracker.paired, 1)
+        report = tracker.report()
+        self.assertEqual(report.pairs, 1)
+        self.assertEqual(report.contributions[0].improved, 1)
+
+    def test_error_survives_snapshot(self) -> None:
+        tracker = HealthTracker(**FAST)
+        tracker.observe("v", "answer", "q1", False, ERROR)
+        restored = HealthTracker.from_json(tracker.to_json(), **FAST)
+        self.assertEqual(restored.errored, 1)
+        self.assertEqual(restored.coverage()[0].errored, 1)
+
+    def test_advance_drops_an_errored_candidate(self) -> None:
+        tracker = HealthTracker(**FAST)
+        tracker.observe("v", "answer", "q1", False, ERROR)
+        tracker.advance()
+        self.assertEqual(len(tracker), 0)
+
+
+class CoverageGateTest(unittest.TestCase):
+    def test_coverage_gates_when_pending_share_is_high(self) -> None:
+        tracker = HealthTracker(**FAST)
+        for index in range(4):
+            tracker.observe("v", "answer", f"q{index}", False, True)
+        tracker.observe("v", "answer", "q9", False, None)
+        report = tracker.report()
+        self.assertEqual(report.coverage.pending, 1)
+        self.assertTrue(report.coverage.complete)  # 1/5 = 20% <= 25%
+        for index in range(4):
+            tracker.observe("v", "answer", f"p{index}", False, None)
+        report = tracker.report()
+        self.assertFalse(report.coverage.complete)
+        self.assertEqual(report.status, "insufficient")
+
+    def test_critical_tier_pending_gates_immediately(self) -> None:
+        tracker = HealthTracker(
+            categories={"crit": "tier-1"},
+            category_weights={"tier-1": 3.0, "tier-3": 1.0},
+            **FAST,
+        )
+        tracker.set_category("aux", "tier-3")
+        for index in range(20):
+            tracker.observe("aux", "answer", f"q{index}", False, True)
+        tracker.observe("crit", "answer", "q1", False, None)
+        report = tracker.report()
+        self.assertEqual(report.coverage.critical_unresolved, 1)
+        self.assertEqual(report.status, "insufficient")
+
+
+class SeedLifecycleTest(unittest.TestCase):
+    """The first seed is drawn once, persisted, and reused for every update."""
+
+    def test_seed_is_generated_when_not_supplied(self) -> None:
+        tracker = HealthTracker(**FAST)
+        self.assertIsInstance(tracker.seed, int)
+
+    def test_seed_is_persisted_and_restored(self) -> None:
+        tracker = HealthTracker(**FAST)
+        seed = tracker.seed
+        restored = HealthTracker.from_json(tracker.to_json(), **FAST)
+        self.assertEqual(restored.seed, seed)
+
+    def test_seed_survives_updates_and_advance(self) -> None:
+        tracker = HealthTracker(**FAST)
+        seed = tracker.seed
+        tracker.observe("v", "answer", "q1", False, True)
+        tracker.report()
+        tracker.advance()
+        tracker.observe("v", "answer", "q1", True, False)
+        tracker.report()
+        self.assertEqual(tracker.seed, seed)
+
+    def test_explicit_seed_is_honoured_on_restore(self) -> None:
+        tracker = HealthTracker(seed=7, **FAST)
+        restored = HealthTracker.from_json(tracker.to_json(), seed=99, **FAST)
+        self.assertEqual(restored.seed, 99)
+
+
+class MergeGuardTest(unittest.TestCase):
+    def test_merge_rejects_different_epochs(self) -> None:
+        primary = HealthTracker(**FAST, baseline_epoch="a", candidate_epoch="b")
+        other = HealthTracker(**FAST, baseline_epoch="a", candidate_epoch="c")
+        with self.assertRaises(ValueError):
+            primary.merge(other)
+        primary.merge(other, on_epoch_mismatch="ignore")
+
+    def test_merge_prefer_other_moves_config_too(self) -> None:
+        primary = HealthTracker(**FAST)
+        other = HealthTracker(
+            weights={"answer": 2.0},
+            categories={"v": "tier-1"},
+            category_weights={"tier-1": 3.0},
+        )
+        primary.merge(other)
+        self.assertEqual(primary.weights, {"answer": 2.0})
+        self.assertEqual(primary.category_of("v"), "tier-1")
+        self.assertEqual(primary.category_weights, {"tier-1": 3.0})
+
+    def test_merge_prefer_self_keeps_local_config(self) -> None:
+        primary = HealthTracker(weights={"answer": 5.0}, **FAST)
+        other = HealthTracker(weights={"answer": 2.0})
+        primary.merge(other, prefer="self")
+        self.assertEqual(primary.weights, {"answer": 5.0})
 
 
 if __name__ == "__main__":

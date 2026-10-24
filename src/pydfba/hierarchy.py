@@ -28,8 +28,8 @@ and a fit costs milliseconds.
 The guardrail is a **posterior predictive heterogeneity check**, not a Bayes
 factor for ``kappa`` (see ``homogeneity_ppc``): under the pooled model, the
 observed dispersion of discordant switch rates across cells is compared with
-its posterior predictive distribution. Small p-values say the strata are *not*
-moving together — exactly the condition under which a pooled score can hide a
+its posterior predictive distribution. Small tail probabilities say the strata
+are *not* moving together — exactly the condition under which a pooled score can hide a
 regression in one stratum behind improvements in the others.
 """
 
@@ -177,11 +177,21 @@ class CellPosteriors:
     from the *same* ``(mu, kappa)`` draw — so the draws are correctly
     correlated across cells and a pooled delta computed from them carries the
     hierarchical uncertainty.
+
+    ``discordance_draws[i][j]`` is the fraction of ``cells[j]``'s pairs that
+    changed at all, drawn from ``Beta(a_d + discordant, b_d + unchanged)``.
+    The switch rate alone conditions on the observed discordant count, so a
+    bank that did not move would look like certainty; multiplying by this draw
+    is what makes a delta interval (and a ROPE on it) a statement about the
+    population rather than a reconstruction of the sample. The two draw sets
+    are independent by construction: ``d`` carries how much moved, ``phi``
+    carries which way.
     """
 
     cells: tuple[Cell, ...]
     summaries: dict[tuple[str, str], CellPosterior]
     phi_draws: tuple[tuple[float, ...], ...]
+    discordance_draws: tuple[tuple[float, ...], ...]
     params: tuple[tuple[float, float], ...]
 
 
@@ -336,6 +346,8 @@ def cell_posteriors(
     *,
     draws: int = DRAWS,
     seed: int = 0,
+    a_d: float = 1.0,
+    b_d: float = 1.0,
 ) -> CellPosteriors:
     """Summarise every cell, keeping the joint draws for pooled quantities.
 
@@ -343,9 +355,18 @@ def cell_posteriors(
     equal-tail interval and logit shift are Monte-Carlo summaries of the
     conditional beta draws. The seed is fixed by default so a given state
     always serialises to the same report (important for a monitoring series).
+
+    ``a_d``/``b_d`` are the Beta prior on each cell's discordance rate. The
+    uniform ``(1, 1)`` default is weakly informative: it never moves the
+    sample mean (``(a_d + discordant) / (a_d + b_d + pairs)`` is the MLE when
+    the prior is uniform) but it does keep the interval honest on a bank where
+    almost nothing moved, because it shrinks the discordance rate towards the
+    prior rather than pinning it at the observed count.
     """
     if draws < 2:
         raise ValueError(f"draws must be at least 2, got {draws}")
+    if a_d <= 0.0 or b_d <= 0.0:
+        raise ValueError(f"discordance prior shapes must be positive, got a_d={a_d}, b_d={b_d}")
     active = [cell for cell in cells if cell.pairs > 0]
     rng = random.Random(seed)
     params = _sample_params(fit, draws, rng)
@@ -357,6 +378,15 @@ def cell_posteriors(
             b = (1.0 - mu) * kappa + cell.regressed
             row.append(beta_sample(rng, a, b))
         phi_draws.append(row)
+    # Drawn after every switch-rate row so the phi draws are byte-identical to
+    # the pre-discordance model for a given seed (reports stay comparable
+    # across a package upgrade).
+    discordance_draws: list[list[float]] = []
+    for _ in params:
+        row = []
+        for cell in active:
+            row.append(beta_sample(rng, a_d + cell.discordant, b_d + cell.unchanged))
+        discordance_draws.append(row)
 
     summaries: dict[tuple[str, str], CellPosterior] = {}
     lower_index = int(0.025 * draws)
@@ -375,6 +405,7 @@ def cell_posteriors(
         cells=tuple(active),
         summaries=summaries,
         phi_draws=tuple(tuple(row) for row in phi_draws),
+        discordance_draws=tuple(tuple(row) for row in discordance_draws),
         params=tuple(params),
     )
 
@@ -393,7 +424,8 @@ def pooled_counts(cells: list[Cell]) -> tuple[int, int]:
 class Homogeneity:
     """Posterior predictive check of "the strata move together"."""
 
-    p_value: float
+    ppc: float
+    """Posterior predictive tail probability (Bayesian model check)."""
     observed: float
     expected: float
     draws: int
@@ -401,7 +433,7 @@ class Homogeneity:
 
     @property
     def heterogeneous(self) -> bool:
-        return self.p_value < 0.05
+        return self.ppc < 0.05
 
 
 def homogeneity_ppc(
@@ -420,8 +452,8 @@ def homogeneity_ppc(
 
     evaluated once against the observed counts and once against data
     simulated from the *pooled* model ``phi | data ~ Beta(a0 + K, b0 + N - K)``
-    (``K``/``N`` the pooled discordant switches/trials). The p-value is the
-    fraction of replicated ``T`` reaching the observed one.
+    (``K``/``N`` the pooled discordant switches/trials). The reported ``ppc``
+    is the fraction of replicated ``T`` reaching the observed one.
 
     @note: Both the trial count and the Pearson statistic use the **discordant**
         sub-population (``improved + regressed``); a cell with no discordant
@@ -466,7 +498,7 @@ def homogeneity_ppc(
         expected += replicated
         exceed += replicated >= observed_draw
     return Homogeneity(
-        p_value=exceed / draws,
+        ppc=exceed / draws,
         observed=observed / draws,
         expected=expected / draws,
         draws=draws,

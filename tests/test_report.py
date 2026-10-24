@@ -9,10 +9,13 @@ import random
 from pydfba.hierarchy import Cell
 from pydfba import DEFAULT_CATEGORY
 from pydfba.report import (
+    CellCoverage,
     HealthReport,
     build_report,
     cell_verdicts,
+    delta_status,
     parse_category_weights,
+    regression_model,
 )
 
 FAST = {"draws": 128, "ppc_draws": 128}
@@ -257,27 +260,31 @@ class CategoryWeightsParsingTest(unittest.TestCase):
 
 
 class RegressionMultiplicityTest(unittest.TestCase):
-    """The per-cell regression flag controls family-wise error across cells."""
+    """The regression flag is a Bayesian FDR decision, not a p-value family."""
 
-    def test_many_individually_significant_cells_are_not_all_flagged(self) -> None:
-        """Sixty cells at p~0.03: below 0.05, above the Holm threshold.
+    def test_a_realistic_global_null_does_not_mass_flag(self) -> None:
+        """Under a genuine null the Bayesian gate stays quiet.
 
-        Without correction every one of these would be a "regressing" cell and
-        the layer would be declared regressing by chance. With Holm none is
-        singled out; the pooled test still decides the layer on its own.
+        A pathological all-at-0/4 layer is overwhelming evidence against a
+        shared .5 switch rate, so a coherent model flags it; a realistic null
+        (each cell's improvements drawn from Bin(20, .5)) is a different story.
         """
-        cells = [cell(f"v{i}", 0, 4, 20) for i in range(60)]
-        verdicts = cell_verdicts(cells)
-        self.assertEqual(len(verdicts), 60)
-        self.assertTrue(all(result.verdict == "stable" for result in verdicts.values()))
-        report = build_report(cells, **FAST)
-        self.assertEqual(report.guardrail.flagged, [])
-        self.assertLess(report.contributions[0].p_improved, 0.05)  # evidence is still reported
+        rng = random.Random(0)
+        cells = []
+        for index in range(40):
+            improved = sum(1 for _ in range(20) if rng.random() < 0.5)
+            cells.append(cell(f"v{index}", improved, 20 - improved, 20))
+        model = regression_model(cells)
+        self.assertEqual(len(model.flagged), 0)
+        self.assertLessEqual(model.bfdr, 0.05)
 
-    def test_a_single_cell_keeps_the_uncorrected_threshold(self) -> None:
-        """With one cell there is no family, so its own alpha applies."""
-        verdicts = cell_verdicts([cell("only", 0, 4, 20)])
-        self.assertEqual(verdicts[("only", "answer")].verdict, "regressing")
+    def test_single_cell_flags_only_on_strong_evidence(self) -> None:
+        """With one cell the prior is the only multiplicity control."""
+        strong = cell_verdicts([cell("only", 0, 10, 20)])
+        self.assertEqual(strong[("only", "answer")].verdict, "regressing")
+        self.assertGreater(strong[("only", "answer")].p_regressed, 0.95)
+        weak = cell_verdicts([cell("only", 0, 4, 20)])
+        self.assertEqual(weak[("only", "answer")].verdict, "stable")
 
     def test_family_wise_false_regressions_stay_rare_under_the_null(self) -> None:
         rng = random.Random(7)
@@ -370,6 +377,197 @@ class ReportStatusTest(unittest.TestCase):
             build_report([cell("a", 1, 1, 4)], regression_prob=0.5)
         with self.assertRaises(ValueError):
             build_report([cell("a", 1, 1, 4)], weights={"answer": -1.0})
+
+
+class WeightedStatusTest(unittest.TestCase):
+    """The verdict must come from the same weighted delta the headline reports."""
+
+    def test_status_follows_the_weighted_delta_not_the_unweighted_pool(self) -> None:
+        cells = [
+            cell("big_aux", 60, 20, 400, outcome="spec", category="tier-3"),
+            cell("crit1", 0, 3, 60, outcome="answer", category="tier-1"),
+            cell("crit2", 0, 3, 60, outcome="answer", category="tier-1"),
+            cell("crit3", 0, 3, 60, outcome="answer", category="tier-1"),
+        ]
+        report = build_report(cells, category_weights={"tier-1": 5.0, "tier-3": 1.0}, **FAST)
+        # The unweighted pooled test is fooled by the huge auxiliary cell...
+        assert report.p_improved is not None
+        self.assertGreater(report.p_improved, 0.95)
+        # ...but the weighted delta is negative, so the status must not say improving.
+        assert report.delta_pp is not None
+        self.assertLess(report.delta_pp, 0.0)
+        self.assertNotEqual(report.status, "improving")
+
+    def test_muted_outcome_cannot_drive_the_status(self) -> None:
+        cells = [
+            cell("muted", 0, 40, 100, outcome="spec"),
+            cell("real", 12, 0, 40, outcome="answer"),
+        ]
+        report = build_report(cells, weights={"spec": 0.0}, **FAST)
+        self.assertEqual(report.status, "improving")
+        self.assertEqual(report.guardrail.flagged, [])
+
+
+class TierRollupTest(unittest.TestCase):
+    """A tier's verdict must include the flags inside that tier, and only those."""
+
+    def test_tier_status_includes_its_own_flagged_cell(self) -> None:
+        cells = [cell(f"t1_{i}", 9, 1, 20, category="tier-1") for i in range(4)]
+        cells.append(cell("t1_bad", 0, 10, 20, category="tier-1"))
+        report = build_report(cells, **FAST)
+        tier = next(summary for summary in report.categories if summary.category == "tier-1")
+        self.assertIn("t1_bad/answer", report.guardrail.flagged)
+        self.assertEqual(tier.status, "regressing")
+
+    def test_tier_rollup_ignores_flags_from_other_tiers(self) -> None:
+        cells = [
+            cell("good1", 9, 1, 20, category="tier-1"),
+            cell("good2", 9, 1, 20, category="tier-1"),
+            cell("bad", 0, 8, 20, category="tier-3"),
+        ]
+        report = build_report(cells, **FAST)
+        tier = next(summary for summary in report.categories if summary.category == "tier-1")
+        self.assertIn("bad/answer", report.guardrail.flagged)
+        self.assertEqual(tier.status, "improving")
+
+
+class BayesianMultiplicityTest(unittest.TestCase):
+    """Criticality is a prior-odds multiplier in the spike-and-slab model."""
+
+    def test_criticality_weight_lifts_a_borderline_regression(self) -> None:
+        rng = random.Random(0)
+        aux = []
+        for index in range(40):
+            improved = sum(1 for _ in range(20) if rng.random() < 0.5)
+            aux.append(cell(f"v{index}", improved, 20 - improved, 20, category="tier-3"))
+        critical = cell("critical", 0, 8, 20, category="tier-1")
+        plain = build_report([*aux, critical], **FAST)
+        weighted = build_report(
+            [*aux, critical],
+            category_weights={"tier-1": 10.0, "tier-3": 1.0},
+            **FAST,
+        )
+        self.assertNotIn("critical/answer", plain.guardrail.flagged)
+        self.assertIn("critical/answer", weighted.guardrail.flagged)
+
+    def test_bfdr_is_within_the_target(self) -> None:
+        cells = [cell("a", 0, 8, 20), cell("b", 2, 18, 20)]
+        model = regression_model(cells, fdr=0.05)
+        self.assertTrue(model.flagged)
+        self.assertLessEqual(model.bfdr, 0.05)
+        self.assertTrue(0.0 <= model.p_no_regression <= 1.0)
+
+
+class RopeStatusTest(unittest.TestCase):
+    """The ROPE makes stability a positive claim, and keeps it N-sensitive."""
+
+    def test_large_unchanged_bank_is_stable(self) -> None:
+        report = build_report([cell("a", 0, 0, 20000), cell("b", 0, 0, 20000)], **FAST)
+        self.assertEqual(report.status, "stable")
+        self.assertAlmostEqual(report.delta_pp or 0.0, 0.0, places=9)
+
+    def test_small_unchanged_bank_is_not_yet_stable(self) -> None:
+        report = build_report([cell("a", 0, 0, 10), cell("b", 0, 0, 8)], **FAST)
+        self.assertNotEqual(report.status, "stable")
+
+    def test_delta_status_is_a_rope_decision(self) -> None:
+        self.assertEqual(delta_status([-0.5] * 100, rope=0.01, alpha=0.05), "regressing")
+        self.assertEqual(delta_status([0.5] * 100, rope=0.01, alpha=0.05), "improving")
+        self.assertEqual(
+            delta_status([0.5] * 100, rope=0.01, alpha=0.05, heterogeneous=True), "mixed"
+        )
+        self.assertEqual(delta_status([0.0] * 100, rope=0.01, alpha=0.05), "stable")
+        self.assertEqual(
+            delta_status([0.5] * 50 + [-0.5] * 50, rope=0.01, alpha=0.05), "insufficient"
+        )
+        self.assertEqual(delta_status([], rope=0.01, alpha=0.05), "insufficient")
+        self.assertEqual(
+            delta_status([0.5] * 100, rope=0.01, alpha=0.05, flagged=True), "regressing"
+        )
+
+
+class HeterogeneityStatusTest(unittest.TestCase):
+    def test_heterogeneous_improvement_is_mixed(self) -> None:
+        cells = [cell(f"t1_{i}", 9, 1, 20, category="tier-1") for i in range(8)]
+        cells.append(cell("t1_bad", 0, 6, 20, category="tier-1"))
+        report = build_report(cells, **FAST)
+        self.assertEqual(report.guardrail.status, "heterogeneous")
+        self.assertEqual(report.guardrail.flagged, [])
+        self.assertEqual(report.status, "mixed")
+
+
+class AdditiveContributionTest(unittest.TestCase):
+    def test_delta_pp_contributions_sum_to_the_headline(self) -> None:
+        cells = [cell("a", 4, 1, 20), cell("b", 2, 5, 20), cell("c", 3, 0, 10)]
+        report = build_report(cells, **FAST)
+        total = sum(item.delta_pp_contribution for item in report.contributions)
+        assert report.delta_pp is not None
+        self.assertAlmostEqual(total, report.delta_pp, places=9)
+
+    def test_contributions_are_additive_under_weights(self) -> None:
+        cells = [
+            cell("critical", 10, 0, 100, category="tier-1"),
+            cell("routine", 0, 9, 100, category="tier-3"),
+        ]
+        report = build_report(cells, category_weights={"tier-1": 3.0, "tier-3": 1.0}, **FAST)
+        total = sum(item.delta_pp_contribution for item in report.contributions)
+        assert report.delta_pp is not None
+        self.assertAlmostEqual(total, report.delta_pp, places=9)
+
+    def test_share_is_absent_when_offsets_make_it_meaningless(self) -> None:
+        report = build_report([cell("up", 10, 0, 100), cell("down", 0, 10, 100)], **FAST)
+        self.assertAlmostEqual(report.delta_pp or 0.0, 0.0, places=9)
+        self.assertTrue(all(item.share is None for item in report.contributions))
+
+
+class ThresholdConsistencyTest(unittest.TestCase):
+    def test_regression_prob_must_agree_with_alpha(self) -> None:
+        with self.assertRaises(ValueError):
+            build_report([cell("a", 8, 2, 20)], alpha=0.01, regression_prob=0.95, **FAST)
+        build_report([cell("a", 8, 2, 20)], alpha=0.01, regression_prob=0.99, **FAST)
+
+    def test_rope_must_be_non_negative(self) -> None:
+        with self.assertRaises(ValueError):
+            build_report([cell("a", 8, 2, 20)], rope_pp=-1.0, **FAST)
+
+
+class CoverageGateTest(unittest.TestCase):
+    def test_pending_share_gates_the_status(self) -> None:
+        report = build_report(
+            [cell("a", 5, 0, 10)],
+            coverage=[CellCoverage("a", "answer", paired=10, pending=5)],
+            **FAST,
+        )
+        self.assertFalse(report.coverage.complete)
+        self.assertEqual(report.status, "insufficient")
+
+    def test_critical_tier_pending_gates_even_a_tiny_global_share(self) -> None:
+        cells = [
+            cell("crit", 5, 0, 100, category="tier-1"),
+            cell("aux", 5, 0, 100, category="tier-3"),
+        ]
+        coverage = [
+            CellCoverage("crit", "answer", category="tier-1", paired=100, pending=1),
+            CellCoverage("aux", "answer", category="tier-3", paired=100, pending=0),
+        ]
+        report = build_report(
+            cells,
+            category_weights={"tier-1": 3.0, "tier-3": 1.0},
+            coverage=coverage,
+            **FAST,
+        )
+        self.assertEqual(report.coverage.critical_unresolved, 1)
+        self.assertFalse(report.coverage.complete)
+        self.assertEqual(report.status, "insufficient")
+
+    def test_coverage_never_buries_a_flagged_regression(self) -> None:
+        report = build_report(
+            [cell("bad", 0, 10, 10)],
+            coverage=[CellCoverage("bad", "answer", paired=10, pending=100)],
+            **FAST,
+        )
+        self.assertIn("bad/answer", report.guardrail.flagged)
+        self.assertEqual(report.status, "regressing")
 
 
 if __name__ == "__main__":

@@ -36,16 +36,60 @@ snapshot so a resumed tracker scores the same way it did before the restart.
 from __future__ import annotations
 
 import json
+import random
 from dataclasses import dataclass
 from typing import Literal
 
 from pydfba.hierarchy import DRAWS, PPC_DRAWS, Cell
-from pydfba.report import DEFAULT_CATEGORY, HealthReport, build_report
+from pydfba.report import DEFAULT_CATEGORY, CellCoverage, HealthReport, build_report
 
-SNAPSHOT_VERSION = 1
+SNAPSHOT_VERSION = 2
 
+
+class _Errored:
+    """Sentinel for an evaluation that failed, distinct from pending ``None``.
+
+    ``None`` means "not evaluated yet"; ``ERROR`` means "evaluated and the
+    evaluation itself failed". Both are unresolved, but an error is a health
+    signal in its own right and must survive a snapshot, so it gets its own
+    state instead of being folded into pending.
+    """
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return "ERROR"
+
+
+#: Marker for a side whose evaluation errored (as opposed to ``None`` = pending).
+ERROR = _Errored()
+
+Side = bool | None | _Errored
 CellKey = tuple[str, str]
-Pair = tuple[bool | None, bool | None]
+Pair = tuple[Side, Side]
+
+
+def _errored(value: Side) -> bool:
+    return isinstance(value, _Errored)
+
+
+def _serialise_side(value: Side) -> object:
+    return "error" if _errored(value) else value
+
+
+def _parse_side(value: object) -> Side:
+    return ERROR if value == "error" else value  # type: ignore[return-value]
+
+
+def _generate_seed() -> int:
+    """A fresh seed for the Monte-Carlo draws.
+
+    Generated once when a tracker is created and persisted in the snapshot, so
+    every later refresh of the same tracker reuses the same random stream.
+    Without that, a restart would redraw the intervals for unchanged data and
+    a monitoring series would jitter for no reason.
+    """
+    return random.SystemRandom().randrange(0, 2**31)
 
 
 @dataclass(frozen=True)
@@ -60,8 +104,8 @@ class PairRecord:
     stratum: str
     outcome: str
     item: str
-    baseline: bool | None
-    candidate: bool | None
+    baseline: Side
+    candidate: Side
 
 
 class HealthTracker:
@@ -79,9 +123,15 @@ class HealthTracker:
         prob_interval: float = 0.95,
         draws: int = DRAWS,
         ppc_draws: int = PPC_DRAWS,
-        seed: int = 0,
+        seed: int | None = None,
         alpha: float = 0.05,
-        regression_prob: float = 0.95,
+        regression_prob: float | None = None,
+        a_d: float = 1.0,
+        b_d: float = 1.0,
+        rope_pp: float = 1.0,
+        pi_prior: tuple[float, float] = (1.0, 1.0),
+        pi_points: int = 199,
+        max_unresolved_share: float = 0.25,
         baseline_epoch: str | None = None,
         candidate_epoch: str | None = None,
     ) -> None:
@@ -97,9 +147,17 @@ class HealthTracker:
         self.prob_interval = prob_interval
         self.draws = draws
         self.ppc_draws = ppc_draws
-        self.seed = seed
+        # The first value: drawn once here and reused for every subsequent
+        # report, so a live series does not jitter as it is refreshed.
+        self.seed = seed if seed is not None else _generate_seed()
         self.alpha = alpha
         self.regression_prob = regression_prob
+        self.a_d = a_d
+        self.b_d = b_d
+        self.rope_pp = rope_pp
+        self.pi_prior = pi_prior
+        self.pi_points = pi_points
+        self.max_unresolved_share = max_unresolved_share
         self.baseline_epoch = baseline_epoch
         self.candidate_epoch = candidate_epoch
         self._records: dict[CellKey, dict[str, Pair]] = {}
@@ -109,16 +167,18 @@ class HealthTracker:
         stratum: str,
         outcome: str,
         item: str,
-        baseline: bool | None,
-        candidate: bool | None,
+        baseline: Side,
+        candidate: Side,
     ) -> None:
         """Record (or overwrite) one item's paired outcome.
 
         @param stratum: View/stratum the item belongs to.
         @param outcome: Outcome name within the view.
         @param item: Stable item key; re-observing the same key overwrites.
-        @param baseline: PASS/FAIL in the baseline epoch, ``None`` if not run.
-        @param candidate: PASS/FAIL in the candidate epoch, ``None`` if pending.
+        @param baseline: PASS/FAIL in the baseline epoch, ``None`` if not run,
+            or :data:`ERROR` if the evaluation failed.
+        @param candidate: PASS/FAIL in the candidate epoch, ``None`` if
+            pending, or :data:`ERROR` if the evaluation failed.
         @raise ValueError: If any of ``stratum``/``outcome``/``item`` is empty.
         """
         if not stratum or not outcome or not item:
@@ -154,16 +214,42 @@ class HealthTracker:
             )
         return len(records)
 
-    def merge(self, other: HealthTracker, *, prefer: Literal["other", "self"] = "other") -> None:
-        """Fold another tracker's state in (same schema, any epoch).
+    def merge(
+        self,
+        other: HealthTracker,
+        *,
+        prefer: Literal["other", "self"] = "other",
+        on_epoch_mismatch: Literal["raise", "ignore"] = "raise",
+    ) -> None:
+        """Fold another tracker's state in.
 
         Per item, a value already present wins over ``None`` from the other
-        side; when both carry a value, ``prefer`` decides whose is kept.
+        side; when both carry a value, ``prefer`` decides whose is kept. The
+        same ``prefer`` also decides whose weights and categories win, so the
+        record and the aggregation can never disagree about whose state this
+        is. Epochs must match unless ``on_epoch_mismatch="ignore"``: merging
+        two different comparisons and calling the result one report would
+        silently mix baselines.
 
         @param other: Tracker whose records and config are merged in.
         @param prefer: Whose value to keep when both sides have one;
             ``"other"`` (default) is the fresher in-flight evaluation.
+        @param on_epoch_mismatch: What to do when the epochs differ.
+        @raise ValueError: If the epochs differ and ``on_epoch_mismatch`` is
+            ``"raise"`` (the default).
         """
+        if on_epoch_mismatch not in ("raise", "ignore"):
+            raise ValueError(f"unknown on_epoch_mismatch {on_epoch_mismatch!r}")
+        if on_epoch_mismatch == "raise" and (
+            self.baseline_epoch != other.baseline_epoch
+            or self.candidate_epoch != other.candidate_epoch
+        ):
+            raise ValueError(
+                "cannot merge trackers from different epochs: "
+                f"self=({self.baseline_epoch!r}, {self.candidate_epoch!r}) "
+                f"other=({other.baseline_epoch!r}, {other.candidate_epoch!r}); "
+                "pass on_epoch_mismatch='ignore' to merge anyway"
+            )
         for key, items in other._records.items():
             target = self._records.setdefault(key, {})
             for item, (other_baseline, other_candidate) in items.items():
@@ -181,12 +267,17 @@ class HealthTracker:
                         other_baseline if other_baseline is not None else baseline,
                         other_candidate if other_candidate is not None else candidate,
                     )
-        for outcome, weight in other.weights.items():
-            self.weights.setdefault(outcome, weight)
-        for stratum, category in other.categories.items():
-            self.categories.setdefault(stratum, category)
-        for category, weight in other.category_weights.items():
-            self.category_weights.setdefault(category, weight)
+        if prefer == "other":
+            self.weights.update(other.weights)
+            self.categories.update(other.categories)
+            self.category_weights.update(other.category_weights)
+        else:
+            for outcome, weight in other.weights.items():
+                self.weights.setdefault(outcome, weight)
+            for stratum, category in other.categories.items():
+                self.categories.setdefault(stratum, category)
+            for category, weight in other.category_weights.items():
+                self.category_weights.setdefault(category, weight)
 
     def advance(
         self,
@@ -203,7 +294,9 @@ class HealthTracker:
         for key, items in self._records.items():
             kept: dict[str, Pair] = {}
             for item, (_, candidate) in items.items():
-                if candidate is not None:
+                # Only a real result can become the next baseline; a pending or
+                # errored candidate has nothing to promote.
+                if isinstance(candidate, bool):
                     kept[item] = (candidate, None)
             if kept:
                 rolled[key] = kept
@@ -213,12 +306,24 @@ class HealthTracker:
 
     @property
     def pending(self) -> int:
-        """Records waiting for the other epoch's outcome."""
+        """Records waiting for an outcome that has not been produced yet."""
         return sum(
             1
             for items in self._records.values()
             for baseline, candidate in items.values()
-            if baseline is None or candidate is None
+            if not _errored(baseline)
+            and not _errored(candidate)
+            and (baseline is None or candidate is None)
+        )
+
+    @property
+    def errored(self) -> int:
+        """Records where an evaluation failed on either side."""
+        return sum(
+            1
+            for items in self._records.values()
+            for baseline, candidate in items.values()
+            if _errored(baseline) or _errored(candidate)
         )
 
     @property
@@ -227,8 +332,32 @@ class HealthTracker:
             1
             for items in self._records.values()
             for baseline, candidate in items.values()
-            if baseline is not None and candidate is not None
+            if isinstance(baseline, bool) and isinstance(candidate, bool)
         )
+
+    def coverage(self) -> list[CellCoverage]:
+        """Per-cell resolved/pending/errored counts, sorted for determinism."""
+        out: list[CellCoverage] = []
+        for (stratum, outcome), items in sorted(self._records.items()):
+            paired = pending = errored = 0
+            for baseline, candidate in items.values():
+                if _errored(baseline) or _errored(candidate):
+                    errored += 1
+                elif baseline is None or candidate is None:
+                    pending += 1
+                else:
+                    paired += 1
+            out.append(
+                CellCoverage(
+                    stratum=stratum,
+                    outcome=outcome,
+                    category=self.categories.get(stratum),
+                    paired=paired,
+                    pending=pending,
+                    errored=errored,
+                )
+            )
+        return out
 
     def cells(self) -> list[Cell]:
         """Current per-cell discordant counts, sorted for determinism."""
@@ -236,7 +365,7 @@ class HealthTracker:
         for (stratum, outcome), items in sorted(self._records.items()):
             pairs = improved = regressed = passed = 0
             for baseline, candidate in items.values():
-                if baseline is None or candidate is None:
+                if not isinstance(baseline, bool) or not isinstance(candidate, bool):
                     continue
                 pairs += 1
                 passed += int(bool(candidate))
@@ -264,6 +393,8 @@ class HealthTracker:
         seed: int | None = None,
         alpha: float | None = None,
         regression_prob: float | None = None,
+        rope_pp: float | None = None,
+        max_unresolved_share: float | None = None,
     ) -> HealthReport:
         """Compute the metric from whatever has arrived so far."""
         return build_report(
@@ -273,13 +404,22 @@ class HealthTracker:
             default_category=self.default_category,
             a0=self.a0,
             b0=self.b0,
+            a_d=self.a_d,
+            b_d=self.b_d,
             prob_interval=self.prob_interval,
             draws=self.draws if draws is None else draws,
             ppc_draws=self.ppc_draws if ppc_draws is None else ppc_draws,
             seed=self.seed if seed is None else seed,
             alpha=self.alpha if alpha is None else alpha,
             regression_prob=self.regression_prob if regression_prob is None else regression_prob,
+            rope_pp=self.rope_pp if rope_pp is None else rope_pp,
+            pi_prior=self.pi_prior,
+            pi_points=self.pi_points,
             pending=self.pending,
+            coverage=self.coverage(),
+            max_unresolved_share=(
+                self.max_unresolved_share if max_unresolved_share is None else max_unresolved_share
+            ),
             baseline_epoch=self.baseline_epoch,
             candidate_epoch=self.candidate_epoch,
         )
@@ -289,9 +429,18 @@ class HealthTracker:
         records: list[list[object]] = []
         for (stratum, outcome), items in sorted(self._records.items()):
             for item, (baseline, candidate) in sorted(items.items()):
-                records.append([stratum, outcome, item, baseline, candidate])
+                records.append(
+                    [
+                        stratum,
+                        outcome,
+                        item,
+                        _serialise_side(baseline),
+                        _serialise_side(candidate),
+                    ]
+                )
         return {
             "version": SNAPSHOT_VERSION,
+            "seed": self.seed,
             "weights": dict(sorted(self.weights.items())),
             "category_weights": dict(sorted(self.category_weights.items())),
             "categories": dict(sorted(self.categories.items())),
@@ -312,18 +461,26 @@ class HealthTracker:
         version = payload.get("version", SNAPSHOT_VERSION)
         if version != SNAPSHOT_VERSION:
             raise ValueError(f"unsupported snapshot version {version!r}")
+        seed = config.pop("seed", payload.get("seed"))
         tracker = cls(
             weights=dict(payload.get("weights") or {}),  # type: ignore[arg-type]
             category_weights=dict(payload.get("category_weights") or {}),  # type: ignore[arg-type]
             categories=dict(payload.get("categories") or {}),  # type: ignore[arg-type]
             default_category=payload.get("default_category", DEFAULT_CATEGORY),  # type: ignore[arg-type]
+            seed=seed,  # type: ignore[arg-type]
             baseline_epoch=payload.get("baseline_epoch"),  # type: ignore[arg-type]
             candidate_epoch=payload.get("candidate_epoch"),  # type: ignore[arg-type]
             **config,  # type: ignore[arg-type]
         )
         for raw in payload.get("records") or []:  # type: ignore[union-attr]
             stratum, outcome, item, baseline, candidate = raw
-            tracker.observe(str(stratum), str(outcome), str(item), baseline, candidate)
+            tracker.observe(
+                str(stratum),
+                str(outcome),
+                str(item),
+                _parse_side(baseline),
+                _parse_side(candidate),
+            )
         return tracker
 
     def to_json(self, *, indent: int | None = None) -> str:
