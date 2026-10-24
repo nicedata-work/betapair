@@ -22,8 +22,12 @@ and dependency-light: the maths uses only Python's built-in `math` and
 
 ## Install
 
+Not published on PyPI yet, so install from a git URL or a checkout:
+
 ```bash
-uv add pydfba      # or: pip install pydfba
+uv add "pydfba @ git+https://github.com/<owner>/pydfba"
+# or, inside a clone:
+uv sync --extra dev
 ```
 
 ## Count the changes
@@ -211,12 +215,17 @@ tracker = HealthTracker.from_json(text)
 ## Development
 
 ```bash
-uv sync                 # set up the environment
+uv sync --extra dev     # set up the environment
 uv run pytest           # run the tests
 uv run ruff check .     # lint
 uv run ruff format .    # format
+uv run mypy             # type-check
 ```
 
 The `mcnemar()` function is a Python port of the R package `DFBA`'s
 `dfba_mcnemar()`. The decisions behind the report, and the simulations that
 check them, are documented in `docs/validation.md`.
+
+## License
+
+Apache-2.0 — see [`LICENSE`](LICENSE).
