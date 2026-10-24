@@ -25,8 +25,10 @@ _FP_MIN = 1e-300
 _CF_ITMAX = 400
 #: Bisection steps for :func:`beta_ppf`.
 _PPF_ITMAX = 64
-#: Clamp keeping sampled rates strictly inside (0, 1); see :func:`beta_sample`.
-_SAMPLE_EPS = 1e-12
+#: Smallest/largest rates :func:`beta_sample` returns — the limits of double
+#: precision, so the tail keeps its spread and downstream log-odds stay finite.
+_MIN_RATE = math.ulp(0.0)
+_MAX_RATE = math.nextafter(1.0, 0.0)
 
 
 def log_beta(a: float, b: float) -> float:
@@ -161,8 +163,19 @@ def log_beta_binomial(k: int, n: int, a: float, b: float) -> float:
     return log_choose(n, k) + log_beta(a + k, b + n - k) - log_beta(a, b)
 
 
-def _gamma_sample(rng: random.Random, shape: float) -> float:
-    """Marsaglia–Tsang gamma draw (shape >= 1)."""
+def _log_gamma_sample(rng: random.Random, shape: float) -> float:
+    """``ln`` of a Gamma(shape, 1) draw — finite for any positive shape.
+
+    @note: Sampling the log keeps the beta ratio well defined when the draw is
+        subnormal: ``ln U**(1/shape)`` is finite even when ``U**(1/shape)``
+        underflows to zero, which is what collapsed the direct gamma ratio onto
+        a point mass for tiny shapes.
+    @note: ``shape < 1`` uses the boost identity in log space,
+        ``ln G(shape) = ln G(shape+1) + ln(U)/shape``, with ``log1p(-U)`` so
+        the ``U == 0`` corner stays finite.
+    """
+    if shape < 1.0:
+        return _log_gamma_sample(rng, shape + 1.0) + math.log1p(-rng.random()) / shape
     d = shape - 1.0 / 3.0
     c = 1.0 / math.sqrt(9.0 * d)
     while True:
@@ -172,29 +185,32 @@ def _gamma_sample(rng: random.Random, shape: float) -> float:
             continue
         u = rng.random()
         if math.log(u) < 0.5 * x * x + d - d * v + d * math.log(v):
-            return d * v
+            return math.log(d) + math.log(v)
 
 
 def gamma_sample(rng: random.Random, shape: float) -> float:
     """Gamma(shape, 1) draw, including shape < 1 via the boost identity."""
     if shape <= 0.0:
         raise ValueError(f"gamma shape must be positive, got {shape}")
-    if shape < 1.0:
-        return gamma_sample(rng, shape + 1.0) * rng.random() ** (1.0 / shape)
-    return _gamma_sample(rng, shape)
+    return math.exp(_log_gamma_sample(rng, shape))
+
+
+def _logistic(value: float) -> float:
+    """Numerically stable logistic function; never overflows."""
+    if value >= 0.0:
+        return 1.0 / (1.0 + math.exp(-value))
+    exp_value = math.exp(value)
+    return exp_value / (1.0 + exp_value)
 
 
 def beta_sample(rng: random.Random, a: float, b: float) -> float:
     """Beta(a, b) draw via the gamma ratio — used for posterior intervals.
 
-    @note: The ratio is clamped to :data:`_SAMPLE_EPS` inside (0, 1). A gamma
-        draw for a very small shape can underflow to exactly 0, and an
-        unclamped 0 or 1 would make downstream log-odds infinite.
+    @note: The ratio is taken in log space and squashed by a stable logistic,
+        so a subnormal gamma draw cannot collapse the sample onto a point
+        mass. The result is clamped to (0, 1) only at the limits of double
+        precision, which keeps downstream log-odds finite without discarding
+        the spread of the tail.
     """
-    left = gamma_sample(rng, a)
-    right = gamma_sample(rng, b)
-    total = left + right
-    if total <= 0.0:  # pragma: no cover - both draws underflowed
-        return min(max(a / (a + b), _SAMPLE_EPS), 1.0 - _SAMPLE_EPS)
-    ratio = left / total
-    return min(max(ratio, _SAMPLE_EPS), 1.0 - _SAMPLE_EPS)
+    log_ratio = _log_gamma_sample(rng, a) - _log_gamma_sample(rng, b)
+    return min(max(_logistic(log_ratio), _MIN_RATE), _MAX_RATE)

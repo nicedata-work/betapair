@@ -72,6 +72,32 @@ class BetaSamplingTest(unittest.TestCase):
         draws = [beta_sample(rng, 0.4, 0.6) for _ in range(200)]
         self.assertTrue(all(0.0 <= value <= 1.0 for value in draws))
 
+    def test_tiny_shapes_do_not_collapse_onto_the_mean(self) -> None:
+        """Regression: both gamma draws underflowing must not return a/(a+b)."""
+        rng = random.Random(99)
+        draws = [beta_sample(rng, 1e-3, 1e-3) for _ in range(5000)]
+        # The old fallback returned exactly 0.5 whenever both draws underflowed
+        # (~24% of the time), i.e. a point mass at the least likely value.
+        self.assertEqual(sum(1 for value in draws if value == 0.5), 0)
+        # A U-shaped Beta(1e-3, 1e-3) puts only ~0.5% of its mass in the middle.
+        middle = sum(1 for value in draws if 0.01 < value < 0.99)
+        self.assertLess(middle, 0.05 * len(draws))
+        self.assertGreater(sum(1 for value in draws if value < 0.01), 0)
+        self.assertGreater(sum(1 for value in draws if value > 0.99), 0)
+        self.assertTrue(all(0.0 < value < 1.0 for value in draws))
+
+    def test_near_zero_tail_keeps_its_spread(self) -> None:
+        """A clamped tail sits at the double limit, not an arbitrary epsilon."""
+        rng = random.Random(4)
+        draws = [beta_sample(rng, 0.1, 1.0) for _ in range(5000)]
+        self.assertTrue(all(0.0 < value < 1.0 for value in draws))
+        tail = [value for value in draws if value < 1e-12]
+        self.assertTrue(tail)
+        # Sampling in log space keeps the whole tail distinct instead of
+        # collapsing every draw below the old 1e-12 clamp onto one value.
+        self.assertGreater(len(set(tail)), 1)
+        self.assertLess(min(draws), 1e-20)
+
 
 class BetaBinomialTest(unittest.TestCase):
     def test_closed_form_matches_numeric_integration(self) -> None:
