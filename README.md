@@ -141,10 +141,12 @@ safety feature.
 from pydfba import HealthTracker, PairRecord
 
 tracker = HealthTracker()
-tracker.observe_many([
-    PairRecord("group_a", "quiz", "q1", False, True),   # fail -> pass
-    PairRecord("group_a", "quiz", "q2", True, True),    # stayed passing
-])
+tracker.observe_many(
+    [
+        PairRecord("group_a", "quiz", "q1", False, True),  # fail -> pass
+        PairRecord("group_a", "quiz", "q2", True, True),  # stayed passing
+    ]
+)
 ```
 
 **Items with no result yet.** Use `None`; they are counted as `pending` and
@@ -152,7 +154,7 @@ left out, so a half-finished run never looks like a regression:
 
 ```python
 tracker.observe("group_a", "quiz", "q3", baseline=False, candidate=None)
-print(tracker.pending)   # 1
+print(tracker.pending)  # 1
 ```
 
 **A failed evaluation.** Use `ERROR` (different from "not run yet"):
@@ -161,7 +163,7 @@ print(tracker.pending)   # 1
 from pydfba import ERROR
 
 tracker.observe("group_a", "quiz", "q4", baseline=False, candidate=ERROR)
-print(tracker.errored)   # 1
+print(tracker.errored)  # 1
 ```
 
 **Some groups matter more.** Tag them and weight the tags:
