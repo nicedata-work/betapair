@@ -147,8 +147,6 @@ class HealthTracker:
         self.prob_interval = prob_interval
         self.draws = draws
         self.ppc_draws = ppc_draws
-        # The first value: drawn once here and reused for every subsequent
-        # report, so a live series does not jitter as it is refreshed.
         self.seed = seed if seed is not None else _generate_seed()
         self.alpha = alpha
         self.regression_prob = regression_prob
@@ -289,13 +287,14 @@ class HealthTracker:
 
         Call this at a refresh boundary. Rows that carry no values at all are
         dropped, so memory stays proportional to one epoch's item count.
+
+        @note: Only a real result can become the next baseline; a pending or
+            errored candidate has nothing to promote.
         """
         rolled: dict[CellKey, dict[str, Pair]] = {}
         for key, items in self._records.items():
             kept: dict[str, Pair] = {}
             for item, (_, candidate) in items.items():
-                # Only a real result can become the next baseline; a pending or
-                # errored candidate has nothing to promote.
                 if isinstance(candidate, bool):
                     kept[item] = (candidate, None)
             if kept:

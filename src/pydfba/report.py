@@ -718,6 +718,12 @@ def build_report(
         posterior, never from the borrowed-strength hierarchy estimate; the
         regression flag comes from the layer-wide spike-and-slab model. The
         hierarchy still shapes ``logit_shift`` and the delta interval.
+    @note: A cell with weight 0 is muted: excluded from the score, the pooled
+        diagnostic and the homogeneity check, so a view that does not count
+        cannot make the layer look inconsistent.
+    @note: Coverage gates everything except a credible regression: incomplete
+        data must not manufacture health, but it must never bury a flagged
+        regression either.
     @return: The assembled :class:`HealthReport`.
     @raise ValueError: If ``alpha`` is outside (0, 0.5), ``regression_prob`` is
         supplied and disagrees with ``1 - alpha``, ``rope_pp`` is negative, or
@@ -811,9 +817,6 @@ def build_report(
     delta_draws.sort()
     delta_p_improved = sum(1 for value in delta_draws if value > 0.0) / len(delta_draws)
 
-    # Muted cells (weight 0) are excluded from the score, so they are also
-    # excluded from the pooled diagnostic and the homogeneity check: a view
-    # that does not count cannot make the layer look inconsistent.
     stat_cells = [cell for cell in active if policy.weight(cell) > 0.0]
     n_improved, n_regressed = pooled_counts(stat_cells)
     pooled = mcnemar(n_improved, n_regressed, a0=a0, b0=b0, prob_interval=prob_interval)
@@ -915,9 +918,6 @@ def build_report(
         flagged=bool(flagged),
         heterogeneous=guardrail.status == "heterogeneous",
     )
-    # Coverage gates everything except a credible regression: incomplete data
-    # must not manufacture health, but it must never bury a flagged regression
-    # either.
     status: Status = "insufficient" if not cov.complete and verdict != "regressing" else verdict
 
     return HealthReport(
@@ -1016,6 +1016,10 @@ def _coverage(
     supplies per-cell counts so the critical tier can be held to a stricter
     standard: any unresolved item in the most critical tier present gates the
     verdict regardless of the global share.
+
+    @note: The critical tier is detected from the coverage itself, not from the
+        active cells: a tier-1 view that is entirely pending or errored has no
+        active cell, and that is exactly the case the gate must catch.
     """
     if coverage is None:
         total = pairs + pending
@@ -1041,9 +1045,6 @@ def _coverage(
     total = paired + pend + errored
     share = (pend + errored) / total if total > 0 else 0.0
 
-    # Detect the critical tier from the coverage itself, not from the active
-    # cells: a tier-1 view that is entirely pending/errored has no active cell,
-    # and that is exactly the case the gate must catch.
     critical_unresolved = 0
     tier_weights = {
         item.category: category_weights.get(item.category, 1.0)

@@ -362,6 +362,10 @@ def cell_posteriors(
     the prior is uniform) but it does keep the interval honest on a bank where
     almost nothing moved, because it shrinks the discordance rate towards the
     prior rather than pinning it at the observed count.
+
+    @note: The discordance draws are taken after every switch-rate row so the
+        phi draws stay byte-identical to the pre-discordance model for a given
+        seed (reports remain comparable across a package upgrade).
     """
     if draws < 2:
         raise ValueError(f"draws must be at least 2, got {draws}")
@@ -378,9 +382,6 @@ def cell_posteriors(
             b = (1.0 - mu) * kappa + cell.regressed
             row.append(beta_sample(rng, a, b))
         phi_draws.append(row)
-    # Drawn after every switch-rate row so the phi draws are byte-identical to
-    # the pre-discordance model for a given seed (reports stay comparable
-    # across a package upgrade).
     discordance_draws: list[list[float]] = []
     for _ in params:
         row = []
@@ -458,15 +459,14 @@ def homogeneity_ppc(
     @note: Both the trial count and the Pearson statistic use the **discordant**
         sub-population (``improved + regressed``); a cell with no discordant
         pairs carries no information and is excluded.
-
-    A large ``T`` means the cells do not share one switch rate — the guardrail
-    condition. Why not a Bayes factor for ``kappa``? Because the pooled model
-    is the ``kappa -> inf`` limit of the hierarchy, a boundary null whose Bayes
-    factor is dominated by prior mass in a tail the data cannot inform (the
-    Lindley/Bartlett effect). The predictive check asks the question that
-    matters for monitoring — "would a layer whose views all moved together
-    plausibly produce this spread?" — and is calibrated under the null, which
-    ``hierarchy_test.py`` anchors.
+    @note: A large ``T`` means the cells do not share one switch rate — the
+        guardrail condition. Why not a Bayes factor for ``kappa``? Because the
+        pooled model is the ``kappa -> inf`` limit of the hierarchy, a boundary
+        null whose Bayes factor is dominated by prior mass in a tail the data
+        cannot inform (the Lindley/Bartlett effect). The predictive check asks
+        the question that matters for monitoring — "would a layer whose views
+        all moved together plausibly produce this spread?" — and is calibrated
+        under the null, which ``hierarchy_test.py`` anchors.
     """
     data = [(cell.improved, cell.discordant) for cell in cells if cell.discordant > 0]
     trials = sum(n for _, n in data)
