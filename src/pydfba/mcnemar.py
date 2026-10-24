@@ -15,9 +15,9 @@ samples instead of drowning in unchanged items.
 
 Reported quantities mirror DFBA's return value: posterior mean/median,
 equal-tail interval, the point-null Bayes factor at ``phi_rb = .5``
-(Savage–Dickey: prior density over posterior density at the null), the
+(Savage-Dickey: prior density over posterior density at the null), the
 interval Bayes factor, and ``P(phi_rb > .5)``. All of them are reproduced to
-DFBA's published digits (``mcnemar_test.py``).
+DFBA's published digits (``tests/test_mcnemar.py``).
 """
 
 from __future__ import annotations
@@ -83,7 +83,7 @@ def mcnemar(
     @return: Posterior summary mirroring DFBA's return value.
     @note: The interval Bayes factor compares the interval null
         ``H0: phi <= .5`` against ``H1: phi > .5`` as the ratio of posterior
-        odds to prior odds; the point null uses the Savage–Dickey density
+        odds to prior odds; the point null uses the Savage-Dickey density
         ratio.
     @raise ValueError: If counts are negative, prior shapes are not positive,
         or ``prob_interval`` is outside (0, 1).
@@ -104,10 +104,8 @@ def mcnemar(
 
     prior_density = beta_pdf(NULL_SWITCH_RATE, a0, b0)
     post_density = beta_pdf(NULL_SWITCH_RATE, a_post, b_post)
-    if post_density > 0.0:
-        bf10_point = prior_density / post_density
-    else:  # pragma: no cover - only for degenerate shapes
-        bf10_point = math.inf
+    # The zero branch only fires for degenerate shapes.
+    bf10_point = prior_density / post_density if post_density > 0.0 else math.inf
 
     prior_h1 = 1.0 - beta_cdf(NULL_SWITCH_RATE, a0, b0)
     post_h0 = 1.0 - p_improved

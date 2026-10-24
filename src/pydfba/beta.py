@@ -1,16 +1,16 @@
-"""Beta-distribution numerics for the health metric — stdlib ``math`` only.
+"""Beta-distribution numerics — stdlib ``math`` and ``random`` only.
 
-The health metric is a conjugate Bayesian model, so every quantity it needs is
-a beta density, a beta tail probability, a beta quantile or a beta-binomial
-marginal likelihood. ``scipy``/``numpy``/``pandas`` are deliberately not
-imported: the eval worker and the web API already run in a constrained
-container, and this module is a few hundred lines of ``math`` calls.
+The model is conjugate, so every quantity needed downstream is a beta density,
+a beta tail probability, a beta quantile or a beta-binomial marginal
+likelihood. ``scipy``/``numpy``/``pandas`` are deliberately not imported: this
+is a few hundred lines of ``math`` calls, which keeps the package installable
+anywhere a Python interpreter runs.
 
 Numerics follow the textbook recipes (Abramowitz & Stegun 26.5.8 for the
-regularized incomplete beta continued fraction; Marsaglia–Tsang for gamma
-sampling). The continued fraction is iterated to ``1e-14`` with a hard
+regularized incomplete beta continued fraction; Marsaglia-Tsang for gamma
+sampling). The continued fraction is iterated to :data:`_FP_EPS` with a hard
 iteration cap, which reproduces ``DFBA::dfba_mcnemar``'s published output to
-every printed digit (see ``mcnemar_test.py``).
+every printed digit (see ``tests/test_mcnemar.py``).
 """
 
 from __future__ import annotations

@@ -12,7 +12,7 @@ them into one number needs a model that
 
 This module is that model: a hierarchical (multi-strata) extension of the
 Bayesian McNemar test, i.e. the Bayesian analogue of the stratified McNemar /
-Cochran–Mantel–Haenszel pooling.
+Cochran-Mantel-Haenszel pooling.
 
     phi_c | mu, kappa  ~ Beta(mu * kappa, (1 - mu) * kappa)      # cell switch rate
     n01_c | phi_c      ~ Binomial(n01_c + n10_c, phi_c)          # discordant pairs
@@ -48,7 +48,7 @@ from pydfba.beta import (
 )
 
 #: Default grid resolution. 49 x 24 is ~1k beta-binomial evaluations per fit,
-#: which keeps a streaming refresh in the low milliseconds per cell.
+#: which keeps a streaming refresh in the low milliseconds.
 MU_POINTS = 49
 KAPPA_POINTS = 24
 #: Concentration grid span. Below .5 the prior is a near-point mass on
@@ -226,19 +226,18 @@ def _weighted_quantiles(
     values: list[float], weights: list[float], probs: tuple[float, ...]
 ) -> tuple[float, ...]:
     """Quantiles of a discrete distribution (grid points/marginal weights)."""
-    order = sorted(range(len(values)), key=values.__getitem__)
     total = sum(weights)
+    ladder: list[tuple[float, float]] = []
     cumulative = 0.0
-    out: list[float] = []
-    running: dict[int, float] = {}
-    for position in order:
+    for position in sorted(range(len(values)), key=values.__getitem__):
         cumulative += weights[position]
-        running[position] = cumulative / total if total > 0 else 0.0
+        ladder.append((values[position], cumulative / total if total > 0 else 0.0))
+    out: list[float] = []
     for prob in probs:
-        result = values[order[-1]]
-        for position in order:
-            if running[position] >= prob:
-                result = values[position]
+        result = ladder[-1][0]
+        for value, bound in ladder:
+            if bound >= prob:
+                result = value
                 break
         out.append(result)
     return tuple(out)
@@ -268,9 +267,9 @@ def fit(
     @note: The likelihood uses the **discordant** pair count as the binomial
         ``n`` (McNemar). Using ``cell.pairs`` would count every unchanged item
         as a failed switch and dilute ``mu`` toward 0 on a real question bank.
-    @note: Marginals are summarised on the full grid *before* points below
-        :data:`GRID_WEIGHT_FLOOR` are pruned, so pruning cannot move the
-        reported intervals.
+    @note: Every reported number is summarised on the full grid *before*
+        points below :data:`GRID_WEIGHT_FLOOR` are pruned, so pruning cannot
+        move them — it only shrinks ``points``.
     @return: The fitted posterior, with ``points`` already pruned.
     @raise ValueError: If the grid is degenerate (fewer than 2x2 points or an
         invalid ``kappa`` span).
@@ -314,16 +313,22 @@ def fit(
         kappa_marginal[kappa] = kappa_marginal.get(kappa, 0.0) + weight
     mu_values = list(mu_marginal)
     kappa_values = list(kappa_marginal)
-    mu_eti = _weighted_quantiles(mu_values, [mu_marginal[v] for v in mu_values], (0.025, 0.975))
-    kappa_eti = _weighted_quantiles(
+    mu_lo, mu_hi = _weighted_quantiles(
+        mu_values, [mu_marginal[v] for v in mu_values], (0.025, 0.975)
+    )
+    kappa_lo, kappa_hi = _weighted_quantiles(
         kappa_values, [kappa_marginal[v] for v in kappa_values], (0.025, 0.975)
     )
+    # Point estimates come off the *unpruned* grid, like the intervals, so
+    # GRID_WEIGHT_FLOOR can only shrink ``points``, never move a number.
+    mean_mu = sum(mu * weight for mu, _, weight in points)
+    mean_kappa = sum(kappa * weight for _, kappa, weight in points)
     points = tuple(point for point in points if point[2] >= GRID_WEIGHT_FLOOR)
     return Fit(
-        mu=sum(mu * weight for mu, _, weight in points),
-        mu_eti=mu_eti,
-        kappa=sum(kappa * weight for _, kappa, weight in points),
-        kappa_eti=kappa_eti,
+        mu=mean_mu,
+        mu_eti=(mu_lo, mu_hi),
+        kappa=mean_kappa,
+        kappa_eti=(kappa_lo, kappa_hi),
         log_marginal=log_marginal,
         points=points,
         cells=len(active),
@@ -410,7 +415,10 @@ def cell_posteriors(
     upper_index = min(draws - 1, int(0.975 * draws))
     for position, cell in enumerate(active):
         column = sorted(row[position] for row in phi_draws)
-        shifts = [_logit(row[position]) - _logit(mu) for (mu, _), row in zip(params, phi_draws)]
+        shifts = [
+            _logit(row[position]) - _logit(mu)
+            for (mu, _), row in zip(params, phi_draws, strict=True)
+        ]
         summaries[cell.key] = CellPosterior(
             mean=fit.cell_mean(cell),
             eti_low=column[lower_index],
@@ -481,7 +489,7 @@ def homogeneity_ppc(
         cannot inform (the Lindley/Bartlett effect). The predictive check asks
         the question that matters for monitoring — "would a layer whose views
         all moved together plausibly produce this spread?" — and is calibrated
-        under the null, which ``hierarchy_test.py`` anchors.
+        under the null, which ``tests/test_hierarchy.py`` anchors.
     """
     data = [(cell.improved, cell.discordant) for cell in cells if cell.discordant > 0]
     trials = sum(n for _, n in data)
@@ -522,7 +530,7 @@ def homogeneity_ppc(
 
 
 def _binomial(rng: random.Random, n: int, p: float) -> int:
-    """Binomial draw by Bernoulli trials — ``n`` is a question-bank size."""
+    """Binomial draw by Bernoulli trials; ``n`` is a discordant pair count."""
     if p <= 0.0:
         return 0
     if p >= 1.0:

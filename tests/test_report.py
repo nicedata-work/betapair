@@ -2,12 +2,11 @@
 
 from __future__ import annotations
 
+import random
 import unittest
 
-import random
-
-from pydfba.hierarchy import Cell
 from pydfba import DEFAULT_CATEGORY
+from pydfba.hierarchy import Cell
 from pydfba.report import (
     CellCoverage,
     HealthReport,
@@ -60,7 +59,8 @@ class ReportIdentityTest(unittest.TestCase):
         cells = [cell("a", 4, 1, 20), cell("b", 2, 5, 20), cell("c", 3, 0, 10)]
         report = build_report(cells, **FAST)
         weighted = sum(
-            item.delta_pp * cell_item.pairs for item, cell_item in zip(report.contributions, cells)
+            item.delta_pp * cell_item.pairs
+            for item, cell_item in zip(report.contributions, cells, strict=True)
         )
         total_pairs = sum(cell_item.pairs for cell_item in cells)
         assert report.delta_pp is not None
@@ -286,7 +286,7 @@ class RegressionMultiplicityTest(unittest.TestCase):
         rng = random.Random(7)
         trials = 200
         false_flags = 0
-        for trial in range(trials):
+        for _ in range(trials):
             cells = []
             for index in range(40):
                 improved = sum(1 for _ in range(20) if rng.random() < 0.5)

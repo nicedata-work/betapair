@@ -64,6 +64,7 @@ from pydfba.tracker import ERROR, HealthTracker, PairRecord
 
 __all__ = [
     "DEFAULT_CATEGORY",
+    "ERROR",
     "REPORT_VERSION",
     "CategorySummary",
     "Cell",
@@ -73,7 +74,6 @@ __all__ = [
     "CellPosteriors",
     "CellVerdict",
     "Coverage",
-    "ERROR",
     "Fit",
     "Guardrail",
     "HealthReport",

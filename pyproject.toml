@@ -8,6 +8,8 @@ version = "0.1.0"
 description = "Dependency-light Bayesian analysis of paired binary outcomes: a Python port of DFBA's McNemar test with hierarchical multi-strata pooling."
 readme = "README.md"
 requires-python = ">=3.10"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
 authors = [{ name = "nicedata" }]
 keywords = [
     "bayesian",
@@ -26,14 +28,31 @@ classifiers = [
 dependencies = ["pydantic>=2.0"]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0", "ruff>=0.6"]
+dev = [
+    "coverage[toml]>=7.6",
+    "mypy>=1.11",
+    "pytest>=8.0",
+    "ruff>=0.6",
+]
 
-[project.urls]
-Repository = "https://example.invalid/nicedata/pydfba"
+# [project.urls]
+# Repository = "https://github.com/<owner>/pydfba"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/pydfba"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["src"]
 addopts = "-q"
+
+[tool.mypy]
+strict = true
+files = ["src", "tools"]
+
+[tool.coverage.run]
+source = ["src/pydfba"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true

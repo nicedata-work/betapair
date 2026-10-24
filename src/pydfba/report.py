@@ -392,7 +392,7 @@ def regression_model(
         for pi in grid
     ]
     log_posterior: list[float] = []
-    for pi, prior in zip(grid, log_prior):
+    for pi, prior in zip(grid, log_prior, strict=True):
         base = math.log(pi / (1.0 - pi))
         value = prior
         for key in keys:
@@ -407,13 +407,13 @@ def regression_model(
     p_regressed: dict[tuple[str, str], float] = {}
     for key in keys:
         accumulator = 0.0
-        for weight, pi in zip(posterior, grid):
+        for weight, pi in zip(posterior, grid, strict=True):
             log_odds = math.log(pi / (1.0 - pi)) + log_multiplier[key] + log_ratio[key]
             accumulator += weight * _sigmoid(log_odds)
         p_regressed[key] = accumulator
 
     p_no_regression = 0.0
-    for weight, pi in zip(posterior, grid):
+    for weight, pi in zip(posterior, grid, strict=True):
         base = math.log(pi / (1.0 - pi))
         product = 1.0
         for key in keys:
@@ -434,7 +434,7 @@ def regression_model(
         flagged=flagged,
         bfdr=bfdr,
         p_no_regression=p_no_regression,
-        pi_mean=sum(weight * pi for weight, pi in zip(posterior, grid)),
+        pi_mean=sum(weight * pi for weight, pi in zip(posterior, grid, strict=True)),
     )
 
 
@@ -528,8 +528,8 @@ def delta_status(
 ) -> Status:
     """The layer/tier verdict from the weighted posterior of its delta.
 
-    One function so the report, the tier roll-up and the web timeline cannot
-    drift apart. The verdict is a Bayesian region-of-practical-equivalence
+    One function so the report, the tier roll-up and any downstream timeline
+    cannot drift apart. The verdict is a Bayesian region-of-practical-equivalence
     decision on the *weighted* delta draws, which is the same quantity the
     headline ``delta_pp`` reports:
 
@@ -781,7 +781,7 @@ def build_report(
 
     delta_draws: list[float] = []
     per_cell_delta: dict[tuple[str, str], list[float]] = {cell.key: [] for cell in posteriors.cells}
-    for row, discordance in zip(posteriors.phi_draws, posteriors.discordance_draws):
+    for row, discordance in zip(posteriors.phi_draws, posteriors.discordance_draws, strict=True):
         total = 0.0
         for position, cell in enumerate(posteriors.cells):
             weight = policy.weight(cell)
@@ -883,14 +883,16 @@ def build_report(
         discordant=pooled.discordant,
     )
 
-    verdict = delta_status(
+    layer_verdict = delta_status(
         delta_draws,
         rope=epsilon,
         alpha=alpha,
         flagged=bool(flagged),
         heterogeneous=guardrail.status == "heterogeneous",
     )
-    status: Status = "insufficient" if not cov.complete and verdict != "regressing" else verdict
+    status: Status = (
+        "insufficient" if not cov.complete and layer_verdict != "regressing" else layer_verdict
+    )
 
     return HealthReport(
         status=status,
