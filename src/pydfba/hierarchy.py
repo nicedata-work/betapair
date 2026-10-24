@@ -209,7 +209,6 @@ class CellPosteriors:
     summaries: dict[tuple[str, str], CellPosterior]
     phi_draws: tuple[tuple[float, ...], ...]
     discordance_draws: tuple[tuple[float, ...], ...]
-    params: tuple[tuple[float, float], ...]
 
 
 def _logit(probability: float) -> float:
@@ -424,7 +423,6 @@ def cell_posteriors(
         summaries=summaries,
         phi_draws=tuple(tuple(row) for row in phi_draws),
         discordance_draws=tuple(tuple(row) for row in discordance_draws),
-        params=tuple(params),
     )
 
 

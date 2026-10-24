@@ -214,11 +214,7 @@ class CellContribution(BaseModel):
     delta_pp_contribution: float = 0.0
     """This cell's additive share of ``delta_pp``: ``100 * w * (n01 - n10) /
     sum(w * pairs)``. Summing this field over every contribution reproduces
-    ``delta_pp`` exactly, even when cells offset (which is when a normalised
-    ``share`` breaks down)."""
-    share: float | None = None
-    """Deprecated: ``delta_pp_contribution / delta_pp``. Unstable and can
-    exceed +/-1 when contributions offset; prefer ``delta_pp_contribution``."""
+    ``delta_pp`` exactly, even when cells offset."""
 
 
 class HealthReport(BaseModel):
@@ -449,19 +445,19 @@ def verdicts_from_model(
     a0: float = 1.0,
     b0: float = 1.0,
     prob_interval: float = 0.95,
-    regression_prob: float = 0.95,
+    improving_prob: float = 0.95,
 ) -> dict[tuple[str, str], CellVerdict]:
     """Turn a fitted :class:`RegressionModel` into per-cell verdicts.
 
     ``improving`` and ``stable`` come from the cell's own DFBA posterior at
-    ``regression_prob``; ``regressing`` is membership of the model's FDR-
+    ``improving_prob``; ``regressing`` is membership of the model's FDR-
     controlled flag set. Separated from :func:`regression_model` so the report
     fits the model once and still has the global quantities to hand.
     """
     verdicts: dict[tuple[str, str], CellVerdict] = {}
     for cell in cells:
         test = mcnemar(cell.improved, cell.regressed, a0=a0, b0=b0, prob_interval=prob_interval)
-        if test.discordant and test.p_improved >= regression_prob:
+        if test.discordant and test.p_improved >= improving_prob:
             verdict: Literal["improving", "stable", "regressing"] = "improving"
         elif cell.key in model.flagged:
             verdict = "regressing"
@@ -481,7 +477,7 @@ def cell_verdicts(
     a0: float = 1.0,
     b0: float = 1.0,
     prob_interval: float = 0.95,
-    regression_prob: float = 0.95,
+    improving_prob: float = 0.95,
     fdr: float = 0.05,
     weights: dict[tuple[str, str], float] | None = None,
     pi_prior: tuple[float, float] = (1.0, 1.0),
@@ -490,7 +486,7 @@ def cell_verdicts(
     """Per-cell verdict from the Bayesian two-group regression model.
 
     ``improving`` and ``stable`` come from the cell's own DFBA posterior at
-    ``regression_prob``. ``regressing`` is the FDR-controlled flag set of
+    ``improving_prob``. ``regressing`` is the FDR-controlled flag set of
     :func:`regression_model` — a Bayesian multiplicity correction, so a wide
     layer does not manufacture regressions by chance and a critical cell is
     not drowned by a field of auxiliary ones. ``weights`` is the effective
@@ -518,7 +514,7 @@ def cell_verdicts(
         a0=a0,
         b0=b0,
         prob_interval=prob_interval,
-        regression_prob=regression_prob,
+        improving_prob=improving_prob,
     )
 
 
@@ -588,22 +584,17 @@ class Weighting:
     tiered: bool
     default_category: str | None
     weights: dict[tuple[str, str], float]
-    family_weights: dict[tuple[str, str], float]
-    """Effective importance, used as a prior-odds multiplier by the gate.
+    """Effective importance: outcome importance x tier weight.
 
-    This is the same outcome x tier weight that moves the score and the
-    delta, so one number governs both how much a cell matters and how much of
-    a head start it gets in the spike-and-slab regression model. A cell with
-    weight 0 is muted everywhere: excluded from the score and unable to be
-    flagged.
+    One number governs both how much a cell matters to the score and the
+    delta, and how much of a head start it gets in the spike-and-slab
+    regression model. A cell with weight 0 is muted everywhere: excluded from
+    the score and unable to be flagged.
     """
     categories: dict[tuple[str, str], str | None]
 
     def weight(self, cell: Cell) -> float:
         return self.weights[cell.key]
-
-    def family_weight(self, cell: Cell) -> float:
-        return self.family_weights[cell.key]
 
     def category(self, cell: Cell) -> str | None:
         return self.categories[cell.key]
@@ -633,22 +624,18 @@ def weighting(
             raise ValueError(f"weight for {name!r} must be >= 0, got {value}")
     tiered = any(cell.category is not None for cell in cells)
     cell_weights: dict[tuple[str, str], float] = {}
-    cell_family_weights: dict[tuple[str, str], float] = {}
     cell_categories: dict[tuple[str, str], str | None] = {}
     for cell in cells:
         category = cell.category
         if category is None and tiered:
             category = default_category
         tier = tier_of.get(category, 1.0) if category is not None else 1.0
-        effective = weight_of.get(cell.outcome, 1.0) * tier
-        cell_weights[cell.key] = effective
-        cell_family_weights[cell.key] = effective
+        cell_weights[cell.key] = weight_of.get(cell.outcome, 1.0) * tier
         cell_categories[cell.key] = category
     return Weighting(
         tiered=tiered,
         default_category=default_category,
         weights=cell_weights,
-        family_weights=cell_family_weights,
         categories=cell_categories,
     )
 
@@ -668,7 +655,6 @@ def build_report(
     ppc_draws: int = PPC_DRAWS,
     seed: int = 0,
     alpha: float = 0.05,
-    regression_prob: float | None = None,
     rope_pp: float = 1.0,
     pi_prior: tuple[float, float] = (1.0, 1.0),
     pi_points: int = 199,
@@ -692,9 +678,8 @@ def build_report(
     ``alpha`` is the single posterior threshold behind every decision: the
     homogeneity check, the per-cell improving threshold (``>= 1 - alpha``),
     the weighted delta ROPE, and the posterior FDR target for the regression
-    gate. ``regression_prob`` is accepted only for backwards compatibility and
-    must equal ``1 - alpha`` if supplied. ``pi_prior`` is the Beta hyperprior
-    on the share of cells that truly regressed, gridded at ``pi_points``.
+    gate. ``pi_prior`` is the Beta hyperprior on the share of cells that truly
+    regressed, gridded at ``pi_points``.
 
     ``rope_pp`` is the region of practical equivalence for the layer verdict,
     in percentage points: a net movement under this size counts as ``stable``
@@ -725,21 +710,11 @@ def build_report(
         data must not manufacture health, but it must never bury a flagged
         regression either.
     @return: The assembled :class:`HealthReport`.
-    @raise ValueError: If ``alpha`` is outside (0, 0.5), ``regression_prob`` is
-        supplied and disagrees with ``1 - alpha``, ``rope_pp`` is negative, or
-        ``max_unresolved_share`` is outside [0, 1].
+    @raise ValueError: If ``alpha`` is outside (0, 0.5), ``rope_pp`` is
+        negative, or ``max_unresolved_share`` is outside [0, 1].
     """
     if not 0.0 < alpha < 0.5:
         raise ValueError(f"alpha must be in (0, 0.5), got {alpha}")
-    if regression_prob is None:
-        regression_prob = 1.0 - alpha
-    elif not 0.5 < regression_prob < 1.0:
-        raise ValueError(f"regression_prob must be in (0.5, 1), got {regression_prob}")
-    elif abs(regression_prob - (1.0 - alpha)) > 1e-9:
-        raise ValueError(
-            "regression_prob and alpha are two names for the same threshold; "
-            f"expected regression_prob={1.0 - alpha}, got {regression_prob}"
-        )
     if rope_pp < 0.0:
         raise ValueError(f"rope_pp must be >= 0, got {rope_pp}")
     if not 0.0 <= max_unresolved_share <= 1.0:
@@ -827,7 +802,7 @@ def build_report(
         a0=a0,
         b0=b0,
         fdr=alpha,
-        weights=policy.family_weights,
+        weights=policy.weights,
         pi_prior=pi_prior,
         pi_points=pi_points,
     )
@@ -837,12 +812,11 @@ def build_report(
         a0=a0,
         b0=b0,
         prob_interval=prob_interval,
-        regression_prob=regression_prob,
+        improving_prob=1.0 - alpha,
     )
 
     contributions: list[CellContribution] = []
     flagged: list[str] = []
-    net_change = sum(policy.weight(cell) * (cell.improved - cell.regressed) for cell in active)
     for cell in active:
         summary = posteriors.summaries[cell.key]
         weight = policy.weight(cell)
@@ -852,7 +826,6 @@ def build_report(
         verdict = cell_test.verdict
         if verdict == "regressing":
             flagged.append(f"{cell.stratum}/{cell.outcome}")
-        share = None if net_change == 0 else weight * (cell.improved - cell.regressed) / net_change
         contribution = 100.0 * weight * (cell.improved - cell.regressed) / weighted_pairs
         contributions.append(
             CellContribution(
@@ -875,7 +848,6 @@ def build_report(
                 logit_shift=summary.logit_shift,
                 verdict=verdict,
                 delta_pp_contribution=contribution,
-                share=share,
             )
         )
     contributions.sort(

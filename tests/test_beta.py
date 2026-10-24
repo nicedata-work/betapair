@@ -12,7 +12,6 @@ from pydfba.beta import (
     beta_pdf,
     beta_ppf,
     beta_sample,
-    beta_var,
     log_beta_binomial,
     log_choose,
 )
@@ -41,7 +40,6 @@ class BetaQuantileTest(unittest.TestCase):
         self.assertAlmostEqual(beta_pdf(0.5, 2.0, 2.0), 1.5, places=12)
         self.assertAlmostEqual(beta_cdf(0.5, 2.0, 2.0), 0.5, places=12)
         self.assertAlmostEqual(beta_mean(3.0, 5.0), 0.375, places=12)
-        self.assertAlmostEqual(beta_var(3.0, 5.0), 3 * 5 / (64 * 9), places=12)
 
     def test_boundaries(self) -> None:
         self.assertEqual(beta_cdf(0.0, 3.0, 4.0), 0.0)
@@ -85,6 +83,13 @@ class BetaSamplingTest(unittest.TestCase):
         self.assertGreater(sum(1 for value in draws if value < 0.01), 0)
         self.assertGreater(sum(1 for value in draws if value > 0.99), 0)
         self.assertTrue(all(0.0 < value < 1.0 for value in draws))
+
+    def test_invalid_shapes_are_rejected(self) -> None:
+        rng = random.Random(0)
+        with self.assertRaises(ValueError):
+            beta_sample(rng, 0.0, 1.0)
+        with self.assertRaises(ValueError):
+            beta_sample(rng, 1.0, -1.0)
 
     def test_near_zero_tail_keeps_its_spread(self) -> None:
         """A clamped tail sits at the double limit, not an arbitrary epsilon."""

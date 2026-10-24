@@ -201,7 +201,6 @@ class HealthTracker:
         ppc_draws: int = PPC_DRAWS,
         seed: int | None = None,
         alpha: float = 0.05,
-        regression_prob: float | None = None,
         a_d: float = 1.0,
         b_d: float = 1.0,
         rope_pp: float = 1.0,
@@ -225,7 +224,6 @@ class HealthTracker:
         self.ppc_draws = ppc_draws
         self.seed = seed if seed is not None else _generate_seed()
         self.alpha = alpha
-        self.regression_prob = regression_prob
         self.a_d = a_d
         self.b_d = b_d
         self.rope_pp = rope_pp
@@ -456,7 +454,6 @@ class HealthTracker:
         ppc_draws: int | None = None,
         seed: int | None = None,
         alpha: float | None = None,
-        regression_prob: float | None = None,
         rope_pp: float | None = None,
         max_unresolved_share: float | None = None,
     ) -> HealthReport:
@@ -475,7 +472,6 @@ class HealthTracker:
             ppc_draws=self.ppc_draws if ppc_draws is None else ppc_draws,
             seed=self.seed if seed is None else seed,
             alpha=self.alpha if alpha is None else alpha,
-            regression_prob=self.regression_prob if regression_prob is None else regression_prob,
             rope_pp=self.rope_pp if rope_pp is None else rope_pp,
             pi_prior=self.pi_prior,
             pi_points=self.pi_points,

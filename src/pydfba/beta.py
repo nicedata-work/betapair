@@ -61,14 +61,6 @@ def beta_pdf(x: float, a: float, b: float) -> float:
     return math.exp((a - 1.0) * math.log(x) + (b - 1.0) * math.log1p(-x) - log_beta(a, b))
 
 
-def beta_log_pdf(x: float, a: float, b: float) -> float:
-    """Log density; ``-inf`` where the density is zero or infinite."""
-    density = beta_pdf(x, a, b)
-    if density <= 0.0 or math.isinf(density):
-        return -math.inf
-    return math.log(density)
-
-
 def _beta_cf(x: float, a: float, b: float) -> float:
     """Continued fraction for the incomplete beta function (Lentz's method).
 
@@ -147,11 +139,6 @@ def beta_mean(a: float, b: float) -> float:
     return a / (a + b)
 
 
-def beta_var(a: float, b: float) -> float:
-    total = a + b
-    return a * b / (total * total * (total + 1.0))
-
-
 def log_beta_binomial(k: int, n: int, a: float, b: float) -> float:
     """Log marginal likelihood of ``k`` successes in ``n`` trials under Beta(a, b).
 
@@ -166,6 +153,8 @@ def log_beta_binomial(k: int, n: int, a: float, b: float) -> float:
 def _log_gamma_sample(rng: random.Random, shape: float) -> float:
     """``ln`` of a Gamma(shape, 1) draw — finite for any positive shape.
 
+    @raise ValueError: If ``shape`` is not positive.
+
     @note: Sampling the log keeps the beta ratio well defined when the draw is
         subnormal: ``ln U**(1/shape)`` is finite even when ``U**(1/shape)``
         underflows to zero, which is what collapsed the direct gamma ratio onto
@@ -174,6 +163,8 @@ def _log_gamma_sample(rng: random.Random, shape: float) -> float:
         ``ln G(shape) = ln G(shape+1) + ln(U)/shape``, with ``log1p(-U)`` so
         the ``U == 0`` corner stays finite.
     """
+    if shape <= 0.0:
+        raise ValueError(f"gamma shape must be positive, got {shape}")
     if shape < 1.0:
         return _log_gamma_sample(rng, shape + 1.0) + math.log1p(-rng.random()) / shape
     d = shape - 1.0 / 3.0
@@ -186,13 +177,6 @@ def _log_gamma_sample(rng: random.Random, shape: float) -> float:
         u = rng.random()
         if math.log(u) < 0.5 * x * x + d - d * v + d * math.log(v):
             return math.log(d) + math.log(v)
-
-
-def gamma_sample(rng: random.Random, shape: float) -> float:
-    """Gamma(shape, 1) draw, including shape < 1 via the boost identity."""
-    if shape <= 0.0:
-        raise ValueError(f"gamma shape must be positive, got {shape}")
-    return math.exp(_log_gamma_sample(rng, shape))
 
 
 def _logistic(value: float) -> float:
@@ -211,6 +195,9 @@ def beta_sample(rng: random.Random, a: float, b: float) -> float:
         mass. The result is clamped to (0, 1) only at the limits of double
         precision, which keeps downstream log-odds finite without discarding
         the spread of the tail.
+    @raise ValueError: If either shape parameter is not positive.
     """
+    if a <= 0.0 or b <= 0.0:
+        raise ValueError(f"shape parameters must be positive, got a={a}, b={b}")
     log_ratio = _log_gamma_sample(rng, a) - _log_gamma_sample(rng, b)
     return min(max(_logistic(log_ratio), _MIN_RATE), _MAX_RATE)

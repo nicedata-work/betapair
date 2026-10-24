@@ -59,10 +59,6 @@ class ReportIdentityTest(unittest.TestCase):
     def test_contributions_carry_the_whole_delta(self) -> None:
         cells = [cell("a", 4, 1, 20), cell("b", 2, 5, 20), cell("c", 3, 0, 10)]
         report = build_report(cells, **FAST)
-        shares = [item.share for item in report.contributions]
-        self.assertTrue(all(share is not None for share in shares))
-        self.assertAlmostEqual(sum(share for share in shares if share is not None), 1.0, places=9)
-
         weighted = sum(
             item.delta_pp * cell_item.pairs for item, cell_item in zip(report.contributions, cells)
         )
@@ -374,8 +370,6 @@ class ReportStatusTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             build_report([cell("a", 1, 1, 4)], alpha=0.6)
         with self.assertRaises(ValueError):
-            build_report([cell("a", 1, 1, 4)], regression_prob=0.5)
-        with self.assertRaises(ValueError):
             build_report([cell("a", 1, 1, 4)], weights={"answer": -1.0})
 
 
@@ -514,18 +508,14 @@ class AdditiveContributionTest(unittest.TestCase):
         assert report.delta_pp is not None
         self.assertAlmostEqual(total, report.delta_pp, places=9)
 
-    def test_share_is_absent_when_offsets_make_it_meaningless(self) -> None:
+    def test_offsetting_contributions_still_sum_to_the_headline(self) -> None:
         report = build_report([cell("up", 10, 0, 100), cell("down", 0, 10, 100)], **FAST)
         self.assertAlmostEqual(report.delta_pp or 0.0, 0.0, places=9)
-        self.assertTrue(all(item.share is None for item in report.contributions))
+        total = sum(item.delta_pp_contribution for item in report.contributions)
+        self.assertAlmostEqual(total, 0.0, places=9)
 
 
 class ThresholdConsistencyTest(unittest.TestCase):
-    def test_regression_prob_must_agree_with_alpha(self) -> None:
-        with self.assertRaises(ValueError):
-            build_report([cell("a", 8, 2, 20)], alpha=0.01, regression_prob=0.95, **FAST)
-        build_report([cell("a", 8, 2, 20)], alpha=0.01, regression_prob=0.99, **FAST)
-
     def test_rope_must_be_non_negative(self) -> None:
         with self.assertRaises(ValueError):
             build_report([cell("a", 8, 2, 20)], rope_pp=-1.0, **FAST)

@@ -272,7 +272,9 @@ class SnapshotTest(unittest.TestCase):
             {"version": 2, "records": [["v", "answer", "q1", "nonsense", True]]},
             {"version": 2, "records": [["v", "answer", "q1", True]]},
             {"version": 2, "records": [], "weights": {"answer": "heavy"}},
+            {"version": 2, "records": [], "weights": "heavy"},
             {"version": 2, "records": [], "categories": {"v": 3}},
+            {"version": 2, "records": [], "categories": "heavy"},
             {"version": 2, "records": [], "baseline_epoch": 7},
             {"version": 2, "records": [], "seed": "nope"},
         ):
