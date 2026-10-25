@@ -19,8 +19,8 @@ from betapair.beta import (
 
 
 class BetaQuantileTest(unittest.TestCase):
-    def test_matches_dfba_published_output(self) -> None:
-        """DFBA::dfba_mcnemar(n_01 = 17, n_10 = 2) prints these quantiles."""
+    def test_matches_reference_quantiles(self) -> None:
+        """Reference Beta(18, 3) quantiles for the worked example."""
         self.assertAlmostEqual(beta_ppf(0.5, 18, 3), 0.8685263, places=6)
         self.assertAlmostEqual(beta_ppf(0.025, 18, 3), 0.683017, places=6)
         self.assertAlmostEqual(beta_ppf(0.975, 18, 3), 0.9679291, places=6)

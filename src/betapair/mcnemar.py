@@ -1,9 +1,8 @@
-"""Bayesian McNemar test — a faithful port of ``DFBA::dfba_mcnemar()``.
+"""Bayesian McNemar test for paired binary outcomes.
 
-Prior art: Chechile (2020) ch. 7, as implemented in the R package DFBA
-(Barch), function ``dfba_mcnemar(n_01, n_10, a0 = 1, b0 = 1, prob_interval = .95)``.
-The change cases are a Bernoulli process, so the population switch rate
-``phi_rb`` has a Beta posterior:
+Prior art: Chechile (2020) ch. 7, *Bayesian Statistics for Experimental
+Scientists*. The change cases are a Bernoulli process, so the population
+switch rate ``phi_rb`` has a Beta posterior:
 
     phi_rb | data ~ Beta(a0 + n_01, b0 + n_10)
 
@@ -13,11 +12,10 @@ information about ``phi_rb`` — that focus on the discordant sub-population is
 the whole point of McNemar, and it is why the test stays usable on small
 samples instead of drowning in unchanged items.
 
-Reported quantities mirror DFBA's return value: posterior mean/median,
-equal-tail interval, the point-null Bayes factor at ``phi_rb = .5``
-(Savage-Dickey: prior density over posterior density at the null), the
-interval Bayes factor, and ``P(phi_rb > .5)``. All of them are reproduced to
-DFBA's published digits (``tests/test_mcnemar.py``).
+Reported quantities: posterior mean/median, equal-tail interval, the
+point-null Bayes factor at ``phi_rb = .5`` (Savage-Dickey: prior density over
+posterior density at the null), the interval Bayes factor, and
+``P(phi_rb > .5)``.
 """
 
 from __future__ import annotations
@@ -177,14 +175,13 @@ def mcnemar(
 ) -> McNemarResult:
     """Bayesian McNemar test from the two discordant counts.
 
-    @param n_improved: 0 → 1 switch count (``n_01`` in DFBA).
-    @param n_regressed: 1 → 0 switch count (``n_10`` in DFBA).
-    @param a0: Beta prior shape on the switch rate — uniform by default,
-        matching DFBA.
+    @param n_improved: 0 → 1 switch count (``n_01`` in the McNemar table).
+    @param n_regressed: 1 → 0 switch count (``n_10`` in the McNemar table).
+    @param a0: Beta prior shape on the switch rate — uniform by default.
     @param b0: Beta prior shape on the switch rate; ``(0.5, 0.5)`` gives
         Jeffreys' prior.
     @param prob_interval: Mass of the equal-tail credible interval.
-    @return: Posterior summary mirroring DFBA's return value.
+    @return: Posterior summary of the switch rate.
     @note: The interval Bayes factor compares the interval null
         ``H0: phi <= .5`` against ``H1: phi > .5`` as the ratio of posterior
         odds to prior odds; the point null uses the Savage-Dickey density

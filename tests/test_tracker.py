@@ -6,7 +6,7 @@ import json
 import random
 import unittest
 
-from betapair import ERROR, HealthTracker, PairRecord
+from betapair import ERROR, FAILED, RETIRED, HealthTracker, PairRecord
 
 FAST = {"draws": 96, "ppc_draws": 96}
 
@@ -295,11 +295,14 @@ class SnapshotTest(unittest.TestCase):
 
 
 class SideValidationTest(unittest.TestCase):
-    """A side is a real result, a pending ``None`` or :data:`ERROR` — nothing else."""
+    """A side is a real result, ``None``, :data:`ERROR`, :data:`FAILED` or
+    :data:`RETIRED`."""
 
     def test_non_binary_sides_are_rejected(self) -> None:
         tracker = HealthTracker(**FAST)
-        for junk in ("yes", "", 1, 0, "pending"):
+        # The *strings* "error"/"failed"/"retired" are snapshot encodings, not
+        # API values.
+        for junk in ("yes", "", 1, 0, "pending", "retired", "error", "failed"):
             with self.assertRaises(ValueError):
                 tracker.observe("v", "answer", "q1", junk, True)
             with self.assertRaises(ValueError):
@@ -307,17 +310,28 @@ class SideValidationTest(unittest.TestCase):
         self.assertEqual(len(tracker), 0)
 
     def test_coverage_agrees_with_every_other_counter(self) -> None:
-        """One record is paired, pending or errored in exactly one place."""
+        """One record is paired, pending, errored or retired in exactly one place."""
         tracker = HealthTracker(**FAST)
         tracker.observe("v", "answer", "q1", False, True)
         tracker.observe("v", "answer", "q2", False, None)
         tracker.observe("v", "answer", "q3", False, ERROR)
+        tracker.observe("v", "answer", "q4", False, RETIRED)
+        tracker.observe("v", "answer", "q5", False, FAILED)
         coverage = tracker.coverage()[0]
         self.assertEqual(coverage.paired, tracker.paired)
         self.assertEqual(coverage.pending, tracker.pending)
         self.assertEqual(coverage.errored, tracker.errored)
+        self.assertEqual(coverage.retired, tracker.retired)
+        self.assertEqual(coverage.failed, tracker.failed)
         self.assertEqual(coverage.paired, sum(cell.pairs for cell in tracker.cells()))
-        self.assertEqual(coverage.paired + coverage.pending + coverage.errored, len(tracker))
+        self.assertEqual(
+            coverage.paired + coverage.pending + coverage.errored + coverage.retired,
+            len(tracker),
+        )
+        # ``failed`` is a subset of ``paired``: those items are resolved, so
+        # they are counted in neither ``pending`` nor ``errored``.
+        self.assertLessEqual(coverage.failed, coverage.paired)
+        self.assertEqual(coverage.unresolved, tracker.pending + tracker.errored)
 
 
 class ErroredStateTest(unittest.TestCase):
@@ -352,6 +366,377 @@ class ErroredStateTest(unittest.TestCase):
         tracker.observe("v", "answer", "q1", False, ERROR)
         tracker.advance()
         self.assertEqual(len(tracker), 0)
+
+
+class FailedStateTest(unittest.TestCase):
+    """A view-caused failure is a result: it scores as a failure, not an absence.
+
+    ``ERROR`` says the harness could not evaluate the item; ``FAILED`` says the
+    view could not answer it. The second is a health signal about the view, so
+    dropping it from the denominator — exactly what ``ERROR`` does — would let a
+    view raise its own score by breaking on the questions it was failing.
+    """
+
+    def test_view_caused_failure_is_paired_not_errored(self) -> None:
+        tracker = HealthTracker(**FAST)
+        tracker.observe("v", "answer", "q1", False, FAILED)
+        self.assertEqual(tracker.failed, 1)
+        self.assertEqual(tracker.paired, 1)
+        self.assertEqual(tracker.errored, 0)
+        self.assertEqual(tracker.pending, 0)
+        report = tracker.report()
+        self.assertEqual(report.pairs, 1)
+        self.assertEqual(report.failed, 1)
+        self.assertEqual(report.coverage.failed, 1)
+        self.assertEqual(report.score, 0.0)
+        self.assertTrue(report.coverage.complete)
+
+    def test_view_caused_failure_scores_as_a_failure(self) -> None:
+        """A FAILED candidate is a FAIL: no improvement, a regression if it passed before."""
+        tracker = HealthTracker(**FAST)
+        tracker.observe("v", "answer", "was_pass", True, FAILED)
+        tracker.observe("v", "answer", "was_fail", False, FAILED)
+        cell = tracker.cells()[0]
+        self.assertEqual(cell.pairs, 2)
+        self.assertEqual(cell.passed, 0)
+        self.assertEqual(cell.regressed, 1)
+        self.assertEqual(cell.improved, 0)
+
+    def test_erroring_out_of_failing_items_does_not_raise_the_score(self) -> None:
+        """The roadmap reproduction: 100 items at 60%.
+
+        Losing the 20 always-failing items to ``ERROR`` lifts the level to 75.0
+        with a silent ``+0.0`` composition effect. Scoring the same 20 as
+        view-caused failures leaves the level at 60.0, because a failure is a
+        result — no ledger and no composition term are needed.
+        """
+
+        def build(sentinel: object) -> HealthTracker:
+            tracker = HealthTracker(**FAST)
+            for index in range(100):
+                if index < 60:
+                    candidate: object = True
+                elif index < 80:
+                    candidate = sentinel
+                else:
+                    candidate = False
+                tracker.observe("v", "answer", f"q{index}", index < 60, candidate)  # type: ignore[arg-type]
+            return tracker
+
+        errored = build(ERROR).report()
+        self.assertEqual(errored.score, 75.0)
+        self.assertEqual(errored.composition_effect_pp, 0.0)
+
+        failed = build(FAILED).report()
+        self.assertEqual(failed.score, 60.0)
+        self.assertEqual(failed.baseline_score, 60.0)
+        self.assertEqual(failed.composition_effect_pp, 0.0)
+        self.assertEqual(failed.pairs, 100)
+        self.assertEqual(failed.failed, 20)
+
+    def test_harness_error_outranks_a_view_caused_failure(self) -> None:
+        """One side unresolved is still unresolved: the harness must retry it."""
+        tracker = HealthTracker(**FAST)
+        tracker.observe("v", "answer", "q1", FAILED, ERROR)
+        self.assertEqual(tracker.errored, 1)
+        self.assertEqual(tracker.failed, 0)
+        self.assertEqual(tracker.paired, 0)
+
+    def test_retirement_outranks_a_view_caused_failure(self) -> None:
+        """A retired record is not scored, so it is not counted as failed either."""
+        tracker = HealthTracker(**FAST)
+        tracker.observe("v", "answer", "q1", FAILED, RETIRED)
+        self.assertEqual(tracker.retired, 1)
+        self.assertEqual(tracker.failed, 0)
+        self.assertEqual(tracker.coverage()[0].failed, 0)
+
+    def test_advance_promotes_a_view_caused_failure_as_fail(self) -> None:
+        tracker = HealthTracker(**FAST)
+        tracker.observe("v", "answer", "q1", True, FAILED)
+        tracker.advance()
+        self.assertEqual(len(tracker), 1)
+        self.assertEqual(tracker.paired, 0)
+        self.assertEqual(tracker._records[("v", "answer")]["q1"], (False, None))
+
+    def test_retiring_a_failed_item_holds_it_as_a_failure(self) -> None:
+        tracker = HealthTracker(**FAST)
+        tracker.observe("v", "answer", "q1", False, True)
+        tracker.observe("v", "answer", "q2", False, FAILED)
+        tracker.retire("v", "answer", "q2")
+        self.assertEqual(tracker.retired_ledger[("v", "answer")]["q2"], False)
+        report = tracker.report()
+        self.assertEqual(report.score, 100.0)
+        self.assertAlmostEqual(report.score_held, 50.0)
+        self.assertAlmostEqual(report.composition_effect_pp, 50.0)
+
+    def test_failed_survives_snapshot(self) -> None:
+        tracker = HealthTracker(**FAST)
+        tracker.observe("v", "answer", "q1", False, FAILED)
+        payload = tracker.to_json()
+        self.assertIn('"failed"', payload)
+        restored = HealthTracker.from_json(payload, **FAST)
+        self.assertEqual(restored.snapshot(), tracker.snapshot())
+        self.assertEqual(restored.failed, 1)
+        self.assertEqual(restored.coverage()[0].failed, 1)
+
+    def test_payload_without_a_failed_side_still_loads(self) -> None:
+        """Additive encoding: a snapshot written before FAILED existed loads."""
+        restored = HealthTracker.from_snapshot(
+            {
+                "version": 3,
+                "records": [
+                    ["v", "answer", "q1", "error", False],
+                    ["v", "answer", "q2", False, True],
+                ],
+            },
+            **FAST,
+        )
+        self.assertEqual(restored.errored, 1)
+        self.assertEqual(restored.failed, 0)
+        self.assertEqual(restored.paired, 1)
+
+
+class RetiredStateTest(unittest.TestCase):
+    """A withdrawn item is neither outstanding work nor a failure."""
+
+    def test_retired_is_distinct_from_pending_and_errored(self) -> None:
+        tracker = HealthTracker(**FAST)
+        tracker.observe("v", "answer", "q1", False, RETIRED)
+        self.assertEqual(tracker.retired, 1)
+        self.assertEqual(tracker.pending, 0)
+        self.assertEqual(tracker.errored, 0)
+        self.assertEqual(tracker.paired, 0)
+
+    def test_retirement_outranks_error_and_pending(self) -> None:
+        """Retirement is a statement about the item, so it holds either side."""
+        tracker = HealthTracker(**FAST)
+        tracker.observe("v", "answer", "q1", ERROR, RETIRED)
+        tracker.observe("v", "answer", "q2", None, RETIRED)
+        self.assertEqual(tracker.retired, 2)
+        self.assertEqual(tracker.errored, 0)
+        self.assertEqual(tracker.pending, 0)
+
+    def test_retire_keeps_the_last_known_outcome(self) -> None:
+        tracker = HealthTracker(**FAST)
+        tracker.observe("v", "answer", "q1", False, True)
+        tracker.retire("v", "answer", "q1")
+        self.assertEqual(tracker.retired, 1)
+        self.assertEqual(tracker.retired_ledger[("v", "answer")]["q1"], True)
+
+    def test_retire_prefers_the_most_recent_outcome(self) -> None:
+        """The candidate epoch is newer than the baseline one."""
+        tracker = HealthTracker(**FAST)
+        tracker.observe("v", "answer", "q1", True, False)  # regressed
+        tracker.retire("v", "answer", "q1")
+        self.assertEqual(tracker.retired_ledger[("v", "answer")]["q1"], False)
+
+    def test_retiring_an_unseen_item_is_allowed(self) -> None:
+        tracker = HealthTracker(**FAST)
+        tracker.retire("v", "answer", "never-run")
+        self.assertEqual(tracker.retired, 1)
+        self.assertIsNone(tracker.retired_ledger[("v", "answer")]["never-run"])
+
+    def test_retire_rejects_empty_keys(self) -> None:
+        tracker = HealthTracker(**FAST)
+        with self.assertRaises(ValueError):
+            tracker.retire("", "answer", "q1")
+        with self.assertRaises(ValueError):
+            tracker.retire("v", "answer", "")
+
+    def test_retired_item_leaves_the_paired_test(self) -> None:
+        tracker = HealthTracker(**FAST)
+        tracker.observe("v", "answer", "q1", False, True)
+        tracker.observe("v", "answer", "q2", False, False)
+        tracker.retire("v", "answer", "q2")
+        report = tracker.report()
+        self.assertEqual(report.pairs, 1)
+        self.assertEqual([item.stratum for item in report.contributions], ["v"])
+        self.assertEqual(report.contributions[0].pairs, 1)
+
+    def test_retirement_does_not_gate_coverage(self) -> None:
+        """The point of the sentinel: a shrinking bank is not a broken pipeline.
+
+        Ten retired items and four pending-free pairs would be a 71% unresolved
+        share if retirement were folded into pending, which would gate the
+        layer to ``insufficient``.
+        """
+        tracker = HealthTracker(**FAST)
+        for index in range(4):
+            tracker.observe("v", "answer", f"keep{index}", False, True)
+        for index in range(10):
+            tracker.retire("v", "answer", f"drop{index}")
+        report = tracker.report()
+        self.assertTrue(report.coverage.complete)
+        self.assertEqual(report.coverage.retired, 10)
+        self.assertEqual(report.coverage.unresolved_share, 0.0)
+        self.assertNotEqual(report.status, "insufficient")
+
+    def test_a_shrunken_bank_is_visible_on_the_report(self) -> None:
+        """The level follows the survivors, and ``retired`` says so out loud."""
+        tracker = HealthTracker(**FAST)
+        for index in range(4):
+            tracker.observe("v", "answer", f"keep{index}", False, True)
+        for index in range(6):
+            tracker.observe("v", "answer", f"drop{index}", False, False)
+        before = tracker.report()
+        self.assertEqual(before.score, 40.0)
+        self.assertEqual(before.retired, 0)
+        for index in range(6):
+            tracker.retire("v", "answer", f"drop{index}")
+        after = tracker.report()
+        self.assertEqual(after.pairs, 4)
+        self.assertEqual(after.score, 100.0)
+        self.assertEqual(after.retired, 6)
+
+    def test_advance_drops_the_row_but_keeps_the_ledger(self) -> None:
+        tracker = HealthTracker(**FAST)
+        tracker.observe("v", "answer", "q1", False, True)
+        tracker.retire("v", "answer", "q1")
+        tracker.advance()
+        self.assertEqual(len(tracker), 0)
+        self.assertEqual(tracker.retired, 0)
+        self.assertEqual(tracker.retired_ledger[("v", "answer")]["q1"], True)
+
+    def test_retirement_survives_snapshot(self) -> None:
+        tracker = HealthTracker(**FAST)
+        tracker.observe("v", "answer", "q1", False, True)
+        tracker.retire("v", "answer", "q1")
+        tracker.retire("v", "answer", "never-run")
+        restored = HealthTracker.from_json(tracker.to_json(), **FAST)
+        self.assertEqual(restored.retired, 2)
+        self.assertEqual(restored.coverage()[0].retired, 2)
+        self.assertEqual(restored.retired_ledger[("v", "answer")]["q1"], True)
+        self.assertIsNone(restored.retired_ledger[("v", "answer")]["never-run"])
+
+    def test_ledger_rejects_a_non_boolean_outcome(self) -> None:
+        tracker = HealthTracker(**FAST)
+        payload = tracker.snapshot()
+        payload["retired_ledger"] = [["v", "answer", "q1", "pass"]]
+        with self.assertRaises(ValueError):
+            HealthTracker.from_snapshot(payload, **FAST)
+
+    def test_snapshot_without_a_ledger_still_loads(self) -> None:
+        """Additive key: a payload written before the ledger existed loads."""
+        tracker = HealthTracker(**FAST)
+        tracker.observe("v", "answer", "q1", False, True)
+        payload = tracker.snapshot()
+        del payload["retired_ledger"]
+        restored = HealthTracker.from_snapshot(payload, **FAST)
+        self.assertEqual(restored.paired, 1)
+        self.assertEqual(restored.retired_ledger, {})
+
+
+class CompositionSplitTest(unittest.TestCase):
+    """A shrinking bank must not silently redefine the level."""
+
+    def test_no_retirement_means_no_composition_effect(self) -> None:
+        tracker = HealthTracker(**FAST)
+        for index in range(4):
+            tracker.observe("v", "answer", f"q{index}", False, index < 2)
+        report = tracker.report()
+        self.assertEqual(report.score_held, report.score)
+        self.assertEqual(report.composition_effect_pp, 0.0)
+        self.assertEqual(report.retired_held, 0)
+
+    def test_deleting_failing_questions_shows_up_as_composition(self) -> None:
+        """The level reads 100 only because the hard questions were removed."""
+        tracker = HealthTracker(**FAST)
+        for index in range(4):
+            tracker.observe("v", "answer", f"pass{index}", False, True)
+        for index in range(2):
+            tracker.observe("v", "answer", f"fail{index}", False, False)
+        self.assertAlmostEqual(tracker.report().score, 100.0 * 4 / 6)
+        for index in range(2):
+            tracker.retire("v", "answer", f"fail{index}")
+        report = tracker.report()
+        self.assertEqual(report.score, 100.0)
+        self.assertAlmostEqual(report.score_held, 100.0 * 4 / 6)
+        self.assertAlmostEqual(report.composition_effect_pp, 100.0 - 100.0 * 4 / 6)
+        self.assertEqual(report.retired_held, 2)
+        self.assertEqual(report.retired, 2)
+
+    def test_level_decomposes_exactly(self) -> None:
+        """``score = score_held + composition_effect_pp``, with no residual."""
+        tracker = HealthTracker(**FAST)
+        for index in range(7):
+            tracker.observe("v", "answer", f"p{index}", False, True)
+        for index in range(5):
+            tracker.observe("v", "answer", f"f{index}", False, False)
+        for index in range(5):
+            tracker.retire("v", "answer", f"f{index}")
+        report = tracker.report()
+        self.assertEqual(report.retired_held, 5)
+        self.assertAlmostEqual(
+            report.score - report.score_held - report.composition_effect_pp, 0.0, places=9
+        )
+
+    def test_a_fully_retired_view_is_still_held(self) -> None:
+        """A view with no surviving pairs still carries its weight in the level."""
+        tracker = HealthTracker(**FAST)
+        tracker.observe("keep", "answer", "k1", False, True)
+        tracker.observe("gone", "answer", "g1", False, False)
+        tracker.retire("gone", "answer", "g1")
+        report = tracker.report()
+        self.assertEqual(report.score, 100.0)
+        self.assertAlmostEqual(report.score_held, 50.0)
+        self.assertAlmostEqual(report.composition_effect_pp, 50.0)
+        self.assertEqual(report.retired_held, 1)
+
+    def test_held_items_use_the_outcome_weight(self) -> None:
+        tracker = HealthTracker(weights={"heavy": 3.0}, **FAST)
+        tracker.observe("v", "heavy", "h1", False, True)
+        tracker.observe("v", "light", "l1", False, False)
+        tracker.retire("v", "light", "l1")
+        report = tracker.report()
+        self.assertEqual(report.score, 100.0)
+        self.assertAlmostEqual(report.score_held, 75.0)  # 3*1 pass / (3*1 + 1*0)
+        self.assertAlmostEqual(report.composition_effect_pp, 25.0)
+
+    def test_held_items_add_to_a_cell_that_survived(self) -> None:
+        """Retired items join their surviving cell's count, not replace it."""
+        tracker = HealthTracker(
+            categories={"v": "tier-1"}, category_weights={"tier-1": 3.0}, **FAST
+        )
+        tracker.observe("v", "answer", "a1", False, True)
+        tracker.observe("v", "answer", "r1", False, False)
+        tracker.retire("v", "answer", "r1")
+        report = tracker.report()
+        self.assertEqual(report.score, 100.0)
+        self.assertAlmostEqual(report.score_held, 50.0)
+
+    def test_an_unmeasured_retirement_has_nothing_to_hold(self) -> None:
+        tracker = HealthTracker(**FAST)
+        tracker.observe("v", "answer", "q1", False, True)
+        tracker.retire("v", "answer", "never-run")
+        report = tracker.report()
+        self.assertEqual(report.retired, 1)
+        self.assertEqual(report.retired_held, 0)
+        self.assertEqual(report.score_held, report.score)
+        self.assertEqual(report.composition_effect_pp, 0.0)
+
+    def test_the_overlay_respects_the_layer_policy_and_declared_tiers(self) -> None:
+        """Held items keep their catalogue tier; live views keep the policy's weight.
+
+        The only tiered view is fully retired, so no *live* cell declares a tier
+        and ``tiered`` is False: the untagged live view is not re-defaulted into
+        ``tier-2`` just because a retired item dragged a category into the
+        overlay. The retired item itself keeps its declared tier-1 weight — that
+        is catalogue truth and does not touch the headline.
+        """
+        tracker = HealthTracker(
+            categories={"crit": "tier-1"},
+            category_weights={"tier-1": 3.0, "tier-2": 2.0},
+            **FAST,
+        )
+        tracker.observe("aux", "answer", "a1", False, True)
+        tracker.observe("aux", "answer", "a2", False, True)
+        tracker.observe("crit", "answer", "c1", False, False)
+        tracker.retire("crit", "answer", "c1")
+        report = tracker.report()
+        self.assertFalse(report.tiered)
+        self.assertEqual(report.score, 100.0)  # the live view alone, unweighted
+        self.assertAlmostEqual(report.score_held, 40.0)  # (1*2 + 3*0) / (1*2 + 3*1)
+        self.assertAlmostEqual(report.composition_effect_pp, 60.0)
 
 
 class CoverageGateTest(unittest.TestCase):

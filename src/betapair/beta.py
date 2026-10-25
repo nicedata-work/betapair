@@ -9,8 +9,7 @@ anywhere a Python interpreter runs.
 Numerics follow the textbook recipes (Abramowitz & Stegun 26.5.8 for the
 regularized incomplete beta continued fraction; Marsaglia-Tsang for gamma
 sampling). The continued fraction is iterated to :data:`_FP_EPS` with a hard
-iteration cap, which reproduces ``DFBA::dfba_mcnemar``'s published output to
-every printed digit (see ``tests/test_mcnemar.py``).
+iteration cap (see ``tests/test_mcnemar.py`` for the conformance values).
 """
 
 from __future__ import annotations

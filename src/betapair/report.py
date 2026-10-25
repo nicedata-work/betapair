@@ -38,6 +38,7 @@ stream never looks like a regression — the tracker reports those as
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Literal
 
@@ -57,7 +58,10 @@ from betapair.hierarchy import (
 from betapair.mcnemar import mcnemar, switch_evidence
 
 #: Bumped when the JSON shape changes — reports are persisted per refresh.
-REPORT_VERSION = 3
+#: v4 added ``retired``, ``score_held``, ``composition_effect_pp`` and
+#: ``retired_held``; v5 added ``failed`` (view-caused failures) to ``Coverage``
+#: and ``HealthReport``.
+REPORT_VERSION = 5
 
 #: The tier an untagged view falls back to **when tiers are in use at all**.
 #: The vocabulary is fixed: ``tier-1`` critical, ``tier-2`` dependent,
@@ -75,12 +79,17 @@ Status = Literal["improving", "stable", "regressing", "mixed", "insufficient"]
 
 @dataclass(frozen=True)
 class CellCoverage:
-    """Resolved/pending/errored item counts for one cell.
+    """Resolved/pending/errored/retired item counts for one cell.
 
     The tracker owns item-level state, so it is the only layer that can tell
-    ``pending`` (not evaluated yet) from ``errored`` (evaluation failed). The
-    report consumes this to gate on coverage: a crashing view must not make
+    ``pending`` (not evaluated yet) from ``errored`` (the *harness* failed) from
+    ``failed`` (the *view* failed) from ``retired`` (withdrawn from the bank).
+    The report consumes this to gate on coverage: a crashing view must not make
     health look better by shrinking its own denominator.
+
+    ``failed`` is the only one of the four that is **also** resolved: a
+    view-caused failure is scored as a failure, so those items are counted in
+    ``paired`` as well. See :data:`betapair.tracker.FAILED`.
     """
 
     stratum: str
@@ -89,14 +98,23 @@ class CellCoverage:
     paired: int = 0
     pending: int = 0
     errored: int = 0
+    retired: int = 0
+    failed: int = 0
+    """Paired items scored as a failure because the view caused the failure."""
 
     @property
     def unresolved(self) -> int:
+        """Items that are still expected to produce a result.
+
+        Retirement is deliberately excluded: withdrawing an item is a
+        deliberate bank change, not data that failed to arrive, so it must not
+        gate the verdict as if the pipeline were broken.
+        """
         return self.pending + self.errored
 
 
 class McNemarSummary(BaseModel):
-    """DFBA-style posterior summary of a paired comparison."""
+    """Posterior summary of a paired comparison."""
 
     n_improved: int
     n_regressed: int
@@ -176,6 +194,16 @@ class Coverage(BaseModel):
     paired: int = 0
     pending: int = 0
     errored: int = 0
+    retired: int = 0
+    """Items withdrawn from the bank — reported, but never gating."""
+    failed: int = 0
+    """Paired items scored as failures because the view, not the harness, failed.
+
+    Already inside ``paired``: unlike ``pending`` and ``errored`` these did
+    resolve, so they neither shrink the denominator nor gate the verdict. They
+    are surfaced so a view that is *breaking* is distinguishable from one that
+    is merely wrong — both cost the same score, but only one is an incident.
+    """
     unresolved_share: float = 0.0
     critical_unresolved: int = 0
     """Pending/errored items in the highest-criticality tier present."""
@@ -243,6 +271,30 @@ class HealthReport(BaseModel):
     p_improved: float | None = None
     pairs: int = 0
     pending: int = 0
+    failed: int = 0
+    """Paired items scored as failures because the view itself failed.
+
+    A view-caused error (a timeout, a crash) is a result, so it is counted
+    against the level instead of being dropped from it — the incentive TS2
+    encodes as "quitting is a surrender".
+    """
+    retired: int = 0
+    """Items withdrawn from the bank since the comparison began."""
+    retired_held: int = 0
+    """Retired items with a known outcome — the ones ``score_held`` folds in."""
+    score_held: float | None = None
+    """Level with retired items held at their last known outcome, 0-100.
+
+    Equal to ``score`` when nothing was retired. This is what the bank would
+    still read had its withdrawn items kept performing as they last did.
+    """
+    composition_effect_pp: float | None = None
+    """``score - score_held`` in percentage points.
+
+    How much of the headline level is explained by items *leaving* the bank
+    rather than by views changing. Positive means a shrinking bank is
+    flattering the score — the failure mode a paired test cannot see.
+    """
     strata: int = 0
     outcomes: list[str] = Field(default_factory=list)
     baseline_epoch: str | None = None
@@ -290,7 +342,7 @@ class CellVerdict:
     """A cell's exact McNemar evidence and the verdict drawn from it."""
 
     p_improved: float
-    """DFBA ``P(phi > .5)`` — the Bayesian evidence of improvement."""
+    """``P(phi > .5)`` — the Bayesian evidence of improvement."""
     p_regressed: float
     """Posterior probability this cell is a true regression, from the
     spike-and-slab model (see :func:`regression_model`)."""
@@ -448,7 +500,7 @@ def verdicts_from_model(
 ) -> dict[tuple[str, str], CellVerdict]:
     """Turn a fitted :class:`RegressionModel` into per-cell verdicts.
 
-    ``improving`` and ``stable`` come from the cell's own DFBA posterior at
+    ``improving`` and ``stable`` come from the cell's own McNemar posterior at
     ``improving_prob``; ``regressing`` is membership of the model's FDR-
     controlled flag set. Separated from :func:`regression_model` so the report
     fits the model once and still has the global quantities to hand.
@@ -483,7 +535,7 @@ def cell_verdicts(
 ) -> dict[tuple[str, str], CellVerdict]:
     """Per-cell verdict from the Bayesian two-group regression model.
 
-    ``improving`` and ``stable`` come from the cell's own DFBA posterior at
+    ``improving`` and ``stable`` come from the cell's own McNemar posterior at
     ``improving_prob``. ``regressing`` is the FDR-controlled flag set of
     :func:`regression_model` — a Bayesian multiplicity correction, so a wide
     layer does not manufacture regressions by chance and a critical cell is
@@ -607,19 +659,25 @@ def weighting(
     weights: dict[str, float] | None = None,
     category_weights: dict[str, float] | None = None,
     default_category: str | None = DEFAULT_CATEGORY,
+    tiered: bool | None = None,
 ) -> Weighting:
     """Resolve effective weights for ``cells`` (see :class:`Weighting`).
 
     Tiering applies only when at least one cell declares a category; an
     untagged cell then takes ``default_category``. A set with no tier anywhere
     stays uniform: every cell weighs 1.0, and nothing is marked defaulted.
+
+    @param tiered: Override the auto-detection. The held-level overlay passes
+        the layer's own decision, so adding cells that exist only because an
+        item was retired cannot flip the policy and re-weight the report.
     """
     weight_of = dict(weights or {})
     tier_of = dict(category_weights or {})
     for name, value in (*weight_of.items(), *tier_of.items()):
         if value < 0.0:
             raise ValueError(f"weight for {name!r} must be >= 0, got {value}")
-    tiered = any(cell.category is not None for cell in cells)
+    if tiered is None:
+        tiered = any(cell.category is not None for cell in cells)
     cell_weights: dict[tuple[str, str], float] = {}
     cell_categories: dict[tuple[str, str], str | None] = {}
     for cell in cells:
@@ -656,7 +714,10 @@ def build_report(
     pi_prior: tuple[float, float] = (1.0, 1.0),
     pi_points: int = 199,
     pending: int = 0,
+    failed: int = 0,
+    retired: int = 0,
     coverage: list[CellCoverage] | None = None,
+    held_counts: Mapping[tuple[str, str], tuple[int, int]] | None = None,
     max_unresolved_share: float = 0.25,
     baseline_epoch: str | None = None,
     candidate_epoch: str | None = None,
@@ -683,11 +744,21 @@ def build_report(
     rather than improving/regressing. The per-cell regression flag is
     unaffected — a credible regression in any view still forces ``regressing``.
 
-    ``coverage`` carries per-cell pending/errored counts from the tracker; when
-    the unresolved share exceeds ``max_unresolved_share``, or any item in the
-    most critical tier present is unresolved, the status is gated to
+    ``coverage`` carries per-cell pending/errored/retired/failed counts from the
+    tracker; when the unresolved share exceeds ``max_unresolved_share``, or any
+    item in the most critical tier present is unresolved, the status is gated to
     ``insufficient`` so a crashing view cannot improve health by shrinking its
-    own denominator.
+    own denominator. ``failed`` items are *not* unresolved: they are scored as
+    failures and counted in ``paired`` (see :data:`betapair.tracker.FAILED`),
+    and are passed through only so the report can show them. Retirement is
+    excluded from the gate — it is a deliberate bank change, not missing data —
+    and is reported through ``score_held`` and ``composition_effect_pp``
+    instead.
+
+    ``held_counts`` maps a cell to ``(items, passes)`` for items retired with a
+    known outcome. They are folded back into ``score_held`` only, so a level
+    that rose because hard questions were deleted is separable from one that
+    rose because the views changed.
 
     @note: The layer verdict is derived from the *weighted* hierarchical delta
         draws — the same quantity as the headline ``delta_pp`` — not from the
@@ -696,7 +767,7 @@ def build_report(
     @note: The delta draws multiply the switch rate by a discordance-rate draw,
         so the interval and the ROPE are statements about the population, not
         reconstructions of the observed sample delta.
-    @note: A cell's improving/stable evidence comes from its own exact DFBA
+    @note: A cell's improving/stable evidence comes from its own exact McNemar
         posterior, never from the borrowed-strength hierarchy estimate; the
         regression flag comes from the layer-wide spike-and-slab model. The
         hierarchy still shapes ``logit_shift`` and the delta interval.
@@ -732,6 +803,7 @@ def build_report(
         coverage,
         tier_of,
         pending=pending,
+        failed=failed,
         pairs=pairs,
         max_unresolved_share=max_unresolved_share,
     )
@@ -740,6 +812,8 @@ def build_report(
         return HealthReport(
             status="insufficient",
             pending=pending,
+            failed=failed,
+            retired=retired,
             strata=strata,
             outcomes=outcomes,
             baseline_epoch=baseline_epoch,
@@ -755,6 +829,7 @@ def build_report(
         return HealthReport(
             status="insufficient",
             pending=pending,
+            failed=failed,
             strata=strata,
             outcomes=outcomes,
             baseline_epoch=baseline_epoch,
@@ -762,6 +837,7 @@ def build_report(
             category_weights=dict(tier_of),
             default_category=default_category,
             tiered=tiered,
+            retired=retired,
             coverage=cov,
             guardrail=Guardrail(status="insufficient", reason="all outcome weights are zero"),
         )
@@ -772,6 +848,16 @@ def build_report(
     )
     observed_delta = level - baseline_level
     epsilon = rope_pp / 100.0
+    held = _held_overlay(
+        active,
+        held_counts,
+        coverage,
+        policy,
+        score=100.0 * level,
+        weights=weights,
+        category_weights=category_weights,
+        default_category=default_category,
+    )
 
     hierarchy_fit = fit(active, a0=a0, b0=b0)
     posteriors = cell_posteriors(hierarchy_fit, active, draws=draws, seed=seed, a_d=a_d, b_d=b_d)
@@ -904,6 +990,11 @@ def build_report(
         p_improved=pooled_p,
         pairs=pairs,
         pending=pending,
+        failed=failed,
+        retired=retired,
+        retired_held=held.items,
+        score_held=held.score,
+        composition_effect_pp=held.effect_pp,
         coverage=cov,
         strata=strata,
         outcomes=outcomes,
@@ -970,6 +1061,91 @@ def parse_category_weights(text: str | None) -> dict[str, float]:
     return weights
 
 
+@dataclass(frozen=True)
+class _Held:
+    """Level with retired items held at their last known outcome."""
+
+    score: float | None
+    effect_pp: float | None
+    items: int
+
+
+def _held_overlay(
+    active: list[Cell],
+    held_counts: Mapping[tuple[str, str], tuple[int, int]] | None,
+    coverage: list[CellCoverage] | None,
+    policy: Weighting,
+    *,
+    score: float | None,
+    weights: dict[str, float] | None,
+    category_weights: dict[str, float] | None,
+    default_category: str | None,
+) -> _Held:
+    """Read the level again with retired items held at their last known outcome.
+
+    ``held_counts`` maps a cell to ``(items, passes)``: the retired items whose
+    last real outcome is known. Folding them back into the level turns the
+    silent failure mode of a shrinking bank into a number — ``score -
+    score_held`` — so a level that only rose because hard questions were deleted
+    is visible instead of being read as an improvement.
+
+    @note: The overlay is arithmetic only. Retired items are added to the
+        numerator and denominator of the level and to nothing else, so the
+        paired test, the hierarchy, the guardrail and every interval are
+        bit-identical to a run without retirement.
+    @note: Weights for the cells that exist only because of retirement are
+        resolved with the layer's own ``tiered`` decision, so the overlay can
+        never re-weight the cells that ``score`` is built from.
+    @note: An item retired before it was ever measured has no outcome to hold
+        and is left out; it is still visible through ``retired`` and
+        ``coverage.retired``.
+    @return: The held level, the composition effect, and how many retired items
+        carried a known outcome.
+    """
+    extra = {key: counts for key, counts in (held_counts or {}).items() if counts[0] > 0}
+    if not extra or score is None:
+        return _Held(score=score, effect_pp=0.0 if score is not None else None, items=0)
+    by_key = {cell.key: cell for cell in active}
+    stratum_category: dict[str, str | None] = {
+        row.stratum: row.category for row in (coverage or [])
+    }
+    stratum_category.update({cell.stratum: cell.category for cell in active})
+    held_only = [
+        Cell(
+            stratum=stratum,
+            outcome=outcome,
+            pairs=counts[0],
+            passed=counts[1],
+            category=stratum_category.get(stratum),
+        )
+        for (stratum, outcome), counts in sorted(extra.items())
+        if (stratum, outcome) not in by_key
+    ]
+    extended = weighting(
+        [*active, *held_only],
+        weights=weights,
+        category_weights=category_weights,
+        default_category=default_category,
+        tiered=policy.tiered,
+    )
+    weighted_pairs = 0.0
+    weighted_passes = 0.0
+    for key in sorted(set(by_key) | set(extra)):
+        weight = extended.weights[key]
+        base = by_key.get(key)
+        held_pairs, held_passed = extra.get(key, (0, 0))
+        weighted_pairs += weight * ((base.pairs if base is not None else 0) + held_pairs)
+        weighted_passes += weight * ((base.passed if base is not None else 0) + held_passed)
+    if weighted_pairs <= 0.0:
+        return _Held(score=None, effect_pp=None, items=0)
+    held_score = 100.0 * weighted_passes / weighted_pairs
+    return _Held(
+        score=held_score,
+        effect_pp=score - held_score,
+        items=sum(counts[0] for counts in extra.values()),
+    )
+
+
 def _coverage(
     coverage: list[CellCoverage] | None,
     category_weights: dict[str, float],
@@ -977,6 +1153,7 @@ def _coverage(
     pending: int,
     pairs: int,
     max_unresolved_share: float,
+    failed: int = 0,
 ) -> Coverage:
     """Decide whether the comparison resolved enough to be judged.
 
@@ -989,6 +1166,9 @@ def _coverage(
     @note: The critical tier is detected from the coverage itself, not from the
         active cells: a tier-1 view that is entirely pending or errored has no
         active cell, and that is exactly the case the gate must catch.
+    @note: Retirement is counted but does not gate (see
+        :attr:`CellCoverage.unresolved`). It is reported so a shrinking bank is
+        visible rather than silently redefining the score's denominator.
     """
     if coverage is None:
         total = pairs + pending
@@ -1003,6 +1183,7 @@ def _coverage(
             paired=pairs,
             pending=pending,
             errored=0,
+            failed=failed,
             unresolved_share=share,
             complete=complete,
             reason=reason,
@@ -1011,6 +1192,11 @@ def _coverage(
     paired = sum(item.paired for item in coverage)
     pend = sum(item.pending for item in coverage)
     errored = sum(item.errored for item in coverage)
+    retired = sum(item.retired for item in coverage)
+    view_failed = sum(item.failed for item in coverage)
+    # Retired items are out of the comparison entirely, so they are excluded
+    # from the gate's denominator as well as its numerator: a bank that shrank
+    # to five questions with all five pending is a real coverage failure.
     total = paired + pend + errored
     share = (pend + errored) / total if total > 0 else 0.0
 
@@ -1040,6 +1226,8 @@ def _coverage(
         paired=paired,
         pending=pend,
         errored=errored,
+        retired=retired,
+        failed=view_failed,
         unresolved_share=share,
         critical_unresolved=critical_unresolved,
         complete=not reasons,

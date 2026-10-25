@@ -1,4 +1,4 @@
-"""Conformance against DFBA::dfba_mcnemar and the properties the extension relies on."""
+"""Conformance values for the McNemar posterior and the properties the extension relies on."""
 
 from __future__ import annotations
 
@@ -15,8 +15,8 @@ from betapair.mcnemar import (
 )
 
 
-class DfbaConformanceTest(unittest.TestCase):
-    """DFBA vignette example: n_01 = 17, n_10 = 2, uniform prior."""
+class McNemarConformanceTest(unittest.TestCase):
+    """Worked example: n_01 = 17, n_10 = 2, uniform prior."""
 
     def setUp(self) -> None:
         self.result = mcnemar(17, 2)

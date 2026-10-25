@@ -14,6 +14,22 @@ counts, which buys three properties a service needs:
 * **partial data** — ``report()`` always works; items whose candidate side has
   not landed yet are reported as ``pending`` and excluded from the score, so a
   half-finished stream never reads as a regression;
+* **bank churn** — :meth:`HealthTracker.retire` withdraws an item from the
+  bank. A retired item is not *pending* (nothing is outstanding) and not
+  *errored* (nothing failed), so it does not gate coverage. Its last real
+  outcome is kept in :attr:`HealthTracker.retired_ledger` and folded back into
+  ``score_held``, so the part of the level caused by shrinking the bank
+  (``composition_effect_pp``) is separable from the part caused by the views
+  changing;
+* **error attribution** — an evaluation can fail because *the view* failed
+  (its SQL timed out, its query OOM'd the warehouse, its output crashed the
+  judge) or because *the harness* failed (a worker died, an API returned 5xx).
+  The two are not the same: a view-caused failure is a result, so it is passed
+  as :data:`FAILED` and scored as a failure, keeping it in the level and the
+  paired test. A harness-caused failure is genuinely unresolved and is passed
+  as :data:`ERROR`, so it stays out of the score and gates coverage. Without
+  the split, erroring out of the questions you were failing would raise the
+  score exactly as deleting them would, and only one of those keeps a trace;
 * **epoch rollover** — :meth:`HealthTracker.advance` promotes the candidate
   epoch to baseline and clears the other side, so a periodic refresh reuses
   the same tracker with memory bounded by one epoch of items, while
@@ -50,7 +66,8 @@ from betapair.series import ScoreBand, ScorePoint, score_band
 #: of the package version in ``pyproject.toml``. It moves when the payload
 #: shape changes (v3 added the score ``timeline``); :meth:`from_snapshot`
 #: rejects any other version. Within a version, additive keys are fine:
-#: a v3 payload with no ``timeline`` still loads, defaulted to empty.
+#: a v3 payload with no ``timeline`` still loads, defaulted to empty, and one
+#: with no ``retired_ledger`` loads with an empty ledger.
 SNAPSHOT_VERSION = 3
 
 
@@ -72,48 +89,153 @@ class _Errored:
 #: Marker for a side whose evaluation errored (as opposed to ``None`` = pending).
 ERROR = _Errored()
 
-Side = bool | None | _Errored
+
+class _Retired:
+    """Sentinel for an item withdrawn from the question bank.
+
+    ``None`` means "not evaluated yet"; :data:`ERROR` means "evaluated and the
+    evaluation itself failed"; ``RETIRED`` means "no longer part of the bank".
+    A retired item is a *structural* change to the comparison rather than
+    missing data, so it is excluded from the score and the paired test without
+    counting as unresolved — and it is counted on its own so a shrinking bank
+    is visible instead of silently redefining the denominator.
+    """
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return "RETIRED"
+
+
+#: Marker for a side whose item has been withdrawn from the bank.
+RETIRED = _Retired()
+
+
+class _Failed:
+    """Sentinel for a *view-caused* evaluation failure, scored as a failure.
+
+    ``False`` means "evaluated and the item did not pass"; :data:`FAILED` means
+    "evaluated and the evaluation itself failed because the view did". The two
+    are kept apart so the failure stays visible in the counts, but they score
+    the same: a view that times out on the questions it was failing must not
+    improve its own level by removing them from the denominator. Because a
+    failure is a real result, the record stays ``paired`` — it enters the level
+    and the paired test with no ledger and no composition term.
+    """
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return "FAILED"
+
+
+#: Marker for a side whose evaluation failed and the failure was the view's fault.
+FAILED = _Failed()
+
+Side = bool | None | _Errored | _Retired | _Failed
 CellKey = tuple[str, str]
 Pair = tuple[Side, Side]
 
 
 #: One record's state. The single predicate every counter uses, so
-#: ``coverage()``, ``cells()`` and the ``paired``/``pending``/``errored``
-#: properties can never disagree about a record.
-State = Literal["paired", "pending", "errored"]
+#: ``coverage()``, ``cells()`` and the ``paired``/``pending``/``errored``/
+#: ``retired`` properties can never disagree about a record.
+State = Literal["paired", "pending", "errored", "retired"]
 
 
 def _errored(value: object) -> bool:
     return isinstance(value, _Errored)
 
 
+def _retired(value: object) -> bool:
+    return isinstance(value, _Retired)
+
+
+def _failed(value: object) -> bool:
+    return isinstance(value, _Failed)
+
+
+def _outcome(value: Side) -> bool | None:
+    """The result a side *scores as*, or ``None`` when it has no result.
+
+    :data:`FAILED` is a view-caused failure, so it scores as ``False``. That
+    one line is what makes a failure enter the level instead of shrinking its
+    denominator. ``None``, :data:`ERROR` and :data:`RETIRED` carry no result.
+    """
+    if isinstance(value, bool):
+        return value
+    if _failed(value):
+        return False
+    return None
+
+
+def _last_result(*sides: Side) -> bool | None:
+    """The first real outcome among ``sides``, or ``None`` if there is none.
+
+    Callers pass the more recent side first, so a retirement keeps the latest
+    thing actually known about the item rather than an older one. A
+    view-caused failure counts as a real outcome: it last scored as ``False``.
+    """
+    for side in sides:
+        result = _outcome(side)
+        if result is not None:
+            return result
+    return None
+
+
 def _state(baseline: Side, candidate: Side) -> State:
-    """A record is ``paired`` only when both sides are real results."""
+    """A record is ``paired`` only when both sides are real results.
+
+    @note: Retirement outranks the other states. It is a statement about the
+        item, not about an evaluation attempt, so it holds whichever side
+        carries it. A harness error outranks a view-caused failure for the same
+        reason in reverse: an unresolved record cannot be scored.
+    """
+    if _retired(baseline) or _retired(candidate):
+        return "retired"
     if _errored(baseline) or _errored(candidate):
         return "errored"
     if baseline is None or candidate is None:
         return "pending"
+    # A real result on both sides. A ``FAILED`` side is a result (it scores as
+    # a failure), so it lands here as ``paired`` rather than gating coverage.
     return "paired"
 
 
 def _check_side(value: object, field: str) -> Side:
     """Narrow a caller-supplied side, rejecting anything off the type.
 
-    @raise ValueError: If ``value`` is not ``True``, ``False``, ``None`` or
-        :data:`ERROR`.
+    @raise ValueError: If ``value`` is not ``True``, ``False``, ``None``,
+        :data:`ERROR`, :data:`FAILED` or :data:`RETIRED`.
     """
-    if value is None or isinstance(value, bool) or _errored(value):
+    if (
+        value is None
+        or isinstance(value, bool)
+        or _errored(value)
+        or _retired(value)
+        or _failed(value)
+    ):
         return value  # type: ignore[return-value]
-    raise ValueError(f"{field} must be True, False, None or ERROR, got {value!r}")
+    raise ValueError(f"{field} must be True, False, None, ERROR, RETIRED or FAILED, got {value!r}")
 
 
 def _serialise_side(value: Side) -> object:
-    return "error" if _errored(value) else value
+    if _errored(value):
+        return "error"
+    if _retired(value):
+        return "retired"
+    if _failed(value):
+        return "failed"
+    return value
 
 
 def _parse_side(value: object, field: str = "side") -> Side:
     if value == "error":
         return ERROR
+    if value == "retired":
+        return RETIRED
+    if value == "failed":
+        return FAILED
     return _check_side(value, field)
 
 
@@ -165,6 +287,22 @@ def _record_rows(value: object) -> list[list[object]]:
     return rows
 
 
+def _ledger_rows(value: object) -> list[list[object]]:
+    """Validate the retirement ledger's ``[stratum, outcome, item, last]`` rows."""
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise ValueError(f"snapshot retired_ledger must be a list, got {value!r}")
+    rows: list[list[object]] = []
+    for raw in value:
+        if not isinstance(raw, list) or len(raw) != 4:
+            raise ValueError(
+                f"snapshot retired_ledger rows must be [stratum, outcome, item, last], got {raw!r}"
+            )
+        rows.append(list(raw))
+    return rows
+
+
 def _generate_seed() -> int:
     """A fresh seed for the Monte-Carlo draws.
 
@@ -180,9 +318,12 @@ def _generate_seed() -> int:
 class PairRecord:
     """One item's paired outcome: baseline epoch vs candidate epoch.
 
-    ``None`` means "not evaluated in that epoch" — an errored, undecided or
-    not-yet-re-run item. ``True`` is PASS, ``False`` FAIL; the tracker never
-    folds errors into a failure.
+    ``None`` means "not evaluated in that epoch", :data:`ERROR` that the
+    harness failed to evaluate it, :data:`FAILED` that the view caused the
+    evaluation to fail, :data:`RETIRED` that the item has left the bank.
+    ``True`` is PASS, ``False`` FAIL; the tracker never folds *harness* errors
+    or retirement into a failure. A :data:`FAILED` side **is** scored as a
+    failure, because a view that breaks on a question has answered it.
     """
 
     stratum: str
@@ -242,6 +383,15 @@ class HealthTracker:
         self.candidate_epoch = candidate_epoch
         self._records: dict[CellKey, dict[str, Pair]] = {}
         self.timeline: list[ScorePoint] = []
+        self.retired_ledger: dict[CellKey, dict[str, bool | None]] = {}
+        """Last real outcome of every retired item, kept past :meth:`advance`.
+
+        ``advance`` drops a retired row, so without this the bank could shrink
+        with no trace. The ledger is what lets a composition-vs-change split
+        tell a level move caused by dropping items apart from one caused by the
+        views changing. ``None`` means the item was withdrawn before it was
+        ever measured in a paired epoch.
+        """
 
     def observe(
         self,
@@ -257,18 +407,45 @@ class HealthTracker:
         @param outcome: Outcome name within the view.
         @param item: Stable item key; re-observing the same key overwrites.
         @param baseline: PASS/FAIL in the baseline epoch, ``None`` if not run,
-            or :data:`ERROR` if the evaluation failed.
+            :data:`ERROR` if the harness failed to evaluate it, or
+            :data:`FAILED` if the view itself failed.
         @param candidate: PASS/FAIL in the candidate epoch, ``None`` if
-            pending, or :data:`ERROR` if the evaluation failed.
+            pending, :data:`ERROR` if the harness failed to evaluate it, or
+            :data:`FAILED` if the view itself failed.
         @raise ValueError: If any of ``stratum``/``outcome``/``item`` is empty.
         """
         if not stratum or not outcome or not item:
             raise ValueError("stratum, outcome and item must be non-empty")
-        cell = self._records.setdefault((stratum, outcome), {})
-        cell[item] = (
-            _check_side(baseline, "baseline"),
-            _check_side(candidate, "candidate"),
-        )
+        key = (stratum, outcome)
+        baseline_side = _check_side(baseline, "baseline")
+        candidate_side = _check_side(candidate, "candidate")
+        self._records.setdefault(key, {})[item] = (baseline_side, candidate_side)
+        if _retired(baseline_side) or _retired(candidate_side):
+            self.retired_ledger.setdefault(key, {})[item] = _last_result(
+                candidate_side, baseline_side
+            )
+
+    def retire(self, stratum: str, outcome: str, item: str) -> None:
+        """Withdraw an item from the bank, keeping its last known outcome.
+
+        A retired item is neither pending nor errored: it is structurally gone
+        from the comparison, so it leaves the score and the paired test without
+        counting as unresolved data — which is why it does not gate coverage.
+        Its last real outcome is written to :attr:`retired_ledger`.
+
+        Retiring an item the tracker has never seen is allowed and records
+        ``None``, meaning "withdrawn before it was ever measured".
+
+        @note: The tracker cannot infer retirement from silence — an item that
+            is simply never observed again stays ``pending``, exactly as
+            before. Only an explicit retirement makes the bank change visible.
+        @raise ValueError: If any of ``stratum``/``outcome``/``item`` is empty.
+        """
+        if not stratum or not outcome or not item:
+            raise ValueError("stratum, outcome and item must be non-empty")
+        stored = self._records.get((stratum, outcome), {}).get(item)
+        baseline, candidate = stored if stored is not None else (None, None)
+        self.observe(stratum, outcome, item, _last_result(candidate, baseline), RETIRED)
 
     def set_category(self, stratum: str, category: str | None) -> None:
         """Bind (or clear) the category of one stratum.
@@ -385,8 +562,10 @@ class HealthTracker:
         @param record: Append the finished epoch's score to :attr:`timeline`
             before rolling, so a chain of advances preserves the history a
             :meth:`score_band` needs.
-        @note: Only a real result can become the next baseline; a pending or
-            errored candidate has nothing to promote.
+        @note: Only a real result can become the next baseline. A
+            :data:`FAILED` candidate is a real result and is promoted as
+            ``False``; a pending, errored or retired one has nothing to
+            promote.
         """
         if record:
             finished = self.candidate_epoch if baseline_epoch is None else baseline_epoch
@@ -395,8 +574,14 @@ class HealthTracker:
         for key, items in self._records.items():
             kept: dict[str, Pair] = {}
             for item, (_, candidate) in items.items():
-                if isinstance(candidate, bool):
-                    kept[item] = (candidate, None)
+                # Only a real result can become the next baseline. Pending,
+                # errored and retired rows are dropped here — a retired item is
+                # already recorded in ``retired_ledger``, so the bank change
+                # survives the rollover even though the row does not. A
+                # view-caused failure is a real result and promotes as FAIL.
+                outcome = _outcome(candidate)
+                if outcome is not None:
+                    kept[item] = (outcome, None)
             if kept:
                 rolled[key] = kept
         self._records = rolled
@@ -464,20 +649,73 @@ class HealthTracker:
 
     @property
     def errored(self) -> int:
-        """Records where an evaluation failed on either side."""
+        """Records where the *harness* failed to evaluate either side.
+
+        These are genuinely unresolved: they are excluded from the score and
+        gate coverage. A failure caused by the view is :attr:`failed` instead.
+        """
         return self._count("errored")
+
+    @property
+    def failed(self) -> int:
+        """Records scored as a failure because the *view* failed to evaluate.
+
+        A subset of :attr:`paired`, not of :meth:`pending` or
+        :attr:`errored`: a view that times out or crashes on a question has
+        produced a result, and it counts against the level rather than leaving
+        the denominator.
+        """
+        return sum(
+            1
+            for items in self._records.values()
+            for baseline, candidate in items.values()
+            if _state(baseline, candidate) == "paired" and (_failed(baseline) or _failed(candidate))
+        )
 
     @property
     def paired(self) -> int:
         return self._count("paired")
 
+    @property
+    def retired(self) -> int:
+        """Records withdrawn from the bank in the current epoch."""
+        return self._count("retired")
+
+    def held_counts(self) -> dict[CellKey, tuple[int, int]]:
+        """Retired items per cell with a known outcome, as ``(items, passes)``.
+
+        This is the input to the report's composition split: retired items are
+        held at the result they last showed, so the level can be read with and
+        without the bank change. An item retired before it was ever measured has
+        no outcome to hold and is omitted — it still counts in
+        :attr:`retired` and ``coverage().retired``.
+        """
+        out: dict[CellKey, tuple[int, int]] = {}
+        for key, items in self.retired_ledger.items():
+            known = [last for last in items.values() if last is not None]
+            if known:
+                out[key] = (len(known), sum(known))
+        return out
+
     def coverage(self) -> list[CellCoverage]:
         """Per-cell resolved/pending/errored counts, sorted for determinism."""
         out: list[CellCoverage] = []
         for (stratum, outcome), items in sorted(self._records.items()):
-            counts: dict[State, int] = {"paired": 0, "pending": 0, "errored": 0}
+            counts: dict[State, int] = {
+                "paired": 0,
+                "pending": 0,
+                "errored": 0,
+                "retired": 0,
+            }
+            failed = 0
             for baseline, candidate in items.values():
-                counts[_state(baseline, candidate)] += 1
+                state = _state(baseline, candidate)
+                counts[state] += 1
+                # Only a paired record is scored, so only a paired record can
+                # be a view-caused failure. Retirement outranks a failed side,
+                # and such a record is not scored at all.
+                if state == "paired" and (_failed(baseline) or _failed(candidate)):
+                    failed += 1
             out.append(
                 CellCoverage(
                     stratum=stratum,
@@ -486,6 +724,8 @@ class HealthTracker:
                     paired=counts["paired"],
                     pending=counts["pending"],
                     errored=counts["errored"],
+                    retired=counts["retired"],
+                    failed=failed,
                 )
             )
         return out
@@ -498,10 +738,14 @@ class HealthTracker:
             for baseline, candidate in items.values():
                 if _state(baseline, candidate) != "paired":
                     continue
+                # ``_outcome`` maps FAILED to False, so a view-caused failure
+                # counts as a paired FAIL rather than leaving the cell.
+                before = _outcome(baseline)
+                after = _outcome(candidate)
                 pairs += 1
-                passed += int(bool(candidate))
-                improved += int(not baseline and bool(candidate))
-                regressed += int(bool(baseline) and not candidate)
+                passed += int(after is True)
+                improved += int(before is False and after is True)
+                regressed += int(before is True and after is False)
             if pairs:
                 cells.append(
                     Cell(
@@ -545,7 +789,10 @@ class HealthTracker:
             pi_prior=self.pi_prior,
             pi_points=self.pi_points,
             pending=self.pending,
+            failed=self.failed,
+            retired=self.retired,
             coverage=self.coverage(),
+            held_counts=self.held_counts(),
             max_unresolved_share=(
                 self.max_unresolved_share if max_unresolved_share is None else max_unresolved_share
             ),
@@ -578,6 +825,11 @@ class HealthTracker:
             "candidate_epoch": self.candidate_epoch,
             "records": records,
             "timeline": [point.snapshot() for point in self.timeline],
+            "retired_ledger": [
+                [stratum, outcome, item, last]
+                for (stratum, outcome), items in sorted(self.retired_ledger.items())
+                for item, last in sorted(items.items())
+            ],
         }
 
     @classmethod
@@ -619,6 +871,14 @@ class HealthTracker:
                 _parse_side(baseline, "baseline"),
                 _parse_side(candidate, "candidate"),
             )
+        for raw in _ledger_rows(payload.get("retired_ledger")):
+            stratum, outcome, item, last = raw
+            if last is not None and not isinstance(last, bool):
+                raise ValueError(
+                    f"snapshot retired_ledger outcome must be true, false or null, got {last!r}"
+                )
+            key = (str(stratum), str(outcome))
+            tracker.retired_ledger.setdefault(key, {})[str(item)] = last
         raw_timeline = payload.get("timeline", [])
         if not isinstance(raw_timeline, list):
             raise ValueError(f"snapshot timeline must be a list, got {raw_timeline!r}")
@@ -633,5 +893,5 @@ class HealthTracker:
         return cls.from_snapshot(json.loads(text), **config)
 
     def __len__(self) -> int:
-        """Number of tracked items, paired or pending."""
+        """Number of tracked rows in the current epoch, whatever their state."""
         return sum(len(items) for items in self._records.values())

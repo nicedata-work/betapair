@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "betapair"
 version = "0.1.0"
-description = "Dependency-light Bayesian analysis of paired binary outcomes: a Python port of DFBA's McNemar test with hierarchical multi-strata pooling."
+description = "Dependency-light Bayesian analysis of paired binary outcomes with a hierarchical McNemar test and multi-strata pooling."
 readme = "README.md"
 requires-python = ">=3.10"
 license = "Apache-2.0"
@@ -14,7 +14,6 @@ authors = [{ name = "nicedata" }]
 keywords = [
     "bayesian",
     "mcnemar",
-    "dfba",
     "paired",
     "statistics",
     "hierarchical",
@@ -35,8 +34,11 @@ dev = [
     "ruff>=0.6",
 ]
 
-# [project.urls]
-# Repository = "https://github.com/<owner>/betapair"
+[project.urls]
+Homepage = "https://github.com/nicedata-work/betapair"
+Repository = "https://github.com/nicedata-work/betapair"
+Issues = "https://github.com/nicedata-work/betapair/issues"
+Changelog = "https://github.com/nicedata-work/betapair/blob/main/CHANGELOG.md"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/betapair"]

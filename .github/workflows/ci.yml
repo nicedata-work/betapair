@@ -40,3 +40,20 @@ jobs:
           enable-cache: true
       - run: uv sync --extra dev --python ${{ matrix.python-version }}
       - run: uv run pytest
+
+  package:
+    name: build and check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv build
+      - name: Check distributions
+        run: uvx twine check dist/*
+      - name: Smoke-test the wheel in a clean environment
+        run: |
+          uv venv /tmp/smoke
+          uv pip install --python /tmp/smoke/bin/python dist/*.whl
+          /tmp/smoke/bin/python -c "import betapair; from betapair import mcnemar; print(mcnemar(12, 3).p_improved)"

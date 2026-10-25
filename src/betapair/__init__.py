@@ -1,10 +1,10 @@
 """betapair — dependency-light Bayesian analysis of paired binary outcomes.
 
-This package ports the statistical core of ``DFBA::dfba_mcnemar()`` to Python
-and extends it to many strata at once:
+This package implements Bayesian analysis of paired binary outcomes and
+extends it to many strata at once:
 
 * :mod:`betapair.beta` — stdlib beta / beta-binomial numerics (no numpy/scipy);
-* :mod:`betapair.mcnemar` — ``mcnemar()``, a faithful port of ``dfba_mcnemar``;
+* :mod:`betapair.mcnemar` — ``mcnemar()``, the Bayesian McNemar test;
 * :mod:`betapair.hierarchy` — hierarchical (multi-strata) pooling and a
   posterior predictive homogeneity guardrail;
 * :mod:`betapair.report` — the assembled report models and ``build_report()``;
@@ -61,12 +61,14 @@ from betapair.report import (
     weighting,
 )
 from betapair.series import ScoreBand, ScorePoint, score_band
-from betapair.tracker import ERROR, HealthTracker, PairRecord
+from betapair.tracker import ERROR, FAILED, RETIRED, HealthTracker, PairRecord
 
 __all__ = [
     "DEFAULT_CATEGORY",
     "ERROR",
+    "FAILED",
     "REPORT_VERSION",
+    "RETIRED",
     "CategorySummary",
     "Cell",
     "CellContribution",

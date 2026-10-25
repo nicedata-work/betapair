@@ -22,11 +22,15 @@ and dependency-light: the maths uses only Python's built-in `math` and
 
 ## Install
 
-Not published on PyPI yet, so install from a git URL or a checkout:
+```bash
+pip install betapair
+# or with uv:
+uv add betapair
+```
+
+From a checkout:
 
 ```bash
-uv add "betapair @ git+https://github.com/<owner>/betapair"
-# or, inside a clone:
 uv sync --extra dev
 ```
 
@@ -203,7 +207,9 @@ tracker.observe("group_a", "quiz", "q3", baseline=False, candidate=None)
 print(tracker.pending)  # 1
 ```
 
-**A failed evaluation.** Use `ERROR` (different from "not run yet"):
+**A failed evaluation.** Attribute it to whoever failed. `ERROR` means the
+*harness* could not evaluate the item (a worker died, an API returned 5xx): it
+is genuinely unresolved, so it is left out of the score and gates coverage.
 
 ```python
 from betapair import ERROR
@@ -211,6 +217,39 @@ from betapair import ERROR
 tracker.observe("group_a", "quiz", "q4", baseline=False, candidate=ERROR)
 print(tracker.errored)  # 1
 ```
+
+`FAILED` means the *view* could not answer the item (its SQL timed out, its
+query OOM'd the warehouse, its output crashed the judge). A view-caused failure
+is a result, so it is scored as a failure and stays in the score and the paired
+test — a view cannot raise its own level by breaking on the questions it was
+failing:
+
+```python
+from betapair import FAILED
+
+tracker.observe("group_a", "quiz", "q6", baseline=True, candidate=FAILED)
+print(tracker.failed)  # 1, counted against the score rather than dropped from it
+```
+
+**A question leaves the bank.** Retire it, so the score is not quietly
+redefined by the ones that remain:
+
+```python
+tracker.retire("group_a", "quiz", "q5")
+print(tracker.retired)  # 1
+
+report = tracker.report()
+print(report.score)  # the surviving questions only
+print(report.score_held)  # ...with the retired ones held at their last result
+print(report.composition_effect_pp)  # how much of the score is the bank shrinking
+```
+
+A retired question is not `pending` (nothing is outstanding) and not `ERROR`
+(the harness did not fail), so it does not gate coverage. `composition_effect_pp`
+is the part of the score explained by questions *leaving* the bank rather than
+by the views changing, so deleting the questions you were failing shows up as a
+number instead of an improvement. (Erroring out of them with `FAILED` needs no
+such bookkeeping: the failure is already in the score.)
 
 **Some groups matter more.** Tag them and weight the tags:
 
