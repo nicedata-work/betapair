@@ -30,21 +30,33 @@ effective weight of a cell is ``weight[outcome] * category_weight[category]``:
   stratum's). Categories are external labels on the stratum; they change the
   aggregation and the breakdown, never the paired test itself.
 
+A stratum may also carry a ``group`` — the shared upstream dependency it
+belongs to (source table, domain, metric family). Unlike a category it carries
+no weight and gates nothing: it is a label the report passes through per cell
+so views that fail *together* can be read as one incident rather than many
+independent regressions. Nothing in this module's numbers depends on it.
+
 Cells with no paired items are excluded from the score so a half-finished
 stream never looks like a regression — the tracker reports those as
 ``pending``.
+
+The headline ``score`` carries its own interval (``score_low``/``score_high``):
+the equal-tail credible bounds of the same ``Beta(1 + k, 1 + n - k)`` posterior
+whose mode *is* ``score``, taken over the **weighted effective** pairs so the
+interval describes exactly the micro-average it belongs to (see
+``series.ScorePoint.interval`` for the unweighted per-epoch form).
 """
 
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping
-from dataclasses import dataclass
-from typing import Literal
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Literal
 
 from pydantic import BaseModel, Field
 
-from betapair.beta import beta_cdf, log_beta
+from betapair.beta import beta_cdf, beta_ppf, log_beta
 from betapair.hierarchy import (
     DRAWS,
     PPC_DRAWS,
@@ -55,13 +67,76 @@ from betapair.hierarchy import (
     homogeneity_ppc,
     pooled_counts,
 )
+from betapair.irt import (
+    DEFAULT_SIGMA,
+    ItemKey,
+    ItemResponse,
+    RaschFit,
+    ReferenceBank,
+    bank_digest,
+    equated_rates,
+    fit_rasch,
+    sigmoid,
+)
 from betapair.mcnemar import mcnemar, switch_evidence
+
+if TYPE_CHECKING:  # pragma: no cover - annotation only, avoids a report<->series cycle
+    from betapair.series import ScorePoint
 
 #: Bumped when the JSON shape changes — reports are persisted per refresh.
 #: v4 added ``retired``, ``score_held``, ``composition_effect_pp`` and
 #: ``retired_held``; v5 added ``failed`` (view-caused failures) to ``Coverage``
-#: and ``HealthReport``.
-REPORT_VERSION = 5
+#: and ``HealthReport``; v6 added ``score_low``/``score_high``; v7 added
+#: ``score_unpaired``/``unpaired`` (the cold-start level) and ``unresolved_share``;
+#: v8 added ``score_adjusted``/``difficulty_adjustment_pp``/``irt`` (the
+#: opt-in difficulty adjustment) and the per-cell equated rate; v9 added
+#: ``irt.reference`` (the resolved reference bank's name/version/digest/size);
+#: v10 added ``CellContribution.group`` (the shared-dependency label); v11 added
+#: ``HealthReport.groups`` (the per-incident roll-up of the group-as-unit gate).
+REPORT_VERSION = 11
+
+#: Multiplier on the measured between-epoch dispersion when the ROPE is
+#: calibrated from the metric's own history. One measured sd means "a move
+#: smaller than the metric's genuine movement is not a change".
+ROPE_BAND_FACTOR = 1.0
+
+#: Scored points the history needs before its band is trusted to size the
+#: ROPE. With fewer, the hand-set default stands (the dispersion estimate is
+#: itself too noisy to decide a dead zone).
+ROPE_MIN_POINTS = 3
+
+#: Total strength (``a + b``) the default ``pi_prior = (1, 1)`` carries. A
+#: calibrated prior keeps this strength and moves only its mean onto the base
+#: rate the history measured, so it stays as weakly informative as before.
+PI_PRIOR_STRENGTH = 2.0
+
+#: Bounds on the calibrated ``pi_prior`` mean, away from 0 and 1: a prior that
+#: says "nothing ever regresses" (or "everything does") would be unrecoverable
+#: from data.
+PI_PRIOR_MIN = 0.01
+PI_PRIOR_MAX = 0.99
+
+#: History points carrying a ``pi_mean`` the prior needs before it is taken
+#: from them rather than the default. One previous epoch is enough;
+#: subsequent epochs then accumulate.
+PI_MIN_POINTS = 1
+
+#: Completed epochs the history needs before its unresolved shares are
+#: trusted to size the coverage gate. This is a cold-start guard: on the first
+#: runs nearly everything is unresolved, and a threshold derived from that
+#: would gate every early report. Below this count the default stands.
+COVERAGE_MIN_POINTS = 3
+
+#: How far above the history's mean unresolved share the gate tolerates before
+#: it fires — room for a normal, noisy epoch without letting a stalled
+#: pipeline through.
+COVERAGE_MARGIN = 0.05
+
+#: The derived coverage threshold is kept inside these bounds: at least a
+#: sliver of unresolved data is always tolerated, and more than half
+#: unresolved can never be waved through.
+COVERAGE_MIN = 0.02
+COVERAGE_MAX = 0.50
 
 #: The tier an untagged view falls back to **when tiers are in use at all**.
 #: The vocabulary is fixed: ``tier-1`` critical, ``tier-2`` dependent,
@@ -95,6 +170,13 @@ class CellCoverage:
     stratum: str
     outcome: str
     category: str | None = None
+    group: str | None = None
+    """Shared upstream dependency the view belongs to, if one is bound.
+
+    A label only: unlike ``category`` it carries no weight and gates nothing.
+    It travels with the cell so callers can recognise the views that fail
+    together as one incident.
+    """
     paired: int = 0
     pending: int = 0
     errored: int = 0
@@ -188,6 +270,51 @@ class CategorySummary(BaseModel):
     """Weighted ``P(delta > 0)`` for this tier, from the hierarchical draws."""
 
 
+class GroupSummary(BaseModel):
+    """One shared-dependency group, read as **one** test rather than N cells.
+
+    A group is the upstream thing several views depend on (a source table, a
+    domain). Its cells are not independent, so the regression gate fits them as
+    a single unit and this object carries the result: ``p_incident`` is the
+    posterior that the group is one incident, and ``flagged`` says whether it
+    is in the FDR-controlled incident set. ``weight`` is the pair-mass weighted
+    mean of the members' effective weights — the evidence already scales with
+    the group's size, so the importance multiplier must not. The per-cell flags
+    still exist beside this; a flagged group implicates its cells, and a cell's
+    own flag survives whether or not its group is flagged.
+    """
+
+    group: str
+    views: int = 0
+    cells: int = 0
+    pairs: int = 0
+    improved: int = 0
+    regressed: int = 0
+    discordant: int = 0
+    pass_rate: float | None = None
+    baseline_pass_rate: float | None = None
+    score: float | None = None
+    """Candidate-epoch pass rate of the group's cells, 0-100."""
+    baseline_score: float | None = None
+    """Baseline-epoch pass rate of the group's cells, 0-100."""
+    delta_pp: float | None = None
+    """Observed pass-rate change of the group, in percentage points."""
+    delta_pp_contribution: float = 0.0
+    """This group's additive share of the layer ``delta_pp``.
+
+    The sum of the members' :attr:`CellContribution.delta_pp_contribution`, so
+    the layer's movement decomposes exactly into group rows plus the ungrouped
+    cells — the attribution a downstream fluctuation is investigated with. The
+    members themselves stay in :attr:`HealthReport.contributions` (each tagged
+    with ``group``), so a contributing group expands to its cells.
+    """
+    weight: float = 1.0
+    p_incident: float = 0.0
+    """``P(this group is one incident | data)`` from the group-as-unit fit."""
+    flagged: bool = False
+    """Whether the group is in the FDR-controlled incident set."""
+
+
 class Coverage(BaseModel):
     """How much of the comparison actually resolved, and whether that is enough."""
 
@@ -218,6 +345,13 @@ class CellContribution(BaseModel):
     outcome: str
     category: str | None = None
     """Effective tier used for the weight (may be the default, not a tag)."""
+    group: str | None = None
+    """Shared upstream dependency the view belongs to, if one is bound.
+
+    A label only — it never changes ``weight``, the score or the gate. It is
+    here so a report can group the views that share a dependency and read a
+    joint failure as one incident (see the roadmap's Direction E).
+    """
     defaulted: bool = False
     """True when the view carried no tier tag and fell back to the default."""
     weight: float = 1.0
@@ -243,6 +377,159 @@ class CellContribution(BaseModel):
     """This cell's additive share of ``delta_pp``: ``100 * w * (n01 - n10) /
     sum(w * pairs)``. Summing this field over every contribution reproduces
     ``delta_pp`` exactly, even when cells offset."""
+    equated_pass_rate: float | None = None
+    """Candidate pass rate this cell would score on the common reference bank.
+
+    Present only when ``build_report(adjust_difficulty=True, responses=...)``
+    was used. In 0-1, the same scale as ``pass_rate``; on its own bank the
+    cell's raw rate is ``pass_rate``, and the gap between the two is the bank
+    difficulty the equating removed.
+    """
+    difficulty_shift_pp: float | None = None
+    """``100 * (equated_pass_rate - pass_rate)`` — how far equating moved this
+    cell, in percentage points. The layer ``difficulty_adjustment_pp`` is the
+    pair-mass-weighted mean of this field (weights ``w_c * pairs_c``), so the
+    adjustment is auditable back to the cells."""
+
+
+@dataclass(frozen=True)
+class Calibration:
+    """The decision thresholds the report used, and where each came from.
+
+    Every threshold has a hand-set default. When the metric's own history is
+    supplied (``history=`` with ``calibrate=True``), the report may size some
+    of them from the measured series instead — the ROPE from the band's
+    genuine epoch-to-epoch movement, the regression prior from the previous
+    epoch's base rate, the coverage gate from the observed pending share — so
+    a volatile metric is not judged against a fixed dead zone. This object is
+    the *resolved* set: the numbers actually used, plus the provenance needed
+    to read them.
+
+    ``enabled`` is whether calibration was requested, ``history_points`` how
+    many scored points were consulted, and the ``observed_*`` fields the
+    measurements each derivation was based on (``between_sd`` for the ROPE,
+    ``observed_pi_mean`` for the regression prior, ``observed_unresolved_share``
+    for the coverage gate); each is ``None`` when not measured. ``derived``
+    names the thresholds taken from history rather than the caller's default.
+    ``derived`` is empty until enough history exists, so ``calibrated`` is
+    False exactly when the defaults are in force.
+    """
+
+    rope_pp: float = 1.0
+    pi_prior: tuple[float, float] = (1.0, 1.0)
+    max_unresolved_share: float = 0.25
+    enabled: bool = False
+    history_points: int = 0
+    between_sd: float | None = None
+    observed_pi_mean: float | None = None
+    observed_unresolved_share: float | None = None
+    derived: tuple[str, ...] = ()
+
+    @property
+    def calibrated(self) -> bool:
+        """True when at least one threshold came from the metric's history."""
+        return bool(self.derived)
+
+
+class ReferenceBankSummary(BaseModel):
+    """Which reference bank defined the adjusted score, and how complete it was.
+
+    ``name``/``version`` are set when a versioned
+    :class:`~betapair.irt.ReferenceBank` was pinned and ``None`` for an
+    unversioned pin or the observed-union default. ``digest`` is a content
+    hash of the items *actually used* (:func:`betapair.irt.bank_digest`), so
+    two epochs can be compared even when they were pinned under different
+    labels. ``items`` is how many bank items the fitted outcomes declared and
+    ``available`` how many of them were observed in this epoch and therefore
+    equated on; a shortfall means the adjusted score rests on fewer anchors
+    than the bank names.
+    """
+
+    name: str | None = None
+    version: str | None = None
+    digest: str
+    items: int
+    available: int
+
+
+class IrTSummary(BaseModel):
+    """How the difficulty fit linked the views, without the item table.
+
+    Carried on :attr:`HealthReport.irt` only when ``adjust_difficulty`` was on.
+    ``score_adjusted`` is the level the views would score on a common
+    reference bank; this object is what makes that number readable — whether
+    the banks are actually linked (``connected``, ``weakest_link``) or the
+    comparison rests on the prior, how many pairs the fit used, and how many
+    views/items were perfectly separated (so their estimates are the prior's
+    rather than the data's).
+
+    The model is fitted **one outcome at a time**; the summary is taken
+    conservatively across those fits, so ``connected`` requires *every*
+    outcome's bank graph to be connected and ``weakest_link`` is the global
+    minimum over view pairs and outcomes. ``prior_dominated`` and
+    ``separated_items`` count (outcome, view) and (outcome, item) entries.
+    """
+
+    outcomes: list[str] = Field(default_factory=list)
+    sigma_theta: float
+    sigma_d: float
+    connected: bool = True
+    components: int = 0
+    """Largest connected-component count over the per-outcome bank graphs."""
+    weakest_link: int = 0
+    """Fewest shared items over all view pairs and outcomes (0 = prior only)."""
+    prior_dominated: int = 0
+    """Views whose responses were perfectly separated, across all fits."""
+    separated_items: int = 0
+    """Items in a perfectly separated all-pass/all-fail set, across all fits."""
+    observed_pairs: int = 0
+    """Responses the fit consumed — one per paired (view, outcome, item) row."""
+    items: int = 0
+    """Distinct global items over all fitted outcomes."""
+    reference: ReferenceBankSummary | None = None
+    """The bank the adjusted score was equated on, and its completeness.
+
+    Always present when ``irt`` is, because ``score_adjusted`` is only
+    meaningful relative to a bank; ``name``/``version`` are ``None`` for the
+    observed-union default or an unversioned pin, and the ``digest`` still
+    identifies the exact item set used.
+    """
+
+
+@dataclass(frozen=True)
+class UnpairedCell:
+    """One cell's candidate-epoch results that have no baseline to pair with.
+
+    A cold start — the first run, or a view introduced mid-stream — produces
+    candidate results before the matching baseline exists. Those rows cannot
+    enter the paired ``score`` (there is nothing to compare against), but they
+    do carry the candidate epoch's absolute pass rate, which is the initial
+    level a dashboard needs. This object is that evidence per cell: how many
+    rows resolved and how many of them passed.
+
+    ``resolved`` is the number of rows whose **candidate** side is a real
+    result (a :data:`betapair.tracker.FAILED` counts as a failure) while the
+    baseline side is still absent. ``passed`` is the subset that passed.
+    """
+
+    stratum: str
+    outcome: str
+    resolved: int = 0
+    passed: int = 0
+    category: str | None = None
+    group: str | None = None
+
+    def __post_init__(self) -> None:
+        if not self.stratum or not self.outcome:
+            raise ValueError("stratum and outcome must be non-empty")
+        if self.group is not None and not self.group:
+            raise ValueError("group must be non-empty when set")
+        if self.resolved < 0 or self.passed < 0 or self.passed > self.resolved:
+            raise ValueError(f"resolved={self.resolved}, passed={self.passed} out of range")
+
+    @property
+    def key(self) -> tuple[str, str]:
+        return (self.stratum, self.outcome)
 
 
 class HealthReport(BaseModel):
@@ -252,6 +539,62 @@ class HealthReport(BaseModel):
     status: Status
     score: float | None = None
     """Paired candidate-epoch pass rate, 0-100."""
+    score_low: float | None = None
+    """Lower credible bound on ``score``, 0-100.
+
+    The equal-tail bound of the one-parameter ``Beta(1 + k, 1 + n - k)``
+    posterior over the **weighted effective** pairs, whose mode is exactly
+    ``score`` — so the interval never moves the point estimate and describes
+    the same micro-average, aggregation weights included. ``None`` when the
+    report has no paired items at all.
+    """
+    score_high: float | None = None
+    """Upper credible bound on ``score``, 0-100 (see ``score_low``)."""
+    score_unpaired: float | None = None
+    """Cold-start level, 0-100: candidate-epoch pass rate with no baseline.
+
+    Computed over every row whose candidate side resolved but whose baseline
+    side has not run yet — the first run, or a view introduced mid-stream.
+    It is **not** the paired ``score`` and never enters ``delta_pp``, the
+    verdict, the guardrail or the regression gate; it exists so a brand-new
+    view has a number to show while the comparison is still incomplete.
+    ``None`` when no such row exists.
+    """
+    score_unpaired_low: float | None = None
+    """Lower credible bound on ``score_unpaired``, 0-100 (see ``score_low``)."""
+    score_unpaired_high: float | None = None
+    """Upper credible bound on ``score_unpaired``, 0-100."""
+    unpaired: int = 0
+    """Rows behind ``score_unpaired``: candidate resolved, baseline absent."""
+    score_adjusted: float | None = None
+    """Difficulty-adjusted level, 0-100: the pass rate the views would score
+    on a common reference bank, aggregated with the same weights as ``score``.
+
+    Opt-in: ``None`` unless ``build_report(adjust_difficulty=True,
+    responses=...)`` was used. The raw ``score`` is never overwritten — the two
+    differ only through the per-cell rates, and ``difficulty_adjustment_pp``
+    is the difference, so a bank-difficulty effect is separable from a change.
+    """
+    score_adjusted_low: float | None = None
+    """Lower credible bound on ``score_adjusted``, 0-100.
+
+    The equal-tail bounds of the seeded posterior draws of ``theta`` propagated
+    through the equated rates (``RaschFit.sample_abilities``), so the ability
+    uncertainty is what sizes the interval. ``None`` alongside
+    ``score_adjusted``.
+    """
+    score_adjusted_high: float | None = None
+    """Upper credible bound on ``score_adjusted``, 0-100 (see
+    ``score_adjusted_low``)."""
+    difficulty_adjustment_pp: float | None = None
+    """``score_adjusted - score`` in percentage points.
+
+    Positive means the view was measured on a bank harder than the reference,
+    so equating raises its level; negative means the opposite. It is always
+    reported beside the raw score, never instead of it.
+    """
+    irt: IrTSummary | None = None
+    """The difficulty fit behind ``score_adjusted``, and its linking caveats."""
     baseline_score: float | None = None
     delta_pp: float | None = None
     delta_pp_low: float | None = None
@@ -308,10 +651,28 @@ class HealthReport(BaseModel):
     coverage: Coverage = Field(default_factory=Coverage)
     """Resolved/pending/errored accounting and whether the status was gated."""
     categories: list[CategorySummary] = Field(default_factory=list)
+    groups: list[GroupSummary] = Field(default_factory=list)
+    """One row per declared shared-dependency group (empty when none).
+
+    Read as **incidents**, not cells: ``p_incident``/``flagged`` come from the
+    group-as-unit regression gate, so a dependency that breaks is one row and
+    one flag however many views it takes down. A group's cells still carry
+    their own per-cell flags in ``contributions``.
+    """
     guardrail: Guardrail = Field(
         default_factory=lambda: Guardrail(status="insufficient", reason="not computed")
     )
     contributions: list[CellContribution] = Field(default_factory=list)
+    calibration: Calibration = Field(default_factory=Calibration)
+    """The decision thresholds used, and which the metric's history set."""
+    unresolved_share: float | None = None
+    """Share of tracked rows still unresolved when this report was built.
+
+    ``(pending + errored) / all tracked rows``, over every state — the
+    current epoch's coverage pressure, and the evidence the next epoch's
+    coverage threshold is calibrated from. ``None`` when no per-cell coverage
+    was supplied and the row count is unknown.
+    """
 
 
 @dataclass(frozen=True)
@@ -324,6 +685,15 @@ class RegressionModel:
     needed. ``flagged`` is the largest set whose posterior expected false
     discovery rate is within the target, which is the Bayesian counterpart of
     a multiplicity correction.
+
+    When cells declare a ``group``, the same model is *also* fitted on the
+    **groups** as units — a group is one test, its members' evidence pooled —
+    and that fit supplies ``group_incident``/``flagged_groups``. Counting a
+    group of twenty views as one test is the dependence correction: the FDR
+    target is computed against the number of independent things that can break,
+    so a shared incident cannot become a flag storm. The per-cell fit is kept
+    and its flags are unioned with the flagged groups, so a group can never
+    hide an individual regression.
     """
 
     p_regressed: dict[tuple[str, str], float]
@@ -335,6 +705,27 @@ class RegressionModel:
     """``P(no cell in the layer truly regressed | data)``."""
     pi_mean: float
     """Posterior mean of the mixture weight (share of true regressions)."""
+    group_incident: dict[str, float] = field(default_factory=dict)
+    """``P(the declared group is one incident | data)`` per group.
+
+    Empty when no cell declares a ``group``. The probability comes from the
+    **group-as-unit** fit: the group's members are pooled into a single test, so
+    twenty views on one source table count as one hypothesis. That is what
+    keeps a shared break from being read as twenty independent regressions.
+    """
+    flagged_groups: frozenset[str] = frozenset()
+    """Groups in the FDR-controlled incident set (empty when none declare one)."""
+    bfdr_groups: float = 0.0
+    """Posterior expected FDR of ``flagged_groups`` (0 with no groups)."""
+    muted: frozenset[tuple[str, str]] = frozenset()
+    """Cells whose effective weight is 0 — excluded from every flag.
+
+    Muting is a statement that the cell does not matter to the layer, so it is
+    muted *everywhere*: it is left out of the score, it cannot be flagged on
+    its own evidence, and its group's incident cannot implicate it or be
+    created from its evidence. Empty when no weight is 0, so an unweighted
+    report is unchanged.
+    """
 
 
 @dataclass(frozen=True)
@@ -364,6 +755,203 @@ def _sigmoid(value: float) -> float:
     return exponential / (1.0 + exponential)
 
 
+@dataclass(frozen=True)
+class _Unit:
+    """One gate unit: a cell, or a group of cells pooled into one test."""
+
+    keys: tuple[tuple[str, str], ...]
+    improved: int
+    regressed: int
+    weight: float
+
+
+@dataclass(frozen=True)
+class _UnitFit:
+    """The spike-and-slab posterior over a list of units (see :func:`_fit_units`)."""
+
+    p_regressed: tuple[float, ...]
+    flagged: tuple[int, ...]
+    """Indices into the unit list, the FDR-controlled flag set."""
+    bfdr: float
+    p_no_regression: float
+    pi_mean: float
+
+
+def _fit_units(
+    units: list[_Unit],
+    *,
+    a0: float,
+    b0: float,
+    fdr: float,
+    pi_prior: tuple[float, float],
+    pi_points: int,
+) -> _UnitFit:
+    """Spike-and-slab fit over arbitrary evidence units (cells or groups).
+
+    One arithmetic core for both flags: the per-cell gate passes one unit per
+    cell, the group gate passes one unit per group (its members' discordant
+    counts summed and its weight their pair-mass-weighted mean). Unit order is
+    the caller's and is preserved, so the result maps straight back.
+    """
+    count = len(units)
+    z1 = beta_cdf(0.5, a0, b0)
+    if z1 <= 0.0:
+        z1 = 1e-300
+    log_ratio: list[float] = []
+    for unit in units:
+        test = switch_evidence(unit.improved, unit.regressed, a0=a0, b0=b0)
+        discordant = test.discordant
+        if discordant <= 0:
+            log_ratio.append(0.0)
+            continue
+        p_low = 1.0 - test.p_improved
+        if p_low <= 0.0:
+            log_ratio.append(-math.inf)
+            continue
+        log_ratio.append(
+            log_beta(a0 + unit.improved, b0 + unit.regressed)
+            - log_beta(a0, b0)
+            + math.log(p_low)
+            - math.log(z1)
+            - discordant * math.log(0.5)
+        )
+
+    raw = [max(0.0, unit.weight) for unit in units]
+    mean_weight = sum(raw) / count if count else 1.0
+    log_multiplier = [
+        math.log(value / mean_weight) if value > 0.0 and mean_weight > 0.0 else -math.inf
+        for value in raw
+    ]
+
+    grid = [(index + 0.5) / pi_points for index in range(pi_points)]
+    log_prior = [
+        (pi_prior[0] - 1.0) * math.log(pi)
+        + (pi_prior[1] - 1.0) * math.log1p(-pi)
+        - log_beta(pi_prior[0], pi_prior[1])
+        for pi in grid
+    ]
+    log_posterior: list[float] = []
+    for pi, prior in zip(grid, log_prior, strict=True):
+        base = math.log(pi / (1.0 - pi))
+        value = prior
+        for index in range(count):
+            value += _log1p_exp(base + log_multiplier[index] + log_ratio[index])
+            value -= _log1p_exp(base + log_multiplier[index])
+        log_posterior.append(value)
+    peak = max(log_posterior)
+    mass = [math.exp(value - peak) for value in log_posterior]
+    total = sum(mass)
+    posterior = [value / total for value in mass]
+
+    p_regressed: list[float] = []
+    for index in range(count):
+        accumulator = 0.0
+        for weight, pi in zip(posterior, grid, strict=True):
+            log_odds = math.log(pi / (1.0 - pi)) + log_multiplier[index] + log_ratio[index]
+            accumulator += weight * _sigmoid(log_odds)
+        p_regressed.append(accumulator)
+
+    p_no_regression = 0.0
+    for weight, pi in zip(posterior, grid, strict=True):
+        base = math.log(pi / (1.0 - pi))
+        product = 1.0
+        for index in range(count):
+            product *= math.exp(-_log1p_exp(base + log_multiplier[index] + log_ratio[index]))
+        p_no_regression += weight * product
+
+    ordered = sorted(range(count), key=lambda index: -p_regressed[index])
+    cumulative = 0.0
+    best = 0
+    for position, index in enumerate(ordered, start=1):
+        cumulative += 1.0 - p_regressed[index]
+        if cumulative / position <= fdr:
+            best = position
+    flagged = tuple(sorted(ordered[:best]))
+    bfdr = sum(1.0 - p_regressed[index] for index in flagged) / len(flagged) if flagged else 0.0
+    return _UnitFit(
+        p_regressed=tuple(p_regressed),
+        flagged=flagged,
+        bfdr=bfdr,
+        p_no_regression=p_no_regression,
+        pi_mean=sum(weight * pi for weight, pi in zip(posterior, grid, strict=True)),
+    )
+
+
+def _admitted(members: list[Cell], raw_weight: dict[tuple[str, str], float]) -> list[Cell]:
+    """The members whose evidence a group incident may read.
+
+    A cell muted by its weight is excluded from the score and from every flag,
+    so its discordance must not be able to manufacture a group incident and a
+    group incident must not be able to implicate it. A group whose members are
+    all muted has no admissible evidence and is not tested.
+    """
+    return [cell for cell in members if raw_weight[cell.key] > 0.0]
+
+
+def _group_weight(members: list[Cell], raw_weight: dict[tuple[str, str], float]) -> float:
+    """Pair-mass weighted mean of the admitted members' effective weights.
+
+    The evidence already scales with the group's size, so the importance
+    multiplier must not (`\u03a3 w_c\u00b7pairs_c / \u03a3 pairs_c`); members with no
+    pairs fall back to a plain mean of their weights.
+    """
+    observed = [cell for cell in members if cell.pairs > 0]
+    if observed:
+        mass = sum(cell.pairs for cell in observed)
+        return sum(raw_weight[cell.key] * cell.pairs for cell in observed) / mass
+    if not members:
+        return 0.0
+    return sum(raw_weight[cell.key] for cell in members) / len(members)
+
+
+def _group_units(
+    cells: list[Cell], raw_weight: dict[tuple[str, str], float]
+) -> tuple[list[_Unit], dict[str, int]]:
+    """Pool each declared group's cells into one unit; keep the rest as cells.
+
+    A group unit carries the summed discordant counts and the **pair-mass
+    weighted mean** of its members' effective weights — the evidence scales
+    with the group's size, so the importance multiplier must not scale with it
+    too (`\u03a3 w_c\u00b7pairs_c / \u03a3 pairs_c`). Muted members contribute no
+    evidence and no mass, so muting a view cannot create or shrink an incident
+    through a group. Group order is sorted, ungrouped cells keep their input
+    order, so a report is deterministic.
+    """
+    grouped: dict[str, list[Cell]] = {}
+    ungrouped: list[Cell] = []
+    for cell in cells:
+        if cell.group is None:
+            ungrouped.append(cell)
+        else:
+            grouped.setdefault(cell.group, []).append(cell)
+    units: list[_Unit] = []
+    index: dict[str, int] = {}
+    for name in sorted(grouped):
+        members = grouped[name]
+        admitted = _admitted(members, raw_weight)
+        if not admitted:
+            continue
+        index[name] = len(units)
+        units.append(
+            _Unit(
+                keys=tuple(cell.key for cell in members),
+                improved=sum(cell.improved for cell in admitted),
+                regressed=sum(cell.regressed for cell in admitted),
+                weight=_group_weight(admitted, raw_weight),
+            )
+        )
+    for cell in ungrouped:
+        units.append(
+            _Unit(
+                keys=(cell.key,),
+                improved=cell.improved,
+                regressed=cell.regressed,
+                weight=raw_weight[cell.key],
+            )
+        )
+    return units, index
+
+
 def regression_model(
     cells: list[Cell],
     *,
@@ -390,6 +978,14 @@ def regression_model(
     whose posterior expected FDR stays within ``fdr``. A cell with weight 0 is
     muted and can never be flagged.
 
+    When cells declare a ``group``, the model is fitted a second time with the
+    **group as the unit** (its members' evidence pooled, one test per group),
+    and that fit's flag set is published as ``flagged_groups`` — the groups
+    that are one incident. The per-cell fit is untouched, so an individual
+    regression is never hidden by its group; the two flag sets are unioned by
+    :func:`verdicts_from_model`. Grouping changes only *which units the FDR is
+    computed over*, never the score or the delta.
+
     @note: The decision is Bayesian end to end: ``fdr`` is a posterior expected
         FDR, not a frequentist family-wise error rate, and no p-value enters.
     @return: The fitted :class:`RegressionModel`.
@@ -403,90 +999,51 @@ def regression_model(
     if pi_points < 2:
         raise ValueError(f"pi_points must be at least 2, got {pi_points}")
 
-    keys = [cell.key for cell in cells]
-    z1 = beta_cdf(0.5, a0, b0)
-    if z1 <= 0.0:
-        z1 = 1e-300
-    log_ratio: dict[tuple[str, str], float] = {}
-    for cell in cells:
-        test = switch_evidence(cell.improved, cell.regressed, a0=a0, b0=b0)
-        discordant = test.discordant
-        if discordant <= 0:
-            log_ratio[cell.key] = 0.0
-            continue
-        p_low = 1.0 - test.p_improved
-        if p_low <= 0.0:
-            log_ratio[cell.key] = -math.inf
-            continue
-        log_ratio[cell.key] = (
-            log_beta(a0 + cell.improved, b0 + cell.regressed)
-            - log_beta(a0, b0)
-            + math.log(p_low)
-            - math.log(z1)
-            - discordant * math.log(0.5)
+    raw_weight = {
+        cell.key: (max(0.0, float(weights.get(cell.key, 1.0))) if weights is not None else 1.0)
+        for cell in cells
+    }
+    units = [
+        _Unit(
+            keys=(cell.key,),
+            improved=cell.improved,
+            regressed=cell.regressed,
+            weight=raw_weight[cell.key],
         )
-
-    raw = {
-        key: (max(0.0, float(weights.get(key, 1.0))) if weights is not None else 1.0)
-        for key in keys
-    }
-    mean_weight = sum(raw.values()) / len(raw) if raw else 1.0
-    log_multiplier = {
-        key: (math.log(value / mean_weight) if value > 0.0 and mean_weight > 0.0 else -math.inf)
-        for key, value in raw.items()
-    }
-
-    grid = [(index + 0.5) / pi_points for index in range(pi_points)]
-    log_prior = [
-        (pi_prior[0] - 1.0) * math.log(pi)
-        + (pi_prior[1] - 1.0) * math.log1p(-pi)
-        - log_beta(pi_prior[0], pi_prior[1])
-        for pi in grid
+        for cell in cells
     ]
-    log_posterior: list[float] = []
-    for pi, prior in zip(grid, log_prior, strict=True):
-        base = math.log(pi / (1.0 - pi))
-        value = prior
-        for key in keys:
-            value += _log1p_exp(base + log_multiplier[key] + log_ratio[key])
-            value -= _log1p_exp(base + log_multiplier[key])
-        log_posterior.append(value)
-    peak = max(log_posterior)
-    mass = [math.exp(value - peak) for value in log_posterior]
-    total = sum(mass)
-    posterior = [value / total for value in mass]
+    fit = _fit_units(units, a0=a0, b0=b0, fdr=fdr, pi_prior=pi_prior, pi_points=pi_points)
+    p_regressed = {units[index].keys[0]: fit.p_regressed[index] for index in range(len(units))}
+    flagged = frozenset(units[index].keys[0] for index in fit.flagged)
 
-    p_regressed: dict[tuple[str, str], float] = {}
-    for key in keys:
-        accumulator = 0.0
-        for weight, pi in zip(posterior, grid, strict=True):
-            log_odds = math.log(pi / (1.0 - pi)) + log_multiplier[key] + log_ratio[key]
-            accumulator += weight * _sigmoid(log_odds)
-        p_regressed[key] = accumulator
+    group_incident: dict[str, float] = {}
+    flagged_groups: frozenset[str] = frozenset()
+    bfdr_groups = 0.0
+    if any(cell.group is not None for cell in cells):
+        group_units, group_index = _group_units(cells, raw_weight)
+        if group_index:  # a group whose members are all muted is not a test
+            group_fit = _fit_units(
+                group_units, a0=a0, b0=b0, fdr=fdr, pi_prior=pi_prior, pi_points=pi_points
+            )
+            group_incident = {
+                name: group_fit.p_regressed[position] for name, position in group_index.items()
+            }
+            flagged_set = set(group_fit.flagged)
+            flagged_groups = frozenset(
+                name for name, position in group_index.items() if position in flagged_set
+            )
+            bfdr_groups = group_fit.bfdr
 
-    p_no_regression = 0.0
-    for weight, pi in zip(posterior, grid, strict=True):
-        base = math.log(pi / (1.0 - pi))
-        product = 1.0
-        for key in keys:
-            product *= math.exp(-_log1p_exp(base + log_multiplier[key] + log_ratio[key]))
-        p_no_regression += weight * product
-
-    ordered = sorted(keys, key=lambda key: -p_regressed[key])
-    cumulative = 0.0
-    best = 0
-    for index, key in enumerate(ordered, start=1):
-        cumulative += 1.0 - p_regressed[key]
-        if cumulative / index <= fdr:
-            best = index
-    flagged = frozenset(ordered[:best])
-    bfdr = sum(1.0 - p_regressed[key] for key in flagged) / len(flagged) if flagged else 0.0
     return RegressionModel(
         p_regressed=p_regressed,
         flagged=flagged,
-        bfdr=bfdr,
-        p_no_regression=p_no_regression,
-        pi_mean=sum(weight * pi for weight, pi in zip(posterior, grid, strict=True)),
+        bfdr=fit.bfdr,
+        p_no_regression=fit.p_no_regression,
+        pi_mean=fit.pi_mean,
+        group_incident=group_incident,
+        flagged_groups=flagged_groups,
+        bfdr_groups=bfdr_groups,
+        muted=frozenset(key for key, weight in raw_weight.items() if weight <= 0.0),
     )
 
 
@@ -502,15 +1059,23 @@ def verdicts_from_model(
 
     ``improving`` and ``stable`` come from the cell's own McNemar posterior at
     ``improving_prob``; ``regressing`` is membership of the model's FDR-
-    controlled flag set. Separated from :func:`regression_model` so the report
-    fits the model once and still has the global quantities to hand.
+    controlled flag set, **or** membership of a group in
+    ``model.flagged_groups`` — a group incident implicates its cells, and a
+    group can never hide an individual cell's own flag. Separated from
+    :func:`regression_model` so the report fits the model once and still has the
+    global quantities to hand.
     """
     verdicts: dict[tuple[str, str], CellVerdict] = {}
     for cell in cells:
         test = switch_evidence(cell.improved, cell.regressed, a0=a0, b0=b0)
+        in_incident = (
+            cell.group is not None
+            and cell.group in model.flagged_groups
+            and cell.key not in model.muted
+        )
         if test.discordant and test.p_improved >= improving_prob:
             verdict: Literal["improving", "stable", "regressing"] = "improving"
-        elif cell.key in model.flagged:
+        elif cell.key in model.flagged or in_incident:
             verdict = "regressing"
         else:
             verdict = "stable"
@@ -641,20 +1206,30 @@ class Weighting:
     the score and unable to be flagged.
     """
     categories: dict[tuple[str, str], str | None]
+    groups: dict[tuple[str, str], str | None] = field(default_factory=dict)
+    """The shared-dependency label of every cell, resolved by the same policy.
 
-    def weight(self, cell: Cell) -> float:
+    A label only: it does not enter ``weights``. Owning it here keeps the
+    report, the tracker and the timeline reading one cell's group from the
+    same place, and gives the dependence-aware gate a single source for it.
+    """
+
+    def weight(self, cell: Cell | UnpairedCell) -> float:
         return self.weights[cell.key]
 
-    def category(self, cell: Cell) -> str | None:
+    def category(self, cell: Cell | UnpairedCell) -> str | None:
         return self.categories[cell.key]
 
-    def defaulted(self, cell: Cell) -> bool:
+    def group(self, cell: Cell | UnpairedCell) -> str | None:
+        return self.groups[cell.key]
+
+    def defaulted(self, cell: Cell | UnpairedCell) -> bool:
         """True when the cell carried no tier tag and took the fallback tier."""
         return self.tiered and cell.category is None
 
 
 def weighting(
-    cells: list[Cell],
+    cells: Sequence[Cell | UnpairedCell],
     *,
     weights: dict[str, float] | None = None,
     category_weights: dict[str, float] | None = None,
@@ -680,6 +1255,7 @@ def weighting(
         tiered = any(cell.category is not None for cell in cells)
     cell_weights: dict[tuple[str, str], float] = {}
     cell_categories: dict[tuple[str, str], str | None] = {}
+    cell_groups: dict[tuple[str, str], str | None] = {}
     for cell in cells:
         category = cell.category
         if category is None and tiered:
@@ -687,11 +1263,270 @@ def weighting(
         tier = tier_of.get(category, 1.0) if category is not None else 1.0
         cell_weights[cell.key] = weight_of.get(cell.outcome, 1.0) * tier
         cell_categories[cell.key] = category
+        cell_groups[cell.key] = cell.group
     return Weighting(
         tiered=tiered,
         default_category=default_category,
         weights=cell_weights,
         categories=cell_categories,
+        groups=cell_groups,
+    )
+
+
+def _score_interval(
+    successes: float, pairs: float, level: float, prob_interval: float
+) -> tuple[float, float]:
+    """Equal-tail credible bounds on a weighted pass rate, 0-100.
+
+    The posterior is ``Beta(1 + k, 1 + n - k)`` over the weighted effective
+    pairs ``n`` and successes ``k``, whose mode is ``level`` — the headline
+    micro-average. A rate with no effective pairs has no width and collapses
+    onto ``level``, mirroring ``series.ScorePoint.interval``.
+    """
+    if pairs <= 0.0:
+        return 100.0 * level, 100.0 * level
+    tail = 0.5 * (1.0 - prob_interval)
+    return (
+        100.0 * beta_ppf(tail, 1.0 + successes, 1.0 + pairs - successes),
+        100.0 * beta_ppf(1.0 - tail, 1.0 + successes, 1.0 + pairs - successes),
+    )
+
+
+def resolve_calibration(
+    history: Sequence[ScorePoint] | None,
+    *,
+    calibrate: bool,
+    rope_pp: float | None,
+    pi_prior: tuple[float, float],
+    max_unresolved_share: float,
+) -> Calibration:
+    """Resolve the report's thresholds, deriving any the history supports.
+
+    The thresholds are the caller's defaults until there is enough history to
+    measure them from, so passing no history — or leaving ``calibrate``
+    False — leaves every number exactly as it was. Each derivation lands
+    behind this one function: the ROPE from the score band's between-epoch
+    dispersion, the regression prior from the previous epoch's base rate, and
+    the coverage gate from the observed pending share. Resolving in one place
+    is what lets the report publish exactly which value it used.
+
+    @note: The ROPE derivation (B2) needs :data:`ROPE_MIN_POINTS` scored points
+        before the band is trusted, and keeps ``rope_pp`` when the band
+        measures no between-epoch movement at all — a series whose spread is
+        pure sampling noise has no dead zone to size, so the hand-set value
+        still stands. ``rope_pp`` is the fallback whenever calibration cannot
+        size it. The import is local because :mod:`betapair.series` imports
+        this module.
+    @note: The prior derivation (B3) averages the ``pi_mean`` of the history
+        points that carry one — the previous epochs' measured base rate of
+        true regressions — and keeps the default ``pi_prior`` strength while
+        moving its mean. The mean is clipped to
+        :data:`PI_PRIOR_MIN` and :data:`PI_PRIOR_MAX` so the prior cannot
+        collapse onto 0 or 1.
+    @note: The coverage derivation (B4) averages the epochs' unresolved shares
+        and adds :data:`COVERAGE_MARGIN`, clamped to
+        :data:`COVERAGE_MIN`/:data:`COVERAGE_MAX`. It waits for
+        :data:`COVERAGE_MIN_POINTS` epochs on purpose: the first runs are
+        mostly unresolved, and sizing the gate from them would gate every
+        early report (the cold-start guard).
+    @return: The resolved :class:`Calibration`.
+    """
+    points = 0 if history is None else len(history)
+    derived: list[str] = []
+    between_sd: float | None = None
+    resolved_rope = 1.0 if rope_pp is None else rope_pp
+    if calibrate and history is not None and points >= ROPE_MIN_POINTS:
+        from betapair.series import score_band
+
+        band = score_band(history)
+        between_sd = band.between_sd
+        if between_sd > 0.0:
+            resolved_rope = ROPE_BAND_FACTOR * between_sd
+            derived.append("rope_pp")
+    observed_pi_mean: float | None = None
+    observed = [point.pi_mean for point in history or [] if point.pi_mean is not None]
+    if calibrate and len(observed) >= PI_MIN_POINTS:
+        observed_pi_mean = sum(observed) / len(observed)
+        clipped = min(PI_PRIOR_MAX, max(PI_PRIOR_MIN, observed_pi_mean))
+        pi_prior = (clipped * PI_PRIOR_STRENGTH, (1.0 - clipped) * PI_PRIOR_STRENGTH)
+        derived.append("pi_prior")
+    observed_unresolved_share: float | None = None
+    shares = [
+        point.unresolved_share for point in history or [] if point.unresolved_share is not None
+    ]
+    if calibrate and len(shares) >= COVERAGE_MIN_POINTS:
+        observed_unresolved_share = sum(shares) / len(shares)
+        max_unresolved_share = min(
+            COVERAGE_MAX, max(COVERAGE_MIN, observed_unresolved_share + COVERAGE_MARGIN)
+        )
+        derived.append("max_unresolved_share")
+    return Calibration(
+        rope_pp=resolved_rope,
+        pi_prior=pi_prior,
+        max_unresolved_share=max_unresolved_share,
+        enabled=calibrate,
+        history_points=points,
+        between_sd=between_sd,
+        observed_pi_mean=observed_pi_mean,
+        observed_unresolved_share=observed_unresolved_share,
+        derived=tuple(derived),
+    )
+
+
+@dataclass(frozen=True)
+class _Difficulty:
+    """The resolved difficulty adjustment: equated rates plus the level."""
+
+    summary: IrTSummary
+    rates: dict[tuple[str, str], float]
+    score: float
+    low: float
+    high: float
+
+
+def _difficulty_adjustment(
+    cells: list[Cell],
+    responses: Sequence[ItemResponse],
+    policy: Weighting,
+    weighted_pairs: float,
+    *,
+    reference_items: Sequence[ItemKey] | None,
+    reference_bank: ReferenceBank | None,
+    sigma_theta: float,
+    sigma_d: float,
+    draws: int,
+    seed: int,
+    prob_interval: float,
+) -> _Difficulty:
+    """Fit one Rasch model per outcome, equate every active cell, aggregate.
+
+    Equating replaces a cell's own-bank pass rate with the rate it would score
+    on a common reference bank, ``mean_i sigmoid(theta_v + d_i)``, and the
+    adjusted level is the **same** weighted micro-average as ``score`` — so the
+    two differ only through the rates. The reference bank defaults to each
+    outcome's observed union; it can be pinned with raw ``reference_items``
+    (exact: a missing item is an error) or with a versioned
+    :class:`~betapair.irt.ReferenceBank`, whose items are intersected with the
+    fitted ones so a temporarily absent anchor degrades the width of the
+    reference set rather than the whole report. The declared and used sizes are
+    published on ``IrTSummary.reference`` either way.
+
+    The interval comes from seeded posterior draws of ``theta``
+    (:meth:`RaschFit.sample_abilities`), each mapped to an equated rate and
+    aggregated with the same weights, so ability uncertainty sizes the level.
+    Each outcome's draws use ``seed + outcome index`` so one report is
+    reproducible.
+
+    @raise ValueError: If ``draws`` is not positive, no responses were given,
+        a pinned bank names no item for a fitted outcome (or none of its items
+        was observed), or a weighted cell has no response behind it (the
+        adjusted average would then be undefined).
+    """
+    if draws < 1:
+        raise ValueError(f"draws must be at least 1, got {draws}")
+    if not responses:
+        raise ValueError("adjust_difficulty requires responses")
+    pinned: dict[str, list[ItemKey]] = {}
+    if reference_items is not None:
+        seen: set[ItemKey] = set()
+        for key in reference_items:
+            if key in seen:
+                raise ValueError(f"reference_items repeats item {key!r}")
+            seen.add(key)
+            pinned.setdefault(key[0], []).append(key)
+    by_outcome: dict[str, list[ItemResponse]] = {}
+    for response in responses:
+        by_outcome.setdefault(response.outcome, []).append(response)
+
+    rates: dict[tuple[str, str], float] = {}
+    fitted: list[RaschFit] = []
+    draw_totals = [0.0] * draws
+    observed_pairs = 0
+    declared_items = 0
+    resolved_keys: list[ItemKey] = []
+    for index, outcome in enumerate(sorted(by_outcome)):
+        outcome_responses = by_outcome[outcome]
+        fit = fit_rasch(outcome_responses, sigma_theta=sigma_theta, sigma_d=sigma_d)
+        fitted.append(fit)
+        observed_pairs += len(outcome_responses)
+        if reference_bank is not None:
+            declared = [key for key in reference_bank.items if key[0] == outcome]
+            if not declared:
+                raise ValueError(
+                    f"reference bank {reference_bank.label} has no items for outcome {outcome!r}"
+                )
+            keys = [key for key in declared if key in fit.difficulties]
+            if not keys:
+                raise ValueError(
+                    f"no item of reference bank {reference_bank.label} was observed for "
+                    f"outcome {outcome!r}"
+                )
+        elif reference_items is not None:
+            declared = list(pinned.get(outcome, ()))
+            if not declared:
+                raise ValueError(f"reference_items pins no items for outcome {outcome!r}")
+            keys = declared
+        else:
+            declared = list(fit.difficulties)
+            keys = declared
+        outcome_rates = equated_rates(fit, reference_items=keys)
+        rates.update(outcome_rates)
+        declared_items += len(declared)
+        resolved_keys.extend(keys)
+        reference_difficulties = [fit.difficulties[key] for key in keys]
+        sampled = fit.sample_abilities(draws=draws, seed=seed + index)
+        for cell in cells:
+            if cell.outcome != outcome or cell.key not in outcome_rates:
+                continue
+            mass = policy.weight(cell) * cell.pairs
+            if mass == 0.0:
+                continue
+            for position, ability in enumerate(sampled[cell.stratum]):
+                equated = sum(sigmoid(ability + value) for value in reference_difficulties) / len(
+                    reference_difficulties
+                )
+                draw_totals[position] += mass * equated
+
+    missing = [cell.key for cell in cells if policy.weight(cell) > 0.0 and cell.key not in rates]
+    if missing:
+        raise ValueError(f"responses do not cover cell {missing[0]!r}")
+
+    score = (
+        100.0
+        * sum(
+            policy.weight(cell) * cell.pairs * rates[cell.key]
+            for cell in cells
+            if policy.weight(cell) > 0.0
+        )
+        / weighted_pairs
+    )
+    tail = 0.5 * (1.0 - prob_interval)
+    levels = sorted(100.0 * total / weighted_pairs for total in draw_totals)
+    summary = IrTSummary(
+        outcomes=sorted(by_outcome),
+        sigma_theta=sigma_theta,
+        sigma_d=sigma_d,
+        connected=all(fit.diagnostics.connected for fit in fitted),
+        components=max((fit.diagnostics.components for fit in fitted), default=0),
+        weakest_link=min((fit.diagnostics.weakest_link for fit in fitted), default=0),
+        prior_dominated=sum(len(fit.diagnostics.prior_dominated) for fit in fitted),
+        separated_items=sum(fit.diagnostics.separated_items for fit in fitted),
+        observed_pairs=observed_pairs,
+        items=sum(len(fit.difficulties) for fit in fitted),
+        reference=ReferenceBankSummary(
+            name=None if reference_bank is None else reference_bank.name,
+            version=None if reference_bank is None else reference_bank.version,
+            digest=bank_digest(resolved_keys),
+            items=declared_items,
+            available=len(resolved_keys),
+        ),
+    )
+    return _Difficulty(
+        summary=summary,
+        rates=rates,
+        score=score,
+        low=_quantile(levels, tail),
+        high=_quantile(levels, 1.0 - tail),
     )
 
 
@@ -710,7 +1545,7 @@ def build_report(
     ppc_draws: int = PPC_DRAWS,
     seed: int = 0,
     alpha: float = 0.05,
-    rope_pp: float = 1.0,
+    rope_pp: float | None = None,
     pi_prior: tuple[float, float] = (1.0, 1.0),
     pi_points: int = 199,
     pending: int = 0,
@@ -721,6 +1556,16 @@ def build_report(
     max_unresolved_share: float = 0.25,
     baseline_epoch: str | None = None,
     candidate_epoch: str | None = None,
+    history: Sequence[ScorePoint] | None = None,
+    calibrate: bool = False,
+    unpaired_cells: Sequence[UnpairedCell] | None = None,
+    unresolved_share: float | None = None,
+    responses: Sequence[ItemResponse] | None = None,
+    adjust_difficulty: bool = False,
+    reference_items: Sequence[ItemKey] | None = None,
+    reference_bank: ReferenceBank | None = None,
+    sigma_theta: float = DEFAULT_SIGMA,
+    sigma_d: float = DEFAULT_SIGMA,
 ) -> HealthReport:
     """Assemble the health report from per-cell discordant counts.
 
@@ -733,16 +1578,38 @@ def build_report(
     :func:`regression_model`), so a critical view is not drowned by a wide
     field of auxiliary cells.
 
+    ``group`` is the other label a cell may carry: the shared upstream
+    dependency its stratum belongs to. It is passed straight through to
+    ``CellContribution.group`` and enters no number — no weight, no gate, no
+    interval. It exists so a caller can gather the views that fail together
+    into one incident; making the *gate* dependence-aware is a separate step.
+
     ``alpha`` is the single posterior threshold behind every decision: the
     homogeneity check, the per-cell improving threshold (``>= 1 - alpha``),
     the weighted delta ROPE, and the posterior FDR target for the regression
     gate. ``pi_prior`` is the Beta hyperprior on the share of cells that truly
-    regressed, gridded at ``pi_points``.
+    regressed, gridded at ``pi_points``; with ``calibrate=True`` it is
+    re-centred on the history's measured base rate when the history carries
+    one (see :class:`Calibration`).
 
     ``rope_pp`` is the region of practical equivalence for the layer verdict,
     in percentage points: a net movement under this size counts as ``stable``
     rather than improving/regressing. The per-cell regression flag is
     unaffected — a credible regression in any view still forces ``regressing``.
+    ``None`` (the default) means the hand-set ``1.0``. With ``calibrate=True``
+    and enough history, the measured band sizes it instead; ``rope_pp`` is the
+    fallback whenever history cannot.
+
+    ``prob_interval`` is the coverage of every credible interval the report
+    carries, including the headline ``score_low``/``score_high``.
+
+    ``history`` is the metric's own scored series (e.g. a tracker's
+    ``timeline``). With ``calibrate=True`` the report may size its decision
+    thresholds from that history instead of the hand-set defaults — see
+    :class:`Calibration` — and publishes the resolved values on
+    ``HealthReport.calibration``. Calibration is opt-in and additive: with no
+    history, or with ``calibrate`` left False, every number is bit-identical
+    to a report built without the argument.
 
     ``coverage`` carries per-cell pending/errored/retired/failed counts from the
     tracker; when the unresolved share exceeds ``max_unresolved_share``, or any
@@ -759,6 +1626,33 @@ def build_report(
     known outcome. They are folded back into ``score_held`` only, so a level
     that rose because hard questions were deleted is separable from one that
     rose because the views changed.
+
+    ``unpaired_cells`` carries candidate-epoch results whose baseline has not
+    run yet (a cold start, or a view introduced mid-stream). They are summed
+    into ``score_unpaired`` — an absolute level only, with the same weighting
+    policy — and never enter the paired score, the delta, the verdict or the
+    gate. ``unresolved_share`` is the share of tracked rows still unresolved;
+    when omitted it is derived from ``coverage``. It is what the next epoch
+    calibrates its coverage threshold from.
+
+    ``adjust_difficulty`` opts into the latent-difficulty adjustment of the
+    *level*: ``responses`` (from ``HealthTracker.item_responses()``) are fitted
+    one outcome at a time with :func:`betapair.irt.fit_rasch`, each view is
+    equated onto a common reference bank, and ``score_adjusted`` is the same
+    weighted micro-average as ``score`` over the equated rates. The raw score
+    and the shift are always both present, and ``irt`` carries the fit's
+    linking diagnostics and the resolved reference bank
+    (``irt.reference``). The bank defaults to each outcome's observed union;
+    pin it with a versioned :class:`betapair.irt.ReferenceBank` (whose items are
+    intersected with the fitted ones, so a temporarily absent anchor narrows the
+    reference set and is reported) or with raw ``reference_items`` (exact: a
+    missing item is an error). ``reference_bank`` and ``reference_items`` are
+    mutually exclusive — one object should own the scale. ``sigma_theta``
+    and ``sigma_d`` are the fit's prior scales. Off by default: with it off —
+    or with the equivalent tracker config unset — every number is bit-identical
+    to a report built without the argument. The paired delta is unaffected;
+    difficulty already cancels in McNemar's discordant pairs, so only the
+    headline level is adjusted.
 
     @note: The layer verdict is derived from the *weighted* hierarchical delta
         draws — the same quantity as the headline ``delta_pp`` — not from the
@@ -783,14 +1677,29 @@ def build_report(
     """
     if not 0.0 < alpha < 0.5:
         raise ValueError(f"alpha must be in (0, 0.5), got {alpha}")
-    if rope_pp < 0.0:
+    if rope_pp is not None and rope_pp < 0.0:
         raise ValueError(f"rope_pp must be >= 0, got {rope_pp}")
     if not 0.0 <= max_unresolved_share <= 1.0:
         raise ValueError(f"max_unresolved_share must be in [0, 1], got {max_unresolved_share}")
+    if unresolved_share is not None and not 0.0 <= unresolved_share <= 1.0:
+        raise ValueError(f"unresolved_share must be in [0, 1], got {unresolved_share}")
+    if reference_bank is not None and reference_items is not None:
+        raise ValueError("pass reference_bank or reference_items, not both")
+    calibration = resolve_calibration(
+        history,
+        calibrate=calibrate,
+        rope_pp=rope_pp,
+        pi_prior=pi_prior,
+        max_unresolved_share=max_unresolved_share,
+    )
     tier_of = dict(category_weights or {})
     active = [cell for cell in cells if cell.pairs > 0]
+    unpaired_active = [cell for cell in (unpaired_cells or []) if cell.resolved > 0]
+    # One policy covers the paired cells and the cold-start ones, so a new
+    # view's tier and outcome importance are resolved the same way as the
+    # established ones and the unpaired level is a true micro-average.
     policy = weighting(
-        active,
+        [*active, *unpaired_active],
         weights=weights,
         category_weights=category_weights,
         default_category=default_category,
@@ -799,13 +1708,32 @@ def build_report(
     outcomes = sorted({cell.outcome for cell in active})
     strata = len({cell.stratum for cell in active})
     pairs = sum(cell.pairs for cell in active)
+    unpaired_total = sum(cell.resolved for cell in unpaired_active)
+    score_unpaired: float | None = None
+    score_unpaired_low: float | None = None
+    score_unpaired_high: float | None = None
+    unpaired_pairs = sum(policy.weight(cell) * cell.resolved for cell in unpaired_active)
+    if unpaired_active and unpaired_pairs > 0.0:
+        unpaired_successes = sum(policy.weight(cell) * cell.passed for cell in unpaired_active)
+        unpaired_level = unpaired_successes / unpaired_pairs
+        score_unpaired = 100.0 * unpaired_level
+        score_unpaired_low, score_unpaired_high = _score_interval(
+            unpaired_successes, unpaired_pairs, unpaired_level, prob_interval
+        )
+    if unresolved_share is None and coverage:
+        unresolved_rows = sum(cell.pending + cell.errored for cell in coverage)
+        total_rows = sum(
+            cell.paired + cell.pending + cell.errored + cell.retired for cell in coverage
+        )
+        if total_rows:
+            unresolved_share = unresolved_rows / total_rows
     cov = _coverage(
         coverage,
         tier_of,
         pending=pending,
         failed=failed,
         pairs=pairs,
-        max_unresolved_share=max_unresolved_share,
+        max_unresolved_share=calibration.max_unresolved_share,
     )
 
     if pairs == 0 or not active:
@@ -822,6 +1750,12 @@ def build_report(
             default_category=default_category,
             coverage=cov,
             guardrail=Guardrail(status="insufficient", reason="no paired items yet"),
+            calibration=calibration,
+            score_unpaired=score_unpaired,
+            score_unpaired_low=score_unpaired_low,
+            score_unpaired_high=score_unpaired_high,
+            unpaired=unpaired_total,
+            unresolved_share=unresolved_share,
         )
 
     weighted_pairs = sum(policy.weight(cell) * cell.pairs for cell in active)
@@ -840,14 +1774,39 @@ def build_report(
             retired=retired,
             coverage=cov,
             guardrail=Guardrail(status="insufficient", reason="all outcome weights are zero"),
+            calibration=calibration,
+            score_unpaired=score_unpaired,
+            score_unpaired_low=score_unpaired_low,
+            score_unpaired_high=score_unpaired_high,
+            unpaired=unpaired_total,
+            unresolved_share=unresolved_share,
         )
 
-    level = sum(policy.weight(cell) * cell.passed for cell in active) / weighted_pairs
+    weighted_successes = sum(policy.weight(cell) * cell.passed for cell in active)
+    level = weighted_successes / weighted_pairs
+    difficulty: _Difficulty | None = None
+    if adjust_difficulty:
+        difficulty = _difficulty_adjustment(
+            active,
+            responses or (),
+            policy,
+            weighted_pairs,
+            reference_items=reference_items,
+            reference_bank=reference_bank,
+            sigma_theta=sigma_theta,
+            sigma_d=sigma_d,
+            draws=draws,
+            seed=seed,
+            prob_interval=prob_interval,
+        )
     baseline_level = (
         sum(policy.weight(cell) * cell.baseline_passed for cell in active) / weighted_pairs
     )
+    score_low, score_high = _score_interval(
+        weighted_successes, weighted_pairs, level, prob_interval
+    )
     observed_delta = level - baseline_level
-    epsilon = rope_pp / 100.0
+    epsilon = calibration.rope_pp / 100.0
     held = _held_overlay(
         active,
         held_counts,
@@ -886,7 +1845,7 @@ def build_report(
         b0=b0,
         fdr=alpha,
         weights=policy.weights,
-        pi_prior=pi_prior,
+        pi_prior=calibration.pi_prior,
         pi_points=pi_points,
     )
     verdicts = verdicts_from_model(
@@ -909,11 +1868,13 @@ def build_report(
         if verdict == "regressing":
             flagged.append(f"{cell.stratum}/{cell.outcome}")
         contribution = 100.0 * weight * (cell.improved - cell.regressed) / weighted_pairs
+        equated = None if difficulty is None else difficulty.rates.get(cell.key)
         contributions.append(
             CellContribution(
                 stratum=cell.stratum,
                 outcome=cell.outcome,
                 category=policy.category(cell),
+                group=policy.group(cell),
                 defaulted=policy.defaulted(cell),
                 weight=weight,
                 pairs=cell.pairs,
@@ -930,6 +1891,10 @@ def build_report(
                 logit_shift=summary.logit_shift,
                 verdict=verdict,
                 delta_pp_contribution=contribution,
+                equated_pass_rate=equated,
+                difficulty_shift_pp=(
+                    None if equated is None else 100.0 * (equated - cell.pass_rate)
+                ),
             )
         )
     contributions.sort(
@@ -953,6 +1918,7 @@ def build_report(
         category_delta_draws=category_delta_draws,
         verdicts=verdicts,
     )
+    groups = _groups(active, policy, model, weighted_pairs)
 
     heterogeneity = homogeneity_ppc(stat_cells, a0=a0, b0=b0, draws=ppc_draws, seed=seed)
     guardrail = _guardrail(
@@ -978,6 +1944,8 @@ def build_report(
     return HealthReport(
         status=status,
         score=100.0 * level,
+        score_low=score_low,
+        score_high=score_high,
         baseline_score=100.0 * baseline_level,
         delta_pp=100.0 * observed_delta,
         delta_pp_low=100.0 * _quantile(delta_draws, 0.025),
@@ -986,7 +1954,7 @@ def build_report(
         p_no_regression=model.p_no_regression,
         bfdr=model.bfdr,
         pi_mean=model.pi_mean,
-        rope_pp=rope_pp,
+        rope_pp=calibration.rope_pp,
         p_improved=pooled_p,
         pairs=pairs,
         pending=pending,
@@ -1026,8 +1994,20 @@ def build_report(
         default_category=default_category,
         tiered=tiered,
         categories=categories,
+        groups=groups,
         guardrail=guardrail,
         contributions=contributions,
+        calibration=calibration,
+        score_unpaired=score_unpaired,
+        score_unpaired_low=score_unpaired_low,
+        score_unpaired_high=score_unpaired_high,
+        unpaired=unpaired_total,
+        unresolved_share=unresolved_share,
+        score_adjusted=None if difficulty is None else difficulty.score,
+        score_adjusted_low=None if difficulty is None else difficulty.low,
+        score_adjusted_high=None if difficulty is None else difficulty.high,
+        difficulty_adjustment_pp=(None if difficulty is None else difficulty.score - 100.0 * level),
+        irt=None if difficulty is None else difficulty.summary,
     )
 
 
@@ -1110,6 +2090,8 @@ def _held_overlay(
         row.stratum: row.category for row in (coverage or [])
     }
     stratum_category.update({cell.stratum: cell.category for cell in active})
+    stratum_group: dict[str, str | None] = {row.stratum: row.group for row in (coverage or [])}
+    stratum_group.update({cell.stratum: cell.group for cell in active})
     held_only = [
         Cell(
             stratum=stratum,
@@ -1117,6 +2099,7 @@ def _held_overlay(
             pairs=counts[0],
             passed=counts[1],
             category=stratum_category.get(stratum),
+            group=stratum_group.get(stratum),
         )
         for (stratum, outcome), counts in sorted(extra.items())
         if (stratum, outcome) not in by_key
@@ -1263,6 +2246,68 @@ def _category_delta_draws(
             for index in range(draws)
         ]
     return out
+
+
+def _groups(
+    cells: list[Cell],
+    policy: Weighting,
+    model: RegressionModel,
+    weighted_pairs: float,
+) -> list[GroupSummary]:
+    """Roll the grouped cells up into one row per shared dependency.
+
+    The row is the *incident* view of the layer: the pooled evidence of the
+    group and the group-as-unit gate's posterior. The members' per-cell flags
+    remain in ``contributions``; this is the second, coarser reading. The
+    weight is the pair-mass weighted mean of the admitted members' effective
+    weights, so a large group's evidence does not inflate its importance in the
+    same step. Muted members stay in the descriptive counts — they exist in the
+    layer — but contribute no evidence and no mass to the incident, which is
+    why their row can never be flagged.
+    """
+    grouped: dict[str, list[Cell]] = {}
+    for cell in cells:
+        if cell.group is not None:
+            grouped.setdefault(cell.group, []).append(cell)
+    weights = {cell.key: policy.weight(cell) for cell in cells}
+    summaries: list[GroupSummary] = []
+    for name, members in grouped.items():
+        admitted = _admitted(members, weights)
+        pairs = sum(cell.pairs for cell in members)
+        passed = sum(cell.passed for cell in members)
+        baseline = sum(cell.baseline_passed for cell in members)
+        weight = _group_weight(admitted, weights)
+        improved = sum(cell.improved for cell in members)
+        regressed = sum(cell.regressed for cell in members)
+        contribution = (
+            100.0
+            * sum(policy.weight(cell) * (cell.improved - cell.regressed) for cell in members)
+            / weighted_pairs
+            if weighted_pairs > 0.0
+            else 0.0
+        )
+        summaries.append(
+            GroupSummary(
+                group=name,
+                views=len({cell.stratum for cell in members}),
+                cells=len(members),
+                pairs=pairs,
+                improved=improved,
+                regressed=regressed,
+                discordant=improved + regressed,
+                pass_rate=None if pairs <= 0 else passed / pairs,
+                baseline_pass_rate=None if pairs <= 0 else baseline / pairs,
+                score=None if pairs <= 0 else 100.0 * passed / pairs,
+                baseline_score=None if pairs <= 0 else 100.0 * baseline / pairs,
+                delta_pp=None if pairs <= 0 else 100.0 * (improved - regressed) / pairs,
+                delta_pp_contribution=contribution,
+                weight=weight,
+                p_incident=model.group_incident.get(name, 0.0),
+                flagged=name in model.flagged_groups,
+            )
+        )
+    summaries.sort(key=lambda summary: (-summary.p_incident, summary.group))
+    return summaries
 
 
 def _categories(

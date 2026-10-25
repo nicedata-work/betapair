@@ -45,6 +45,16 @@ class ScorePoint:
     weights included). When ``low``/``high`` are absent, the sampling interval
     is derived from ``score`` and ``pairs``. ``epoch`` is an optional label for
     the series (a date, a round number, …).
+
+    ``pi_mean`` is the epoch's estimated share of cells that truly regressed
+    (``HealthReport.pi_mean`` when the point came from a report). It is
+    ``None`` for a bare score and is the empirical-Bayes evidence the next
+    epoch's calibration uses to set its regression prior.
+
+    ``unresolved_share`` is the fraction of tracked rows still unresolved
+    (pending or harness-errored) when the point was recorded. It is ``None``
+    for a bare score and is the observed distribution the next epoch's
+    coverage threshold is calibrated from.
     """
 
     score: float
@@ -52,6 +62,8 @@ class ScorePoint:
     pairs: float = 0.0
     low: float | None = None
     high: float | None = None
+    pi_mean: float | None = None
+    unresolved_share: float | None = None
 
     @classmethod
     def from_report(cls, report: HealthReport) -> ScorePoint | None:
@@ -67,6 +79,10 @@ class ScorePoint:
             score=float(report.score),
             epoch=report.candidate_epoch,
             pairs=float(report.pairs),
+            low=report.score_low,
+            high=report.score_high,
+            pi_mean=report.pi_mean,
+            unresolved_share=report.unresolved_share,
         )
 
     def interval(self, level: float = 0.95) -> tuple[float, float]:
@@ -101,6 +117,8 @@ class ScorePoint:
             "pairs": self.pairs,
             "low": self.low,
             "high": self.high,
+            "pi_mean": self.pi_mean,
+            "unresolved_share": self.unresolved_share,
         }
 
     @classmethod
@@ -124,6 +142,8 @@ class ScorePoint:
             pairs=_number(payload.get("pairs", 0.0), "pairs"),
             low=low,
             high=high,
+            pi_mean=_optional_number(payload.get("pi_mean"), "pi_mean"),
+            unresolved_share=_optional_number(payload.get("unresolved_share"), "unresolved_share"),
         )
 
 

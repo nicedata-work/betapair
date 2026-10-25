@@ -77,6 +77,7 @@ for q in range(10):
 report = tracker.report()
 
 print("score      :", round(report.score, 1))
+print("range      :", round(report.score_low, 1), "to", round(report.score_high, 1))
 print("baseline   :", round(report.baseline_score, 1))
 print("delta (pp) :", round(report.delta_pp, 2))
 print("status     :", report.status)
@@ -88,6 +89,7 @@ for c in report.contributions:
 
 ```
 score      : 70.0
+range      : 47.8 to 85.4
 baseline   : 40.0
 delta (pp) : 30.0
 status     : improving
@@ -98,12 +100,41 @@ guardrail  : ok
 
 * `score` is the pass rate **after** the change, `baseline` the pass rate
   **before**, and `delta_pp` the change in percentage points.
+* `score_low`/`score_high` are the credible bounds on `score`: the same
+  `Beta(1 + k, 1 + n - k)` posterior whose mode is the headline number, over
+  the **weighted effective** pairs, so the range shrinks as more items run and
+  describes exactly the micro-average it belongs to.
 * `status` is the overall verdict: `improving`, `stable`, `regressing`,
   `mixed`, or `insufficient` (not enough data yet).
 * Each contribution is one group. The `change` values add up to `delta_pp`, so
   you can see exactly who moved the number.
 * `group_b` is `stable` even though it improved: the improvement is real but
   not yet strong enough on its own to call.
+
+## The first run, and new views
+
+A paired score needs a before **and** an after. On the very first run there is
+no before, so `score` is `None` and the status is `insufficient` — but the
+candidate results already measured are not thrown away. `score_unpaired`
+reports them as an absolute level, so a dashboard has something to show while
+the baseline is still missing:
+
+```python
+for q in range(10):
+    tracker.observe("group_a", "quiz", f"q{q}", baseline=None, candidate=q < 7)
+
+report = tracker.report()
+print(report.status)  # insufficient - no comparison yet
+print(report.score)  # None - the paired score needs a baseline
+print(report.score_unpaired)  # 70.0 - the candidate epoch's own level
+print(report.unpaired)  # 10 rows behind it
+```
+
+The same applies to a view introduced mid-stream: it contributes
+`score_unpaired` until its first baseline exists, and then joins the paired
+score. `score_unpaired` is an absolute level only — it never enters
+`delta_pp`, the verdict or the `regression gate`, so it can never be mistaken
+for a comparison.
 
 ## Catching a group that got worse
 
@@ -183,6 +214,37 @@ print(round(band.low, 1), "to", round(band.high, 1))  # 59.8 to 88.5
 You can record a point without rolling the epoch with `tracker.record_score()`,
 and the timeline survives `to_json()`/`from_json()`.
 
+**See which thresholds the report used.** Every decision threshold has a
+hand-set default, and the report publishes the resolved set. Passing the
+tracker's own `timeline` as calibration history lets the report size those
+thresholds from the measured series rather than a fixed constant:
+
+```python
+report = tracker.report(calibrate=True)
+print(report.calibration.rope_pp)  # the resolved ROPE, in pp
+print(report.calibration.derived)  # thresholds taken from the series
+```
+
+Three thresholds are sized this way. The **ROPE** becomes the metric's own
+`between_sd` once three epochs are on record (a move smaller than the metric's
+normal epoch-to-epoch movement is not a change), so volatile views stop reading
+as `improving` on ordinary noise. The **regression prior** is re-centred on the
+base rate of true regressions the previous epoch measured — recorded on each
+timeline point as `pi_mean` — and clipped away from 0 and 1 so it cannot
+collapse. The **coverage gate** becomes the epochs' observed unresolved share
+plus a margin (recorded as `unresolved_share`), so a pipeline that normally
+resolves almost everything is not waved through at 25% pending — and a cold
+start, where nearly everything is unresolved, keeps the default until enough
+epochs exist to size it. Calibration is opt-in and additive: with no history —
+or with `calibrate` left off — every number is unchanged, and a threshold is
+only taken from the series when there is enough history to measure it.
+
+The seeded operating characteristics behind those three thresholds — verdict
+stability as volatility changes, the prior's power against the measured base
+rate, and the gate's behaviour on a healthy vs stalled pipeline — are
+generated into [`docs/validation.md`](docs/validation.md) by
+`uv run python tools/calibration.py --write`.
+
 ## Everyday extras
 
 **Add many results at once** with `PairRecord`:
@@ -251,6 +313,91 @@ by the views changing, so deleting the questions you were failing shows up as a
 number instead of an improvement. (Erroring out of them with `FAILED` needs no
 such bookkeeping: the failure is already in the score.)
 
+**Name questions consistently.** A row is identified by
+`(group, outcome, item)`, but an *item* is identified globally by
+`(outcome, item)`. Two views that use the same `item` string are recorded as
+seeing the **same** question — that overlap is what lets a difficulty model
+compare their levels later — so use one stable name per question across views
+and epochs. A renamed question is a different item:
+
+```python
+from betapair import item_key
+
+item_key("quiz", "q5")  # ('quiz', 'q5')
+```
+
+The resolved rows are available under that key with `tracker.item_responses()`;
+pending, `ERROR` and retired rows are omitted.
+
+## Comparing views on different question banks
+
+`score` is a pass rate on whatever questions each view happened to run. If
+`group_b` ran an easier bank than `group_a`, it looks healthier even when the
+two views are equally good. `adjust_difficulty=True` fits a latent difficulty
+model (Rasch/IRT) to the candidate responses and reports the level each view
+would score on a common **reference bank**, so the two become comparable:
+
+```python
+from betapair import HealthTracker
+
+tracker = HealthTracker(adjust_difficulty=True)
+for q in range(4):  # shared anchors: both views pass
+    tracker.observe("group_a", "quiz", f"anchor{q}", baseline=False, candidate=True)
+    tracker.observe("group_b", "quiz", f"anchor{q}", baseline=False, candidate=True)
+for q in range(8):  # group_a ran a hard bank and is still failing it
+    tracker.observe("group_a", "quiz", f"hard{q}", baseline=False, candidate=False)
+for q in range(8):  # group_b ran an easy bank and passes all of it
+    tracker.observe("group_b", "quiz", f"easy{q}", baseline=False, candidate=True)
+
+report = tracker.report()
+print("raw       :", round(report.score, 1))
+print("adjusted  :", round(report.score_adjusted, 1))
+print("shift (pp):", round(report.difficulty_adjustment_pp, 1))
+```
+
+```
+raw       : 66.7
+adjusted  : 63.3
+shift (pp): -3.3
+```
+
+* `score_adjusted` is the same weighted micro-average as `score`, but over
+each view's equated rate, and `score_adjusted_low`/`score_adjusted_high` are
+its interval. The raw `score` is never replaced: both numbers are always
+present, and `difficulty_adjustment_pp` is the difference between them.
+* The paired `delta_pp` is **not** adjusted — both epochs run the same items,
+so difficulty already cancels in the discordant pairs. Only the level needs
+equating.
+* It is opt-in. With `adjust_difficulty` off (the default) every number is
+bit-identical to a report built without it.
+
+**Pin the reference bank.** By default the reference bank is every item
+observed, which shrinks as questions are retired and shifts what the adjusted
+score means. A named, versioned bank keeps the number comparable across epochs:
+
+```python
+from betapair import HealthTracker, ReferenceBank
+
+bank = ReferenceBank.from_responses(tracker.item_responses(), name="standard", version="2026-07")
+tracker = HealthTracker(adjust_difficulty=True, reference_bank=bank)
+```
+
+`report.irt.reference` publishes which bank was used — the declared `name` and
+`version`, a content `digest` of the items actually used, and the declared vs
+`available` counts — so two epochs are only comparable when their digests
+match. The bank is saved with the tracker's snapshot, so a resumed tracker
+scores the same way.
+
+**Read the linking caveat.** Views are connected only through items they both
+ran. `report.irt` reports `connected` and `weakest_link` (the fewest shared
+items over any view pair), plus `prior_dominated` for views whose responses
+were perfectly separated. With no shared items the fit still runs — the priors
+bridge the banks — but that is an assumption, not a measurement.
+
+The seeded evidence behind the adjusted interval's coverage, the cost of weak
+linking, and how much bank bias equating removes is generated into
+[`docs/validation.md`](docs/validation.md) by `tools/calibration.py`.
+
 **Some groups matter more.** Tag them and weight the tags:
 
 ```python
@@ -259,6 +406,30 @@ tracker = HealthTracker(
     category_weights={"tier-1": 3.0, "tier-2": 1.0},
 )
 ```
+
+**Which groups share a dependency.** A *group* here is the second label a view
+can carry: the upstream thing it depends on — a source table, a domain, a
+metric family. Twenty views on one table are not twenty independent tests, so
+the regression gate reads the whole group as **one** test and reports an
+incident instead of a flag storm:
+
+```python
+tracker = HealthTracker(groups={"sv_orders": "orders_table", "sv_lines": "orders_table"})
+tracker.set_group("sv_lines", "orders_table")  # or bind it later
+tracker.group_of("sv_orders")  # "orders_table"
+
+report.groups
+# [GroupSummary(group='orders_table', views=2, cells=8, p_incident=0.98, flagged=True, ...)]
+```
+
+The group changes nothing about the score or the delta, and no individual view
+is hidden: the per-cell gate still runs, so a single regressing view is flagged
+whether or not its group is. Each `GroupSummary` carries its additive share of
+the layer's movement (`delta_pp_contribution`), and the per-cell
+`contributions` (each tagged with `group`) expand an incident into the views
+responsible — the same contribution decomposition used to investigate a
+downstream metric. Groups are persisted in the snapshot exactly like
+categories.
 
 **Start a new round.** `advance()` moves the "after" results into "before" and
 clears the slate:
@@ -289,13 +460,21 @@ tracker = HealthTracker.from_json(text)
 | **`kappa`** | How much the groups move together; big means they agree. |
 | **Guardrail** | A check that stops a good average from hiding a bad group. |
 | **Tier / weight** | A label saying a group matters more, so it counts more in the score and the verdict. |
+| **Group** | A label naming the upstream dependency a view shares with others. The regression gate reads the group as one test, so a shared break is one incident, not a flag storm; it never changes the score. |
+| **Incident** | One flagged group: the shared dependency broke and its views regressed together. Reported in `report.groups`, with each view's own contribution still in `report.contributions`. |
+| **Equated score** | The level a view would score on a common reference bank, so views that ran different questions can be compared. |
+| **Reference bank** | The set of questions an adjusted score is measured on; pin it (named and versioned) so the number keeps its meaning. |
 
 ## What it cannot do
 
 * It only understands pass/fail, not "how wrong" an answer was.
 * Small samples can only catch big changes.
-* Groups are treated as independent; two outcomes that are really the same
-  thing will look slightly more certain than they are.
+* Cells in the same group are pooled into one test only if you say so; two
+  views on the same table that you leave ungrouped are still treated as
+  independent and will look slightly more certain than they are.
+* The difficulty-adjusted score compares views only through questions they both
+  ran; banks with no overlap are bridged by an assumption (the priors), which
+  `report.irt` flags as `connected=False` rather than measuring.
 * If too much of the comparison has no result yet, the status is
   `insufficient` rather than a guess.
 
@@ -308,6 +487,11 @@ uv run ruff check .     # lint
 uv run ruff format .    # format
 uv run mypy             # type-check
 ```
+
+The seeded operating characteristics in [`docs/validation.md`](docs/validation.md)
+are regenerated with `uv run python tools/calibration.py --write`. CI runs
+`uv run python tools/calibration.py --check`, which fails with a diff if that
+document is stale, so a statistical change and its evidence land together.
 
 ## License
 

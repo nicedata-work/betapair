@@ -3,7 +3,9 @@
 The full sweep lives in ``tools/calibration.py``. These are bounded versions
 that run in CI and fail if the Bayesian regression gate drifts: under a
 realistic global null it must stay quiet, criticality must raise power, and a
-heterogeneous layer must never read as a clean improvement.
+heterogeneous layer must never read as a clean improvement. The last class
+pins the B5 evidence: re-centring the prior on a measured base rate raises the
+power to flag a real regression.
 """
 
 from __future__ import annotations
@@ -11,7 +13,7 @@ from __future__ import annotations
 import random
 import unittest
 
-from betapair import Cell, build_report, cell_verdicts
+from betapair import Cell, ScorePoint, build_report, cell_verdicts, resolve_calibration
 
 
 def _draw(rng: random.Random, n: int, q: float) -> tuple[int, int]:
@@ -84,6 +86,41 @@ class PowerTest(unittest.TestCase):
 
     def test_criticality_weight_raises_power(self) -> None:
         self.assertGreater(self._power(True), self._power(False))
+
+
+class PriorCalibrationEvidenceTest(unittest.TestCase):
+    """B5: the prior table rests on a real power difference."""
+
+    @staticmethod
+    def _prior(rate: float) -> tuple[float, float]:
+        resolved = resolve_calibration(
+            [ScorePoint(score=60.0, pairs=50.0, pi_mean=rate)],
+            calibrate=True,
+            rope_pp=None,
+            pi_prior=(1.0, 1.0),
+            max_unresolved_share=0.25,
+        )
+        return resolved.pi_prior
+
+    def _power(self, prior: tuple[float, float], trials: int = 150) -> float:
+        """Flag rate for one true regressor among 40 null auxiliaries."""
+        rng = random.Random(0)
+        hits = 0
+        for _ in range(trials):
+            improved, regressed = _draw(rng, 20, 0.2)
+            cells = [_cell("critical", improved, regressed)]
+            for index in range(40):
+                aux_improved, aux_regressed = _draw(rng, 20, 0.5)
+                cells.append(_cell(f"aux{index}", aux_improved, aux_regressed))
+            verdicts = cell_verdicts(cells, pi_prior=prior)
+            hits += verdicts[("critical", "answer")].verdict == "regressing"
+        return hits / trials
+
+    def test_a_higher_measured_base_rate_raises_power(self) -> None:
+        strict = self._prior(0.02)
+        permissive = self._prior(0.8)
+        self.assertLess(strict[0], permissive[0])
+        self.assertGreater(self._power(permissive), self._power(strict))
 
 
 class HeterogeneityTest(unittest.TestCase):

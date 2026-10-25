@@ -26,6 +26,29 @@ jobs:
           uv run coverage run -m pytest
           uv run coverage report --fail-under=95
 
+  calibration:
+    name: calibration docs reproducible
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv sync
+      - name: Regenerate and compare docs/validation.md
+        run: uv run python tools/calibration.py --check
+
+  oracle:
+    name: IRT oracle (girth parity)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv sync --extra oracle
+      - run: uv run python tools/irt_oracle.py
+
   test:
     name: python ${{ matrix.python-version }}
     runs-on: ubuntu-latest

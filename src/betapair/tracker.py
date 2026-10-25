@@ -41,6 +41,13 @@ Batching is :meth:`observe_many` (many records at once) plus :meth:`merge`
 Persistence is :meth:`snapshot`/:meth:`from_snapshot` — plain JSON, no pickle,
 no database.
 
+Item identity is local to a cell for streaming — ``(stratum, outcome, item)``
+identifies a row, so a replayed item overwrites itself. The *global* identity a
+difficulty model needs is different: ``(outcome, item)``, so the same question
+observed under two views is **one** item. The caller owns that contract (the
+``item`` string must be stable and shared across views); :meth:`item_responses`
+exposes the resolved rows under it. See :mod:`betapair.irt`.
+
 Categories are per **stratum**, not per item: pass
 ``categories={"model_a": "tier-1"}`` once, or bind one later with
 :meth:`set_category`. ``category_weights`` then says how much each category
@@ -49,17 +56,35 @@ weighs 1.0. When some strata are categorised and others are not, the
 uncategorised ones take ``default_category`` — a comparison with no category at
 all stays uniform. Categories, weights and the default are persisted in the
 snapshot so a resumed tracker scores the same way it did before the restart.
+
+**Groups** are the second per-stratum label, beside the tier. Pass
+``groups={"model_a": "orders_table"}`` (or bind one later with
+:meth:`set_group`) to say which shared upstream dependency a view belongs to.
+Unlike a category, a group carries no weight: it changes no number on its own.
+It is carried onto every cell and report row so cells that fail *together* —
+twenty views on one source table — can be recognised as one incident rather
+than twenty independent regressions. Groups are persisted exactly like
+categories.
 """
 
 from __future__ import annotations
 
 import json
 import random
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Literal
 
 from betapair.hierarchy import DRAWS, PPC_DRAWS, Cell
-from betapair.report import DEFAULT_CATEGORY, CellCoverage, HealthReport, build_report, weighting
+from betapair.irt import DEFAULT_SIGMA, ItemKey, ItemResponse, ReferenceBank
+from betapair.report import (
+    DEFAULT_CATEGORY,
+    CellCoverage,
+    HealthReport,
+    UnpairedCell,
+    build_report,
+    weighting,
+)
 from betapair.series import ScoreBand, ScorePoint, score_band
 
 #: Snapshot *format* version — internal to the JSON payload and independent
@@ -67,7 +92,8 @@ from betapair.series import ScoreBand, ScorePoint, score_band
 #: shape changes (v3 added the score ``timeline``); :meth:`from_snapshot`
 #: rejects any other version. Within a version, additive keys are fine:
 #: a v3 payload with no ``timeline`` still loads, defaulted to empty, and one
-#: with no ``retired_ledger`` loads with an empty ledger.
+#: with no ``retired_ledger`` loads with an empty ledger. ``groups`` joined the
+#: same way: absent means no view has a shared-dependency label.
 SNAPSHOT_VERSION = 3
 
 
@@ -271,6 +297,72 @@ def _string_mapping(value: object, field: str) -> dict[str, str]:
     return out
 
 
+def _positive_number(value: object, field: str) -> float:
+    """Validate a positive numeric configuration value (rejects bools)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{field} must be a number, got {value!r}")
+    if value <= 0.0:
+        raise ValueError(f"{field} must be positive, got {value}")
+    return float(value)
+
+
+def _boolean(value: object, field: str) -> bool:
+    """Validate a boolean configuration value (rejects the usual truthy ints)."""
+    if not isinstance(value, bool):
+        raise ValueError(f"{field} must be a bool, got {value!r}")
+    return value
+
+
+def _parse_reference_items(value: object) -> tuple[ItemKey, ...] | None:
+    """Validate a pinned reference bank, or ``None`` for the observed union.
+
+    The bank is a sequence of global ``(outcome, item)`` keys. ``None`` means
+    each outcome's observed union; an explicitly empty bank is rejected,
+    because it would equate onto nothing rather than onto the union.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, (list, tuple)):
+        raise ValueError(f"reference_items must be a list or null, got {value!r}")
+    items: list[ItemKey] = []
+    for entry in value:
+        if not isinstance(entry, (list, tuple)) or len(entry) != 2:
+            raise ValueError(f"reference item must be [outcome, item], got {entry!r}")
+        outcome, item = entry
+        if not isinstance(outcome, str) or not isinstance(item, str):
+            raise ValueError(f"reference item must be [outcome, item] strings, got {entry!r}")
+        if not outcome or not item:
+            raise ValueError(f"reference item parts must be non-empty, got {entry!r}")
+        items.append((outcome, item))
+    if not items:
+        raise ValueError("reference_items must not be empty; use None for the observed union")
+    if len(set(items)) != len(items):
+        raise ValueError("reference_items must not repeat an item")
+    return tuple(sorted(items))
+
+
+def _parse_reference_bank(value: object) -> ReferenceBank | None:
+    """Validate a snapshot-encoded versioned reference bank.
+
+    A bank is ``{"name", "version", "items": [[outcome, item], ...]}``. The
+    item rows go through the same validation as ``reference_items`` (non-empty,
+    no repeats) and :class:`~betapair.irt.ReferenceBank` re-checks its own
+    invariants.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError(f"reference_bank must be an object or null, got {value!r}")
+    name = value.get("name")
+    version = value.get("version")
+    if not isinstance(name, str) or not isinstance(version, str):
+        raise ValueError("reference_bank name and version must be strings")
+    items = _parse_reference_items(value.get("items"))
+    if items is None:
+        raise ValueError("reference_bank items must be a non-empty list")
+    return ReferenceBank(name=name, version=version, items=items)
+
+
 def _record_rows(value: object) -> list[list[object]]:
     if value is None:
         return []
@@ -324,6 +416,10 @@ class PairRecord:
     ``True`` is PASS, ``False`` FAIL; the tracker never folds *harness* errors
     or retirement into a failure. A :data:`FAILED` side **is** scored as a
     failure, because a view that breaks on a question has answered it.
+
+    ``item`` is the caller's stable, cross-view-shared identifier of the
+    question, not of the row; see :mod:`betapair.irt` for the contract a
+    difficulty model depends on.
     """
 
     stratum: str
@@ -342,6 +438,7 @@ class HealthTracker:
         weights: dict[str, float] | None = None,
         category_weights: dict[str, float] | None = None,
         categories: dict[str, str] | None = None,
+        groups: dict[str, str] | None = None,
         default_category: str | None = DEFAULT_CATEGORY,
         a0: float = 1.0,
         b0: float = 1.0,
@@ -358,10 +455,25 @@ class HealthTracker:
         max_unresolved_share: float = 0.25,
         baseline_epoch: str | None = None,
         candidate_epoch: str | None = None,
+        adjust_difficulty: bool = False,
+        sigma_theta: float = DEFAULT_SIGMA,
+        sigma_d: float = DEFAULT_SIGMA,
+        reference_items: Sequence[ItemKey] | None = None,
+        reference_bank: ReferenceBank | None = None,
     ) -> None:
         self.weights = dict(weights or {})
         self.category_weights = dict(category_weights or {})
         self.categories = dict(categories or {})
+        self.groups = dict(groups or {})
+        """Shared upstream dependency per stratum, beside :attr:`categories`.
+
+        A label only: it is carried onto every cell and report row so cells
+        that fail together can be grouped into one incident. It never changes
+        the score, the weighting or the gate.
+        """
+        for stratum, group in self.groups.items():
+            if not group:
+                raise ValueError(f"group for {stratum!r} must be non-empty, got {group!r}")
         self.default_category = default_category
         for name, value in (*self.weights.items(), *self.category_weights.items()):
             if value < 0.0:
@@ -381,8 +493,42 @@ class HealthTracker:
         self.max_unresolved_share = max_unresolved_share
         self.baseline_epoch = baseline_epoch
         self.candidate_epoch = candidate_epoch
+        self.adjust_difficulty = _boolean(adjust_difficulty, "adjust_difficulty")
+        """Whether :meth:`report` fits the difficulty model by default.
+
+        Off by default: the adjustment changes what the headline level means,
+        so it is opted into. Persisted, so a resumed tracker scores the same
+        way it did before the restart.
+        """
+        self.sigma_theta = _positive_number(sigma_theta, "sigma_theta")
+        self.sigma_d = _positive_number(sigma_d, "sigma_d")
+        """Prior scales for the difficulty fit (see :func:`betapair.irt.fit_rasch`)."""
+        self.reference_items = _parse_reference_items(reference_items)
+        """Pinned reference bank, or ``None`` for each outcome's observed union."""
+        if reference_bank is not None and not isinstance(reference_bank, ReferenceBank):
+            raise ValueError(
+                f"reference_bank must be a ReferenceBank or None, got {reference_bank!r}"
+            )
+        if reference_bank is not None and self.reference_items is not None:
+            raise ValueError("pass reference_bank or reference_items, not both")
+        self.reference_bank = reference_bank
+        """Versioned pinned bank (``irt.ReferenceBank``), or ``None``.
+
+        Preferred over :attr:`reference_items` for a long-lived standard bank:
+        it carries a name, a version and a content digest, all published on the
+        report's ``irt.reference`` so the adjusted score's meaning is auditable
+        across epochs. Mutually exclusive with :attr:`reference_items`.
+        """
         self._records: dict[CellKey, dict[str, Pair]] = {}
         self.timeline: list[ScorePoint] = []
+        self._last_pi_mean: float | None = None
+        """The share of cells that truly regressed in the last report built.
+
+        Recorded onto the next :meth:`record_score` point so the following
+        epoch's calibration can set its regression prior from it. Kept in
+        memory only: a timeline point carries its own ``pi_mean``, and a fresh
+        :meth:`report` recomputes this.
+        """
         self.retired_ledger: dict[CellKey, dict[str, bool | None]] = {}
         """Last real outcome of every retired item, kept past :meth:`advance`.
 
@@ -406,6 +552,10 @@ class HealthTracker:
         @param stratum: View/stratum the item belongs to.
         @param outcome: Outcome name within the view.
         @param item: Stable item key; re-observing the same key overwrites.
+            Following the IRT contract, it must be identical for the same
+            underlying question across views and epochs, because
+            :meth:`item_responses` keys items globally by
+            ``(outcome, item)`` — see :mod:`betapair.irt`.
         @param baseline: PASS/FAIL in the baseline epoch, ``None`` if not run,
             :data:`ERROR` if the harness failed to evaluate it, or
             :data:`FAILED` if the view itself failed.
@@ -462,6 +612,28 @@ class HealthTracker:
     def category_of(self, stratum: str) -> str | None:
         """The tier a view belongs to, if one is bound."""
         return self.categories.get(stratum)
+
+    def set_group(self, stratum: str, group: str | None) -> None:
+        """Bind (or clear) the shared-dependency group of one stratum.
+
+        Mirrors :meth:`set_category`: the label may arrive from an external
+        catalogue after the first observations, so binding is separate from
+        observing. ``None`` clears it; the group changes no number by itself,
+        it only lets cells that fail together be reported as one incident.
+
+        @raise ValueError: If ``group`` is an empty string — ``None`` clears,
+            an empty string is never a label.
+        """
+        if group is not None and not group:
+            raise ValueError("group must be non-empty when set")
+        if group is None:
+            self.groups.pop(stratum, None)
+        else:
+            self.groups[stratum] = group
+
+    def group_of(self, stratum: str) -> str | None:
+        """The upstream dependency group a view belongs to, if one is bound."""
+        return self.groups.get(stratum)
 
     def observe_many(self, records: list[PairRecord] | tuple[PairRecord, ...]) -> int:
         """Batch ingest — the nightly-refresh path. Returns the record count."""
@@ -535,12 +707,15 @@ class HealthTracker:
         if prefer == "other":
             self.weights.update(other.weights)
             self.categories.update(other.categories)
+            self.groups.update(other.groups)
             self.category_weights.update(other.category_weights)
         else:
             for outcome, weight in other.weights.items():
                 self.weights.setdefault(outcome, weight)
             for stratum, category in other.categories.items():
                 self.categories.setdefault(stratum, category)
+            for stratum, group in other.groups.items():
+                self.groups.setdefault(stratum, group)
             for category, weight in other.category_weights.items():
                 self.category_weights.setdefault(category, weight)
 
@@ -587,6 +762,10 @@ class HealthTracker:
         self._records = rolled
         self.baseline_epoch = baseline_epoch or self.candidate_epoch
         self.candidate_epoch = candidate_epoch
+        # The last report described the epoch that just closed; a point
+        # recorded in the new epoch without a fresh report has no base rate
+        # yet, and must not inherit the finished epoch's.
+        self._last_pi_mean = None
 
     def _score_point(self, epoch: str | None = None) -> ScorePoint | None:
         """Current epoch's level with its effective pair count, or ``None``.
@@ -612,6 +791,8 @@ class HealthTracker:
             score=100.0 * passed / pairs,
             epoch=self.candidate_epoch if epoch is None else epoch,
             pairs=pairs,
+            pi_mean=self._last_pi_mean,
+            unresolved_share=self._unresolved_share(),
         )
 
     def record_score(self, *, epoch: str | None = None) -> ScorePoint | None:
@@ -697,6 +878,57 @@ class HealthTracker:
                 out[key] = (len(known), sum(known))
         return out
 
+    def unpaired_cells(self) -> list[UnpairedCell]:
+        """Candidate results with no baseline yet, one entry per cell.
+
+        These are the rows a cold start produces — the first run, or a view
+        introduced mid-stream — where the candidate side has a real result but
+        the baseline side has not run (``pending``, baseline ``None``). They
+        are the evidence for the report's absolute ``score_unpaired`` level,
+        which is *not* the paired score. A view-caused :data:`FAILED` candidate
+        is a resolved result and counts as a failure.
+
+        Rows that are paired, retired, or harness-errored are excluded: the
+        first has a baseline, and the others are not a clean candidate-only
+        reading. Sorted for determinism.
+        """
+        out: list[UnpairedCell] = []
+        for (stratum, outcome), items in sorted(self._records.items()):
+            resolved = passed = 0
+            for baseline, candidate in items.values():
+                if _state(baseline, candidate) != "pending":
+                    continue
+                result = _outcome(candidate)
+                if result is None:
+                    continue
+                resolved += 1
+                passed += int(result is True)
+            if resolved:
+                out.append(
+                    UnpairedCell(
+                        stratum=stratum,
+                        outcome=outcome,
+                        resolved=resolved,
+                        passed=passed,
+                        category=self.categories.get(stratum),
+                        group=self.groups.get(stratum),
+                    )
+                )
+        return out
+
+    def _unresolved_share(self) -> float | None:
+        """Share of tracked rows still unresolved, or ``None`` when empty.
+
+        ``(pending + errored) / all rows``. Retirement is a deliberate bank
+        change rather than missing data, so it is excluded on both sides, and
+        a view-caused failure is resolved. This is the value recorded on the
+        timeline for the coverage threshold to be calibrated from later.
+        """
+        total = len(self)
+        if total == 0:
+            return None
+        return (self.pending + self.errored) / total
+
     def coverage(self) -> list[CellCoverage]:
         """Per-cell resolved/pending/errored counts, sorted for determinism."""
         out: list[CellCoverage] = []
@@ -721,6 +953,7 @@ class HealthTracker:
                     stratum=stratum,
                     outcome=outcome,
                     category=self.categories.get(stratum),
+                    group=self.groups.get(stratum),
                     paired=counts["paired"],
                     pending=counts["pending"],
                     errored=counts["errored"],
@@ -756,9 +989,40 @@ class HealthTracker:
                         passed=passed,
                         pairs=pairs,
                         category=self.categories.get(stratum),
+                        group=self.groups.get(stratum),
                     )
                 )
         return cells
+
+    def item_responses(self) -> list[ItemResponse]:
+        """Resolved item responses, globally keyed for the difficulty model.
+
+        One :class:`~betapair.irt.ItemResponse` per ``paired`` row — the
+        candidate-epoch result of one stratum on one item. ``pending``,
+        :data:`ERROR` and :data:`RETIRED` rows carry no response and are
+        omitted; a view-caused :data:`FAILED` arrives as ``passed=False``,
+        because it is scored as a failure rather than treated as a hole.
+
+        Identity is ``(outcome, item)`` (:mod:`betapair.irt`): the same
+        ``item`` string under two strata is one item seen twice, and a
+        different string is a different item. Sorted for determinism.
+
+        @return: Responses sorted by ``(stratum, outcome, item)``.
+        """
+        out: list[ItemResponse] = []
+        for (stratum, outcome), items in sorted(self._records.items()):
+            for item, (baseline, candidate) in sorted(items.items()):
+                if _state(baseline, candidate) != "paired":
+                    continue
+                out.append(
+                    ItemResponse(
+                        stratum=stratum,
+                        outcome=outcome,
+                        item=item,
+                        passed=_outcome(candidate) is True,
+                    )
+                )
+        return out
 
     def report(
         self,
@@ -769,9 +1033,33 @@ class HealthTracker:
         alpha: float | None = None,
         rope_pp: float | None = None,
         max_unresolved_share: float | None = None,
+        calibrate: bool = False,
+        adjust_difficulty: bool | None = None,
+        reference_items: Sequence[ItemKey] | None = None,
+        reference_bank: ReferenceBank | None = None,
     ) -> HealthReport:
-        """Compute the metric from whatever has arrived so far."""
-        return build_report(
+        """Compute the metric from whatever has arrived so far.
+
+        @param calibrate: Size the decision thresholds from this tracker's own
+            :attr:`timeline` instead of the hand-set defaults (see
+            :class:`~betapair.report.Calibration`). Off by default, so a
+            report is unchanged until a caller opts in.
+        @param adjust_difficulty: Fit the difficulty model and report an
+            equated level (see :func:`betapair.report.build_report`). ``None``
+            uses this tracker's own :attr:`adjust_difficulty` config; the
+            responses come from :meth:`item_responses`.
+        @param reference_items: Pinned reference bank for this call; ``None``
+            uses :attr:`reference_items`, which itself may be ``None`` (each
+            outcome's observed union).
+        @param reference_bank: Versioned pinned bank for this call; ``None``
+            uses :attr:`reference_bank`. Mutually exclusive with
+            ``reference_items`` (see :func:`betapair.report.build_report`).
+        @note: The report's ``pi_mean`` is remembered for the next recorded
+            point, so the *following* epoch can calibrate its regression prior
+            from this one.
+        """
+        adjust = self.adjust_difficulty if adjust_difficulty is None else adjust_difficulty
+        report = build_report(
             self.cells(),
             weights=self.weights,
             category_weights=self.category_weights,
@@ -798,7 +1086,18 @@ class HealthTracker:
             ),
             baseline_epoch=self.baseline_epoch,
             candidate_epoch=self.candidate_epoch,
+            history=self.timeline,
+            calibrate=calibrate,
+            unpaired_cells=self.unpaired_cells(),
+            responses=self.item_responses() if adjust else None,
+            adjust_difficulty=adjust,
+            reference_items=(self.reference_items if reference_items is None else reference_items),
+            reference_bank=(self.reference_bank if reference_bank is None else reference_bank),
+            sigma_theta=self.sigma_theta,
+            sigma_d=self.sigma_d,
         )
+        self._last_pi_mean = report.pi_mean
+        return report
 
     def snapshot(self) -> dict[str, object]:
         """JSON-ready state; sorted so equal state serialises byte-identically."""
@@ -820,10 +1119,28 @@ class HealthTracker:
             "weights": dict(sorted(self.weights.items())),
             "category_weights": dict(sorted(self.category_weights.items())),
             "categories": dict(sorted(self.categories.items())),
+            "groups": dict(sorted(self.groups.items())),
             "default_category": self.default_category,
             "baseline_epoch": self.baseline_epoch,
             "candidate_epoch": self.candidate_epoch,
             "records": records,
+            "adjust_difficulty": self.adjust_difficulty,
+            "sigma_theta": self.sigma_theta,
+            "sigma_d": self.sigma_d,
+            "reference_items": (
+                None
+                if self.reference_items is None
+                else [[outcome, item] for outcome, item in self.reference_items]
+            ),
+            "reference_bank": (
+                None
+                if self.reference_bank is None
+                else {
+                    "name": self.reference_bank.name,
+                    "version": self.reference_bank.version,
+                    "items": [[outcome, item] for outcome, item in self.reference_bank.items],
+                }
+            ),
             "timeline": [point.snapshot() for point in self.timeline],
             "retired_ledger": [
                 [stratum, outcome, item, last]
@@ -850,16 +1167,38 @@ class HealthTracker:
         seed = config.pop("seed", payload.get("seed"))
         if seed is not None and not isinstance(seed, int):
             raise ValueError(f"snapshot seed must be an integer or null, got {seed!r}")
+        adjust_difficulty = _boolean(
+            config.pop("adjust_difficulty", payload.get("adjust_difficulty", False)),
+            "adjust_difficulty",
+        )
+        sigma_theta = _positive_number(
+            config.pop("sigma_theta", payload.get("sigma_theta", DEFAULT_SIGMA)), "sigma_theta"
+        )
+        sigma_d = _positive_number(
+            config.pop("sigma_d", payload.get("sigma_d", DEFAULT_SIGMA)), "sigma_d"
+        )
+        reference_items = _parse_reference_items(
+            config.pop("reference_items", payload.get("reference_items"))
+        )
+        reference_bank = _parse_reference_bank(
+            config.pop("reference_bank", payload.get("reference_bank"))
+        )
         tracker = cls(
             weights=_number_mapping(payload.get("weights"), "weights"),
             category_weights=_number_mapping(payload.get("category_weights"), "category_weights"),
             categories=_string_mapping(payload.get("categories"), "categories"),
+            groups=_string_mapping(payload.get("groups"), "groups"),
             default_category=_text_or_none(
                 payload.get("default_category", DEFAULT_CATEGORY), "default_category"
             ),
             seed=seed,
             baseline_epoch=_text_or_none(payload.get("baseline_epoch"), "baseline_epoch"),
             candidate_epoch=_text_or_none(payload.get("candidate_epoch"), "candidate_epoch"),
+            adjust_difficulty=adjust_difficulty,
+            sigma_theta=sigma_theta,
+            sigma_d=sigma_d,
+            reference_items=reference_items,
+            reference_bank=reference_bank,
             **config,  # type: ignore[arg-type]
         )
         for raw in _record_rows(payload.get("records")):

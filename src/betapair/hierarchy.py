@@ -81,6 +81,11 @@ class Cell:
     ``pairs`` the number of items observed in both epochs. ``category`` is the
     criticality tier the stratum (semantic view) belongs to — a label, never
     used by the statistics themselves; the report turns it into a weight.
+    ``group`` names the shared upstream dependency the stratum depends on
+    (source table, domain, metric family) — also a label, and likewise never
+    used by the statistics themselves: it exists so cells that fail *together*
+    can be recognised as one incident rather than many independent regressions
+    (see the roadmap's Direction E).
 
     The counts must describe one coherent set of paired items: ``passed``
     contains every ``improved`` pair and the candidate-epoch failures contain
@@ -95,8 +100,11 @@ class Cell:
     passed: int = 0
     pairs: int = 0
     category: str | None = None
+    group: str | None = None
 
     def __post_init__(self) -> None:
+        if self.group is not None and not self.group:
+            raise ValueError("group must be non-empty when set")
         if self.improved < 0 or self.regressed < 0:
             raise ValueError(f"counts must be non-negative: {self}")
         if self.pairs < 0 or self.passed > self.pairs:

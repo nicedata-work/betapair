@@ -40,6 +40,37 @@ class ScorePointTest(unittest.TestCase):
         plain = point(61.5, pairs=40.0)
         self.assertEqual(ScorePoint.from_snapshot(plain.snapshot()), plain)
 
+    def test_snapshot_round_trips_the_regression_base_rate(self) -> None:
+        stored = ScorePoint(score=61.5, pairs=40.0, pi_mean=0.2)
+        self.assertEqual(ScorePoint.from_snapshot(stored.snapshot()), stored)
+        self.assertEqual(stored.pi_mean, 0.2)
+
+    def test_payload_without_a_base_rate_still_loads(self) -> None:
+        """Additive encoding: a timeline written before pi_mean existed loads."""
+        restored = ScorePoint.from_snapshot({"score": 61.5, "pairs": 40.0})
+        self.assertIsNone(restored.pi_mean)
+
+    def test_from_report_carries_the_base_rate(self) -> None:
+        report = HealthReport(status="stable", score=60.0, pairs=50, pi_mean=0.15)
+        extracted = ScorePoint.from_report(report)
+        assert extracted is not None
+        self.assertEqual(extracted.pi_mean, 0.15)
+
+    def test_snapshot_round_trips_the_unresolved_share(self) -> None:
+        stored = ScorePoint(score=61.5, pairs=40.0, unresolved_share=0.2)
+        self.assertEqual(ScorePoint.from_snapshot(stored.snapshot()), stored)
+        self.assertEqual(stored.unresolved_share, 0.2)
+
+    def test_payload_without_an_unresolved_share_still_loads(self) -> None:
+        restored = ScorePoint.from_snapshot({"score": 61.5, "pairs": 40.0})
+        self.assertIsNone(restored.unresolved_share)
+
+    def test_from_report_carries_the_unresolved_share(self) -> None:
+        report = HealthReport(status="stable", score=60.0, pairs=50, unresolved_share=0.1)
+        extracted = ScorePoint.from_report(report)
+        assert extracted is not None
+        self.assertEqual(extracted.unresolved_share, 0.1)
+
     def test_snapshot_rejects_half_an_interval(self) -> None:
         with self.assertRaises(ValueError):
             ScorePoint.from_snapshot({"score": 50.0, "low": 40.0})

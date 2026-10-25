@@ -47,6 +47,13 @@ class CellTest(unittest.TestCase):
         self.assertAlmostEqual(cell.pass_rate, 0.6)
         self.assertAlmostEqual(cell.baseline_pass_rate, 0.45)
 
+    def test_group_is_an_optional_non_empty_label(self) -> None:
+        cell = Cell(stratum="s", outcome="o", group="orders_table")
+        self.assertEqual(cell.group, "orders_table")
+        self.assertIsNone(Cell(stratum="s", outcome="o").group)
+        with self.assertRaises(ValueError):
+            Cell(stratum="s", outcome="o", group="")
+
     def test_validation(self) -> None:
         with self.assertRaises(ValueError):
             Cell(stratum="s", outcome="o", improved=-1, regressed=0, pairs=3)

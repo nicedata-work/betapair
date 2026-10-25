@@ -33,6 +33,9 @@ dev = [
     "pytest>=8.0",
     "ruff>=0.6",
 ]
+#: Optional external oracle for the IRT fit (see ``tools/irt_oracle.py``).
+#: Kept out of ``dev`` because it pulls numpy+scipy into the environment.
+oracle = ["girth>=0.8", "numpy>=1.24"]
 
 [project.urls]
 Homepage = "https://github.com/nicedata-work/betapair"

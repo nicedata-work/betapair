@@ -6,7 +6,7 @@ import json
 import random
 import unittest
 
-from betapair import ERROR, FAILED, RETIRED, HealthTracker, PairRecord
+from betapair import ERROR, FAILED, RETIRED, HealthTracker, PairRecord, ReferenceBank
 
 FAST = {"draws": 96, "ppc_draws": 96}
 
@@ -222,6 +222,90 @@ class CategoryTrackerTest(unittest.TestCase):
     def test_invalid_category_weight_is_rejected(self) -> None:
         with self.assertRaises(ValueError):
             HealthTracker(category_weights={"tier-1": -1.0})
+
+
+class GroupTrackerTest(unittest.TestCase):
+    """A group is an incident label: it never moves the score or the delta."""
+
+    def test_a_group_is_carried_and_only_adds_incidents(self) -> None:
+        labelled = HealthTracker(seed=0, **FAST, groups={"orders_a": "orders_table"})
+        plain = HealthTracker(seed=0, **FAST)
+        for tracker in (labelled, plain):
+            tracker.observe("orders_a", "answer", "q1", False, True)
+            tracker.observe("orders_a", "answer", "q2", True, False)
+            tracker.observe("orders_b", "answer", "q1", False, True)
+        cells = {cell.stratum: cell for cell in labelled.cells()}
+        self.assertEqual(cells["orders_a"].group, "orders_table")
+        self.assertIsNone(cells["orders_b"].group)
+        report = labelled.report()
+        baseline = plain.report()
+        contribution = next(row for row in report.contributions if row.stratum == "orders_a")
+        self.assertEqual(contribution.group, "orders_table")
+        # Aggregation and per-cell gate are untouched: a group is not a weight.
+        self.assertEqual(report.score, baseline.score)
+        self.assertEqual(report.delta_pp, baseline.delta_pp)
+        self.assertEqual(report.pairs, baseline.pairs)
+        self.assertEqual(
+            [row.p_regressed for row in report.contributions],
+            [row.p_regressed for row in baseline.contributions],
+        )
+        # The group appears only as the incident roll-up.
+        self.assertEqual([row.group for row in report.groups], ["orders_table"])
+        self.assertEqual(baseline.groups, [])
+
+    def test_a_group_can_be_bound_after_the_fact(self) -> None:
+        tracker = HealthTracker(**FAST)
+        tracker.observe("v", "answer", "q1", False, True)
+        self.assertIsNone(tracker.group_of("v"))
+        tracker.set_group("v", "orders_table")
+        self.assertEqual(tracker.group_of("v"), "orders_table")
+        self.assertEqual(tracker.cells()[0].group, "orders_table")
+        tracker.set_group("v", None)
+        self.assertIsNone(tracker.group_of("v"))
+
+    def test_groups_survive_a_snapshot(self) -> None:
+        tracker = HealthTracker(groups={"v": "orders_table"}, **FAST)
+        tracker.observe("v", "answer", "q1", False, True)
+        tracker.observe("v", "answer", "q2", True, False)
+        restored = HealthTracker.from_json(tracker.to_json(), **FAST)
+        self.assertEqual(restored.groups, {"v": "orders_table"})
+        self.assertEqual(restored.report().model_dump(), tracker.report().model_dump())
+
+    def test_merge_keeps_the_first_bound_group(self) -> None:
+        primary = HealthTracker(**FAST)
+        primary.observe("v", "answer", "q1", False, True)
+        secondary = HealthTracker(groups={"v": "orders_table"})
+        primary.merge(secondary)
+        self.assertEqual(primary.group_of("v"), "orders_table")
+
+    def test_merge_prefer_other_takes_the_other_group(self) -> None:
+        primary = HealthTracker(groups={"v": "orders_table"})
+        secondary = HealthTracker(groups={"v": "customers_table"})
+        primary.merge(secondary)
+        self.assertEqual(primary.group_of("v"), "customers_table")
+
+    def test_coverage_and_unpaired_cells_carry_the_group(self) -> None:
+        tracker = HealthTracker(groups={"v": "orders_table"}, **FAST)
+        tracker.observe("v", "answer", "q1", False, True)
+        tracker.observe("v", "answer", "q2", None, True)  # candidate only
+        self.assertEqual(tracker.coverage()[0].group, "orders_table")
+        self.assertEqual(tracker.unpaired_cells()[0].group, "orders_table")
+
+    def test_an_empty_group_is_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            HealthTracker(groups={"v": ""})
+        tracker = HealthTracker(**FAST)
+        with self.assertRaises(ValueError):
+            tracker.set_group("v", "")
+
+    def test_malformed_snapshot_group_is_rejected(self) -> None:
+        for payload in (
+            {"version": 3, "records": [], "groups": "orders_table"},
+            {"version": 3, "records": [], "groups": {"v": 3}},
+            {"version": 3, "records": [], "groups": {"v": ""}},
+        ):
+            with self.assertRaises(ValueError):
+                HealthTracker.from_snapshot(payload)
 
 
 class SnapshotTest(unittest.TestCase):
@@ -892,6 +976,422 @@ class TimelineTest(unittest.TestCase):
         restored = HealthTracker.from_json(tracker.to_json(), **FAST)
         self.assertEqual(restored.timeline, tracker.timeline)
         self.assertEqual(restored.snapshot(), tracker.snapshot())
+
+    def test_recorded_points_carry_the_regression_base_rate(self) -> None:
+        """The next epoch's prior calibration needs this epoch's pi_mean."""
+        tracker = HealthTracker(seed=0, **FAST)
+        tracker.observe("v", "answer", "q1", False, True)
+        report = tracker.report()
+        point = tracker.record_score()
+        assert point is not None
+        self.assertEqual(point.pi_mean, report.pi_mean)
+        self.assertEqual(tracker.timeline[-1].pi_mean, report.pi_mean)
+
+    def test_the_finished_epochs_base_rate_is_not_carried_forward(self) -> None:
+        tracker = HealthTracker(seed=0, **FAST)
+        tracker.observe("v", "answer", "q1", False, True)
+        tracker.report()
+        tracker.advance()
+        tracker.observe("v", "answer", "q1", True, False)
+        point = tracker.record_score()
+        assert point is not None
+        self.assertIsNone(point.pi_mean)
+
+    def test_next_reports_calibration_uses_the_recorded_base_rate(self) -> None:
+        tracker = HealthTracker(seed=0, **FAST)
+        tracker.observe("v", "answer", "q1", False, True)
+        tracker.report()
+        tracker.advance()  # records the finished epoch, then clears the bank
+        report = tracker.report(calibrate=True)
+        self.assertEqual(report.calibration.history_points, 1)
+        self.assertIn("pi_prior", report.calibration.derived)
+        self.assertIsNotNone(report.calibration.observed_pi_mean)
+
+    def test_report_offers_its_timeline_as_calibration_history(self) -> None:
+        tracker = HealthTracker(seed=0, **FAST)
+        tracker.observe("v", "answer", "q1", False, True)
+        tracker.advance(baseline_epoch="r1", candidate_epoch="r2")
+        tracker.observe("v", "answer", "q1", True, False)
+
+        default = tracker.report()
+        self.assertEqual(default.calibration.history_points, 1)
+        self.assertFalse(default.calibration.enabled)
+        self.assertFalse(default.calibration.calibrated)
+
+        opted_in = tracker.report(calibrate=True)
+        self.assertEqual(opted_in.calibration.history_points, 1)
+        self.assertTrue(opted_in.calibration.enabled)
+        # B1 plumbs the history; the derivations land with B2-B4, so with a
+        # single point every decision number is still the default one.
+        self.assertEqual(opted_in.rope_pp, default.rope_pp)
+        self.assertEqual(opted_in.score, default.score)
+        self.assertEqual(opted_in.delta_pp, default.delta_pp)
+        self.assertEqual(opted_in.status, default.status)
+
+
+class ColdStartTrackerTest(unittest.TestCase):
+    """A first run (or a new view) has no baseline: it still has a level."""
+
+    def test_candidate_only_epoch_reports_the_unpaired_level(self) -> None:
+        tracker = HealthTracker(**FAST)
+        for index in range(10):
+            tracker.observe("v", "answer", f"q{index}", baseline=None, candidate=index < 7)
+        report = tracker.report()
+        self.assertEqual(report.status, "insufficient")
+        self.assertIsNone(report.score)
+        self.assertEqual(report.pending, 10)
+        self.assertEqual(report.unpaired, 10)
+        self.assertEqual(report.score_unpaired, 70.0)
+        self.assertAlmostEqual(report.unresolved_share or 0.0, 1.0)
+
+    def test_unpaired_level_disappears_once_the_baseline_arrives(self) -> None:
+        tracker = HealthTracker(**FAST)
+        for index in range(10):
+            tracker.observe("v", "answer", f"q{index}", baseline=None, candidate=index < 7)
+        for index in range(10):
+            tracker.observe("v", "answer", f"q{index}", baseline=index < 4, candidate=index < 7)
+        report = tracker.report()
+        self.assertEqual(report.score, 70.0)
+        self.assertEqual(report.unpaired, 0)
+        self.assertIsNone(report.score_unpaired)
+        self.assertEqual(report.unresolved_share, 0.0)
+
+    def test_a_new_view_is_the_unpaired_part_of_a_mixed_report(self) -> None:
+        tracker = HealthTracker(**FAST)
+        tracker.observe("old", "answer", "q1", False, True)
+        tracker.observe("new", "answer", "n1", None, False)
+        tracker.observe("new", "answer", "n2", None, True)
+        report = tracker.report()
+        self.assertEqual(report.score, 100.0)  # the paired view only
+        self.assertEqual(report.unpaired, 2)
+        self.assertEqual(report.score_unpaired, 50.0)  # the cold view
+
+    def test_a_view_caused_failure_counts_against_the_unpaired_level(self) -> None:
+        tracker = HealthTracker(**FAST)
+        tracker.observe("v", "answer", "q1", None, True)
+        tracker.observe("v", "answer", "q2", None, FAILED)
+        report = tracker.report()
+        self.assertEqual(report.unpaired, 2)
+        self.assertEqual(report.score_unpaired, 50.0)
+
+    def test_paired_errored_and_retired_rows_are_not_unpaired(self) -> None:
+        tracker = HealthTracker(**FAST)
+        tracker.observe("v", "answer", "paired", False, True)
+        tracker.observe("v", "answer", "errored", ERROR, True)
+        tracker.observe("v", "answer", "retired", None, RETIRED)
+        tracker.observe("v", "answer", "cold", None, True)
+        cells = tracker.unpaired_cells()
+        self.assertEqual(
+            [(c.stratum, c.outcome, c.resolved, c.passed) for c in cells], [("v", "answer", 1, 1)]
+        )
+
+    def test_timeline_records_the_epochs_unresolved_share(self) -> None:
+        tracker = HealthTracker(seed=0, **FAST)
+        tracker.observe("v", "answer", "q1", False, True)
+        tracker.observe("v", "answer", "q2", True, None)
+        tracker.advance()
+        self.assertEqual(len(tracker.timeline), 1)
+        # One of the two rows never resolved at the epoch boundary.
+        self.assertAlmostEqual(tracker.timeline[0].unresolved_share or 0.0, 0.5)
+
+    def test_unresolved_share_round_trips_through_a_snapshot(self) -> None:
+        tracker = HealthTracker(seed=0, **FAST)
+        tracker.observe("v", "answer", "q1", False, True)
+        tracker.observe("v", "answer", "q2", True, None)
+        tracker.advance()
+        restored = HealthTracker.from_json(tracker.to_json(), **FAST)
+        self.assertEqual(restored.timeline, tracker.timeline)
+
+
+class ItemIdentityTest(unittest.TestCase):
+    """The global item key ``(outcome, item)`` that the difficulty model needs.
+
+    A row is identified by ``(stratum, outcome, item)``, but an *item* is
+    identified by ``(outcome, item)``: the same question asked of two views is
+    one item (the overlap that makes abilities comparable), and a renamed
+    question is a different item.
+    """
+
+    def test_item_responses_are_paired_candidate_results(self) -> None:
+        tracker = HealthTracker(**FAST)
+        tracker.observe("v", "answer", "q1", False, True)
+        tracker.observe("v", "answer", "q2", True, FAILED)
+        tracker.observe("v", "answer", "q3", False, None)  # pending
+        tracker.observe("v", "answer", "q4", False, ERROR)  # harness error
+        tracker.observe("v", "answer", "q5", False, RETIRED)  # withdrawn
+        responses = tracker.item_responses()
+        self.assertEqual([r.item for r in responses], ["q1", "q2"])
+        self.assertTrue(responses[0].passed)
+        # A view-caused failure is a result: it arrives as a failed response.
+        self.assertFalse(responses[1].passed)
+        self.assertEqual(responses[0].stratum, "v")
+        self.assertEqual(responses[0].outcome, "answer")
+
+    def test_the_same_item_across_views_is_one_item(self) -> None:
+        tracker = HealthTracker(**FAST)
+        tracker.observe("view_a", "answer", "q5", False, True)
+        tracker.observe("view_b", "answer", "q5", True, False)
+        responses = tracker.item_responses()
+        self.assertEqual(len(responses), 2)
+        self.assertEqual({r.key for r in responses}, {("answer", "q5")})
+        self.assertEqual({r.stratum for r in responses}, {"view_a", "view_b"})
+
+    def test_a_differing_item_string_is_a_different_item(self) -> None:
+        tracker = HealthTracker(**FAST)
+        tracker.observe("view_a", "answer", "q5", False, True)
+        tracker.observe("view_b", "answer", "q5_v2", True, False)
+        keys = {r.key for r in tracker.item_responses()}
+        self.assertEqual(keys, {("answer", "q5"), ("answer", "q5_v2")})
+
+    def test_the_outcome_is_part_of_the_item_key(self) -> None:
+        """One question under two metrics is two items, not one."""
+        tracker = HealthTracker(**FAST)
+        tracker.observe("view_a", "answer", "q5", False, True)
+        tracker.observe("view_a", "sql_valid", "q5", False, True)
+        keys = {r.key for r in tracker.item_responses()}
+        self.assertEqual(keys, {("answer", "q5"), ("sql_valid", "q5")})
+
+    def test_item_responses_are_sorted_for_determinism(self) -> None:
+        tracker = HealthTracker(**FAST)
+        tracker.observe("view_b", "answer", "q2", False, True)
+        tracker.observe("view_a", "answer", "q1", False, True)
+        tracker.observe("view_a", "answer", "q1", False, True)  # replay overwrites
+        responses = tracker.item_responses()
+        self.assertEqual(
+            [(r.stratum, r.item) for r in responses], [("view_a", "q1"), ("view_b", "q2")]
+        )
+
+
+class DifficultyConfigTest(unittest.TestCase):
+    """IRT config is opt-in, validated, and persisted with the tracker."""
+
+    def _tracker(self, **config: object) -> HealthTracker:
+        tracker = HealthTracker(seed=0, **FAST, **config)  # type: ignore[arg-type]
+        for index in range(6):
+            tracker.observe("hard", "answer", f"anchor{index}", False, True)
+            tracker.observe("easy", "answer", f"anchor{index}", False, True)
+        for index in range(6):
+            tracker.observe("hard", "answer", f"hard{index}", False, False)
+            tracker.observe("easy", "answer", f"easy{index}", False, True)
+        return tracker
+
+    def test_config_round_trips_and_scores_the_same(self) -> None:
+        reference = [("answer", f"anchor{index}") for index in range(6)]
+        tracker = self._tracker(
+            adjust_difficulty=True, sigma_theta=1.2, sigma_d=0.8, reference_items=reference
+        )
+        assert tracker.report().score_adjusted is not None
+        restored = HealthTracker.from_json(tracker.to_json(), **FAST)
+        self.assertTrue(restored.adjust_difficulty)
+        self.assertEqual(restored.sigma_theta, 1.2)
+        self.assertEqual(restored.sigma_d, 0.8)
+        self.assertEqual(restored.reference_items, tuple(reference))
+        self.assertEqual(restored.snapshot(), tracker.snapshot())
+        self.assertEqual(restored.report().model_dump(), tracker.report().model_dump())
+
+    def test_the_config_is_the_report_default(self) -> None:
+        self.assertIsNone(self._tracker().report().score_adjusted)
+        self.assertIsNotNone(self._tracker(adjust_difficulty=True).report().score_adjusted)
+
+    def test_per_call_override_does_not_touch_the_config(self) -> None:
+        tracker = self._tracker()
+        self.assertIsNone(tracker.report().score_adjusted)
+        forced = tracker.report(adjust_difficulty=True)
+        self.assertIsNotNone(forced.score_adjusted)
+        self.assertFalse(tracker.adjust_difficulty)
+        pinned = tracker.report(adjust_difficulty=True, reference_items=[("answer", "anchor0")])
+        self.assertIsNotNone(pinned.score_adjusted)
+        self.assertIsNone(tracker.reference_items)
+
+    def test_a_payload_without_the_config_still_loads(self) -> None:
+        restored = HealthTracker.from_snapshot(
+            {"version": 3, "records": [["v", "answer", "q", False, True]]}
+        )
+        self.assertFalse(restored.adjust_difficulty)
+        self.assertEqual(restored.sigma_theta, 1.5)
+        self.assertEqual(restored.sigma_d, 1.5)
+        self.assertIsNone(restored.reference_items)
+        self.assertEqual(restored.snapshot()["version"], 3)
+
+    def test_reference_item_order_does_not_change_the_snapshot(self) -> None:
+        first = HealthTracker(seed=0, reference_items=[("answer", "q2"), ("answer", "q1")])
+        second = HealthTracker(seed=0, reference_items=[("answer", "q1"), ("answer", "q2")])
+        self.assertEqual(first.to_json(), second.to_json())
+
+    def test_a_versioned_bank_round_trips_and_scores_the_same(self) -> None:
+        probe = self._tracker()
+        bank = ReferenceBank.from_responses(probe.item_responses(), name="standard", version="1")
+        tracker = self._tracker(adjust_difficulty=True, reference_bank=bank)
+        self.assertEqual(tracker.reference_bank, bank)
+        self.assertIsNone(tracker.reference_items)
+        restored = HealthTracker.from_json(tracker.to_json(), **FAST)
+        self.assertEqual(restored.reference_bank, bank)
+        report = tracker.report()
+        assert report.irt is not None and report.irt.reference is not None
+        self.assertEqual(report.irt.reference.name, "standard")
+        self.assertEqual(restored.report().model_dump(), report.model_dump())
+
+    def test_a_per_call_bank_overrides_and_does_not_persist(self) -> None:
+        tracker = self._tracker(adjust_difficulty=True)
+        bank = ReferenceBank.from_responses(tracker.item_responses(), name="override", version="9")
+        report = tracker.report(reference_bank=bank)
+        assert report.irt is not None and report.irt.reference is not None
+        self.assertEqual(report.irt.reference.name, "override")
+        self.assertIsNone(tracker.reference_bank)
+
+    def test_invalid_config_is_rejected(self) -> None:
+        bank = ReferenceBank(name="s", version="1", items=(("answer", "q"),))
+        for config in (
+            {"adjust_difficulty": "yes"},
+            {"sigma_theta": 0.0},
+            {"sigma_d": -1.0},
+            {"sigma_theta": "wide"},
+            {"reference_items": []},
+            {"reference_items": "answer/q1"},
+            {"reference_items": [("answer",)]},
+            {"reference_items": [(7, "q")]},
+            {"reference_items": [("answer", "")]},
+            {"reference_items": [("answer", "q"), ("answer", "q")]},
+            {"reference_bank": {"name": "s"}},
+            {"reference_bank": bank, "reference_items": [("answer", "q")]},
+        ):
+            with self.assertRaises(ValueError):
+                HealthTracker(**config)  # type: ignore[arg-type]
+
+    def test_a_per_call_bank_conflicts_with_a_configured_raw_pin(self) -> None:
+        tracker = self._tracker(adjust_difficulty=True, reference_items=[("answer", "anchor0")])
+        bank = ReferenceBank.from_responses(tracker.item_responses(), name="s", version="1")
+        with self.assertRaises(ValueError):
+            tracker.report(reference_bank=bank)
+
+    def test_malformed_snapshot_config_is_rejected(self) -> None:
+        for payload in (
+            {"version": 3, "records": [], "adjust_difficulty": "yes"},
+            {"version": 3, "records": [], "sigma_theta": "wide"},
+            {"version": 3, "records": [], "sigma_d": 0.0},
+            {"version": 3, "records": [], "reference_items": "nope"},
+            {"version": 3, "records": [], "reference_items": []},
+            {"version": 3, "records": [], "reference_items": [["answer"]]},
+            {"version": 3, "records": [], "reference_bank": "nope"},
+            {"version": 3, "records": [], "reference_bank": {"name": "s", "version": "1"}},
+            {
+                "version": 3,
+                "records": [],
+                "reference_bank": {"name": 7, "version": "1", "items": [["answer", "q"]]},
+            },
+            {
+                "version": 3,
+                "records": [],
+                "reference_bank": {"name": "s", "version": "1", "items": []},
+            },
+        ):
+            with self.assertRaises(ValueError):
+                HealthTracker.from_snapshot(payload)
+
+
+def _group_views() -> dict[str, str]:
+    """Twelve views sharing one upstream table."""
+    return {f"v{index}": "table_x" for index in range(12)}
+
+
+def _fill_group(tracker: HealthTracker, *, improving: int) -> None:
+    """Fill each view with ``improving`` improvements and the rest regressions."""
+    for index in range(12):
+        for q in range(20):
+            tracker.observe(f"v{index}", "answer", f"q{q}", q >= improving, q < improving)
+
+
+def _gate(report: object) -> list[tuple[object, ...]]:
+    """The gate's per-incident reading, for comparing two runs."""
+    return [
+        (
+            row.group,
+            row.cells,
+            row.pairs,
+            row.improved,
+            row.regressed,
+            row.p_incident,
+            row.flagged,
+        )
+        for row in report.groups  # type: ignore[attr-defined]
+    ]
+
+
+class GroupEpochInvariantTest(unittest.TestCase):
+    """An incident is recomputed per epoch, and the group label survives the roll."""
+
+    def test_a_finished_incident_does_not_leak_into_the_next_epoch(self) -> None:
+        tracker = HealthTracker(seed=0, groups=_group_views(), candidate_epoch="e1", **FAST)
+        _fill_group(tracker, improving=8)
+        first = tracker.report()
+        self.assertEqual([row.group for row in first.groups], ["table_x"])
+        self.assertTrue(first.groups[0].flagged)
+        self.assertEqual(first.status, "regressing")
+
+        tracker.advance(baseline_epoch="e1", candidate_epoch="e2")
+        self.assertEqual(tracker.group_of("v0"), "table_x")
+        self.assertEqual(tracker.paired, 0)
+        self.assertEqual([point.epoch for point in tracker.timeline], ["e1"])
+
+        # Every view recovers: the closed epoch's incident must not be inherited.
+        for index in range(12):
+            for q in range(20):
+                tracker.observe(f"v{index}", "answer", f"q{q}", True, True)
+        second = tracker.report()
+        self.assertEqual([row.group for row in second.groups], ["table_x"])
+        self.assertFalse(second.groups[0].flagged)
+        self.assertEqual(second.guardrail.flagged, [])
+        self.assertNotEqual(second.status, "regressing")
+
+    def test_a_new_shared_break_is_one_incident_again(self) -> None:
+        tracker = HealthTracker(seed=0, groups=_group_views(), candidate_epoch="e1", **FAST)
+        _fill_group(tracker, improving=8)
+        tracker.advance(baseline_epoch="e1", candidate_epoch="e2")
+        # The rolled baseline passes, the new candidate fails: a fresh incident.
+        _fill_group(tracker, improving=0)
+        second = tracker.report()
+        self.assertEqual([row.group for row in second.groups], ["table_x"])
+        self.assertTrue(second.groups[0].flagged)
+        self.assertEqual(second.status, "regressing")
+
+
+class GroupRetirementInvariantTest(unittest.TestCase):
+    """Retirement removes evidence; it must not move the incident gate."""
+
+    def _tracker(self) -> HealthTracker:
+        tracker = HealthTracker(seed=0, groups=_group_views(), **FAST)
+        _fill_group(tracker, improving=8)
+        return tracker
+
+    def test_retirement_leaves_the_incident_gate_on_the_remaining_pairs(self) -> None:
+        retired = self._tracker()
+        for index in range(12):
+            for q in range(4):  # retire four improved items per view
+                retired.retire(f"v{index}", "answer", f"q{q}")
+        never = HealthTracker(seed=0, groups=_group_views(), **FAST)
+        for index in range(12):
+            for q in range(4, 20):  # the same evidence, never observed
+                never.observe(f"v{index}", "answer", f"q{q}", q >= 8, q < 8)
+
+        a, b = retired.report(), never.report()
+        # Invariant 1: the surviving regressions stay flagged individually.
+        self.assertEqual(a.status, "regressing")
+        self.assertEqual(len(a.groups), 1)
+        self.assertTrue(a.groups[0].flagged)
+        self.assertTrue(all(row.verdict == "regressing" for row in a.contributions))
+        # The incident row is computed on the remaining pairs only...
+        self.assertEqual(_gate(a), _gate(b))
+        self.assertEqual(
+            [row.verdict for row in a.contributions],
+            [row.verdict for row in b.contributions],
+        )
+        # ...so the layer's own numbers move only through the held overlay.
+        self.assertEqual(a.score, b.score)
+        self.assertEqual(a.delta_pp, b.delta_pp)
+        self.assertEqual(a.retired, 48)
+        self.assertEqual(a.retired_held, 48)
+        assert a.composition_effect_pp is not None
+        self.assertLess(a.composition_effect_pp, 0.0)
 
 
 if __name__ == "__main__":
