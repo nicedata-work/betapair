@@ -37,23 +37,40 @@ what makes streaming idempotent; re-observing the same ``(outcome, item)`` under
 a *different* stratum adds a second response to the same item, which is exactly
 what links two views.
 
-@note: Editing the *text* of a question while keeping its id pools two
-    different questions under one difficulty — the classic item-drift bug. The
-    content fingerprint that detects it is a separate, later task; until then
-    the caller owns identity.
+Content fingerprints
+--------------------
+
+Editing the *text* of a question while keeping its id pools two different
+questions under one difficulty — the classic item-drift bug. :func:`item_fingerprint`
+mints a short, stable digest of the **meaning** of a question (Unicode NFC,
+case-folded, whitespace-collapsed text plus the outcome it targets), so a
+reworded question gets a new fingerprint. The recommended patterns are:
+
+* derive ``item`` from ``item_fingerprint(outcome, text)`` — a reworded
+  question is then automatically a new item; or
+* keep a stable human-readable ``item`` and pass the fingerprint beside it
+  (``observe(..., fingerprint=...)``) — :class:`ItemDrift` then records every
+  observation where an unchanged id carries changed content.
+
+A fingerprint is **not** a substitute for a stable id across epochs when you
+want a paired comparison: keep the id stable and use the fingerprint as the
+identity check. The tracker detects the mismatch; it does not silently re-key
+or drop the row.
 
 The model
 ---------
 
-For one outcome at a time, each response ``y_{v,i} in {0, 1}`` is the
-candidate-epoch result of view ``v`` on item ``i``:
+Each response ``y_{v,o,i} in {0, 1}`` is the candidate-epoch result of view
+``v`` on item ``i`` for outcome ``o``:
 
-    ``P(y_{v,i} = 1) = sigmoid(theta_v + d_i)``
+    ``P(y_{v,o,i} = 1) = sigmoid(theta_v + d_{o,i})``
 
-with ``theta_v ~ N(0, sigma_theta^2)`` the view's ability (higher = healthier)
-and ``d_i ~ N(0, sigma_d^2)`` the item's easiness (higher = easier). Reporting
-uses difficulty ``b_i = -d_i``; the code carries ``d`` because the gradient is
-cleanest that way.
+with ``theta_v ~ N(0, sigma_theta^2)`` the view's **shared** ability (higher =
+healthier; informed by every outcome the view ran) and
+``d_{o,i} ~ N(0, sigma_d^2)`` the item's easiness, outcome-specific (higher =
+easier). An outcome that is uniformly harder is absorbed by its item
+difficulties, not by a separate ability scale. Reporting uses difficulty
+``b = -d``; the code carries ``d`` because the gradient is cleanest that way.
 
 The two Gaussian priors fix the additive non-identifiability (``theta + d`` is
 invariant to ``theta + c, d - c``), keep perfectly separated views and items
@@ -80,8 +97,9 @@ an easy bank comparable.
 Comparability is only as good as the **link**: views are connected only
 through items they both ran. :class:`RaschDiagnostics` (carried on every
 :class:`RaschFit`) reports the view-item graph's ``components``/``connected``
-flags, the ``weakest_link`` shared-item count, and the views/items that are
-perfectly separated (``prior_dominated``, ``separated_items``). Disjoint banks
+flags, the global ``shared_items`` count and the ``weakest_link`` pair-wise
+minimum, and the views/items that are perfectly separated
+(``prior_dominated``, ``separated_items``). Disjoint banks
 are still fitted — the priors bridge them — but that is an assumption the
 diagnostics surface rather than a measurement.
 """
@@ -91,8 +109,11 @@ from __future__ import annotations
 import hashlib
 import math
 import random
+import unicodedata
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
+
+from betapair.beta import log1p_exp, sigmoid
 
 #: Views above which the ``V x V`` Schur complement is not inverted; its
 #: diagonal is used instead, which understates the ability uncertainty. The
@@ -124,6 +145,78 @@ def item_key(outcome: str, item: str) -> ItemKey:
     if not outcome or not item:
         raise ValueError("outcome and item must be non-empty")
     return (outcome, item)
+
+
+#: Prefix carried by every fingerprint. A future normalisation or digest change
+#: bumps it, so old and new fingerprints can never collide silently.
+FINGERPRINT_VERSION = "fp1"
+
+#: Hex characters kept from the SHA-256 digest (16 hex = 64 bits; the birthday
+#: collision probability for a bank of 100,000 items is below 3e-10).
+FINGERPRINT_CHARS = 16
+
+_FINGERPRINT_SEPARATOR = "\x1f"
+
+
+def _normalise_text(text: str) -> str:
+    """Case-folded, Unicode-NFC text with every whitespace run collapsed.
+
+    Formatting is not meaning: capitalisation, line wrapping and trailing
+    spaces must not mint a new fingerprint. Punctuation and wording are kept —
+    normalising those would conflate questions that only look similar.
+    """
+    return " ".join(unicodedata.normalize("NFC", text).casefold().split())
+
+
+def item_fingerprint(outcome: str, text: str) -> str:
+    """A short, stable content fingerprint for one item, ``fp1_<16 hex>``.
+
+    The digest covers the normalised question text **and** the outcome it
+    targets, so the same question under ``answer`` and ``sql_valid`` yields two
+    fingerprints, while the same wording in two views yields one — which is
+    what lets :class:`ItemDrift` tell a renamed row from an edited question.
+
+    Formatting is normalised away (see :func:`_normalise_text`); wording,
+    punctuation and the outcome are not. The ``fp1_`` prefix versions the
+    normalisation, so a future change cannot silently reuse an old fingerprint.
+
+    @raise ValueError: If ``outcome`` or ``text`` is empty/blank.
+    """
+    if not outcome:
+        raise ValueError("outcome must be non-empty")
+    if not isinstance(text, str) or not text.strip():
+        raise ValueError("text must be non-empty")
+    canonical = _FINGERPRINT_SEPARATOR.join((FINGERPRINT_VERSION, outcome, _normalise_text(text)))
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    return f"{FINGERPRINT_VERSION}_{digest[:FINGERPRINT_CHARS]}"
+
+
+@dataclass(frozen=True, order=True)
+class ItemDrift:
+    """An unchanged item id observed with a changed content fingerprint.
+
+    ``expected`` is the first fingerprint recorded for ``(outcome, item)``;
+    ``observed`` is a later, different one. A row means the same id now refers
+    to different question text — the classic item-drift bug — so the pooled
+    difficulty and the paired comparison mix two questions. The report surfaces
+    it; the tracker does not silently re-key or drop the row.
+    """
+
+    outcome: str
+    item: str
+    expected: str
+    observed: str
+
+    def __post_init__(self) -> None:
+        for name in ("outcome", "item", "expected", "observed"):
+            if not getattr(self, name):
+                raise ValueError(f"{name} must be non-empty")
+        if self.expected == self.observed:
+            raise ValueError("a drift row needs two different fingerprints")
+
+    @property
+    def key(self) -> ItemKey:
+        return (self.outcome, self.item)
 
 
 @dataclass(frozen=True)
@@ -241,6 +334,8 @@ class RaschDiagnostics:
       other by at least one shared item;
     * ``weakest_link`` — the fewest shared items over all view pairs (0 when
       there are fewer than two views, or when a pair shares nothing);
+    * ``shared_items`` — how many items were observed by **more than one**
+      view, so the count does not hide partial overlap behind one sparse pair;
     * ``prior_dominated`` — views whose responses are all-pass or all-fail, so
       their ability estimate is the prior's, not the data's;
     * ``separated_items`` — how many items are in the same perfectly separated
@@ -256,6 +351,14 @@ class RaschDiagnostics:
     components: int = 0
     connected: bool = True
     weakest_link: int = 0
+    shared_items: int = 0
+    """Items observed by more than one view.
+
+    ``weakest_link`` is pair-wise, so one sparse pair hides overlap elsewhere;
+    this is the global count the report uses to say whether any cross-view
+    evidence exists at all. Zero with more than one view means every
+    comparison rests on the prior (see :attr:`prior_only`).
+    """
     prior_dominated: tuple[str, ...] = ()
     separated_items: int = 0
 
@@ -264,34 +367,52 @@ class RaschDiagnostics:
             raise ValueError(f"components must be non-negative, got {self.components}")
         if self.weakest_link < 0:
             raise ValueError(f"weakest_link must be non-negative, got {self.weakest_link}")
+        if self.shared_items < 0:
+            raise ValueError(f"shared_items must be non-negative, got {self.shared_items}")
         if self.separated_items < 0:
             raise ValueError(f"separated_items must be non-negative, got {self.separated_items}")
         if self.connected != (self.components <= 1):
             raise ValueError("connected must be components <= 1")
 
+    @property
+    def prior_only(self) -> bool:
+        """True when a multi-view fit shares no item across views.
+
+        The comparison is then prior-bridged rather than measured: the fitted
+        abilities are exchangeable draws from the prior distribution, not
+        evidence about the views' relative health. A single-view fit is not
+        "prior only" — there is no cross-view comparison to make.
+        """
+        return self.shared_items == 0 and self.components > 1
+
 
 @dataclass(frozen=True)
 class RaschFit:
-    """A fitted one-parameter logistic model for a single outcome.
+    """A fitted one-parameter logistic model over one or more outcomes.
 
     ``abilities`` maps a stratum to ``theta_v`` and ``difficulties`` maps a
-    global :data:`ItemKey` to the easiness ``d_i`` (report difficulty as
-    ``-d_i``). ``ability_sd`` and ``difficulty_sd`` are the Laplace posterior
+    global :data:`ItemKey` to the easiness ``d_{o,i}`` (report difficulty as
+    ``-d``). ``ability_sd`` and ``difficulty_sd`` are the Laplace posterior
     standard deviations; the latter is conditional on ``theta``.
 
     ``hyper`` is the resolved ``(sigma_theta, sigma_d)`` pair and ``outcomes``
-    the outcome the fit covers (a one-tuple, or empty for no responses). The
-    model is fitted **one outcome at a time** — items are outcome-specific — so
-    a call that spans outcomes is rejected rather than silently pooled.
+    the outcomes the fit covers (empty for no responses). Items are always
+    outcome-specific, but **one ability is estimated per view across all
+    outcomes**: a response on ``sql_valid`` informs the same ``theta_v`` as a
+    response on ``answer``, which is the multi-facet form of the model. This
+    borrows strength when an outcome's own bank is thin, while the per-outcome
+    item difficulties absorb that outcome's overall difficulty.
 
     ``diagnostics`` records how well the banks are actually linked (see
     :class:`RaschDiagnostics`); it is part of the fit, not a separate call, so
     an equated number can never be read without its caveat.
 
     @note: The fit is invariant to the additive split of the generating truth
-        (``theta + c, d - c``): the likelihood sees only the sum, and the
-        priors pin the decomposition, so the fitted probabilities are
-        unchanged.
+        (``theta + c, d - c`` within an outcome): the likelihood sees only the
+        sum, and the priors pin the decomposition, so the fitted probabilities
+        are unchanged. Because ``theta`` is shared, adding a very easy or very
+        hard outcome moves the per-outcome difficulties, not the shared
+        abilities.
     """
 
     abilities: dict[str, float]
@@ -304,13 +425,23 @@ class RaschFit:
     _ability_factor: tuple[tuple[float, ...], ...] = field(default=(), repr=False, compare=False)
     """Lower factor ``G`` of ``Var(theta)``, empty when it was not built."""
 
-    def probability(self, stratum: str, item: str) -> float:
+    def probability(self, stratum: str, item: str, outcome: str | None = None) -> float:
         """Fitted ``P(pass)`` of ``stratum`` on ``item``, ``sigmoid(theta + d)``.
+
+        ``outcome`` may be omitted only when the fit covers exactly one
+        outcome; a multi-outcome fit needs it, because the same item string can
+        name different ``(outcome, item)`` items.
 
         @raise KeyError: If the stratum or the item is not in the fit, or the
             fit covers no outcome.
+        @raise ValueError: If ``outcome`` is omitted for a multi-outcome fit.
         """
-        outcome = self.outcomes[0]
+        if outcome is None:
+            if not self.outcomes:
+                raise KeyError("the fit covers no outcome")
+            if len(self.outcomes) > 1:
+                raise ValueError("outcome is required when the fit covers several outcomes")
+            outcome = self.outcomes[0]
         return sigmoid(self.abilities[stratum] + self.difficulties[(outcome, item)])
 
     def sample_abilities(self, *, draws: int, seed: int) -> dict[str, list[float]]:
@@ -358,21 +489,6 @@ class RaschFit:
 def log_sigmoid(value: float) -> float:
     """``log(sigmoid(value))``, stable in both tails."""
     return -log1p_exp(-value)
-
-
-def sigmoid(value: float) -> float:
-    """Logistic function, stable in both tails."""
-    if value >= 0.0:
-        return 1.0 / (1.0 + math.exp(-value))
-    exponential = math.exp(value)
-    return exponential / (1.0 + exponential)
-
-
-def log1p_exp(value: float) -> float:
-    """``log(1 + exp(value))`` without overflow."""
-    if value > 0.0:
-        return value + math.log1p(math.exp(-value))
-    return math.log1p(math.exp(value))
 
 
 def _log_likelihood(value: float, passed: int) -> float:
@@ -653,10 +769,14 @@ def _diagnose(
         for item in range(item_count)
         if len({passed for _view, passed in item_observations[item]}) == 1
     )
+    shared_items = sum(
+        1 for observed in item_observations if len({view for view, _passed in observed}) > 1
+    )
     return RaschDiagnostics(
         components=components,
         connected=components <= 1,
         weakest_link=_weakest_link(item_observations, len(strata)),
+        shared_items=shared_items,
         prior_dominated=dominated,
         separated_items=separated_items,
     )
@@ -670,7 +790,7 @@ def fit_rasch(
     max_iter: int = DEFAULT_MAX_ITER,
     tol: float = DEFAULT_TOL,
 ) -> RaschFit:
-    """Fit the penalised-JML Rasch model to one outcome's responses.
+    """Fit the penalised-JML Rasch model, sharing one ability per view.
 
     Alternating 1-D Newton over the two conditionally independent blocks
     (views, then items), with step-halving if a sweep would decrease the
@@ -678,15 +798,18 @@ def fit_rasch(
     and ``sigma_d`` are the Gaussian prior scales that fix the additive
     non-identifiability and keep separated parameters finite.
 
-    @note: One outcome per call — items are outcome-specific, so a fit that
-        spans outcomes would silently pool unrelated items. The caller groups
-        by outcome (the report's cells already are).
+    Items are outcome-specific (``(outcome, item)``) but ``theta`` is **not**:
+    every response of a view, whatever its outcome, updates that view's single
+    ability. Two outcomes with disjoint item banks are therefore linked through
+    the shared abilities without pooling one outcome's items into the other's
+    difficulties.
+
     @note: Deterministic: strata and items are processed in sorted order and no
         randomness enters the MAP, so the same responses give the same fit.
     @return: The :class:`RaschFit`; empty for no responses.
     @raise ValueError: If a prior scale is not positive, ``max_iter < 1``,
-        ``tol`` is not positive, responses span outcomes, or a
-        ``(stratum, item)`` row is repeated.
+        ``tol`` is not positive, or a ``(stratum, outcome, item)`` row is
+        repeated.
     """
     if sigma_theta <= 0.0:
         raise ValueError(f"sigma_theta must be positive, got {sigma_theta}")
@@ -697,9 +820,7 @@ def fit_rasch(
     if tol <= 0.0:
         raise ValueError(f"tol must be positive, got {tol}")
 
-    outcomes = sorted({response.outcome for response in responses})
-    if len(outcomes) > 1:
-        raise ValueError(f"fit_rasch fits one outcome at a time, got {outcomes}")
+    outcomes = tuple(sorted({response.outcome for response in responses}))
     if not outcomes:
         return RaschFit(
             abilities={},
@@ -710,22 +831,22 @@ def fit_rasch(
             outcomes=(),
             diagnostics=RaschDiagnostics(),
         )
-    outcome = outcomes[0]
-
     strata = sorted({response.stratum for response in responses})
-    items = sorted({response.item for response in responses})
+    items = sorted({response.key for response in responses})
     view_index = {stratum: index for index, stratum in enumerate(strata)}
-    item_index = {item: index for index, item in enumerate(items)}
+    item_index = {key: index for index, key in enumerate(items)}
     view_observations: list[list[tuple[int, int]]] = [[] for _ in strata]
     item_observations: list[list[tuple[int, int]]] = [[] for _ in items]
-    seen: set[tuple[str, str]] = set()
+    seen: set[tuple[str, str, str]] = set()
     for response in responses:
-        row = (response.stratum, response.item)
+        row = (response.stratum, response.outcome, response.item)
         if row in seen:
-            raise ValueError(f"duplicate response for stratum={row[0]!r}, item={row[1]!r}")
+            raise ValueError(
+                f"duplicate response for stratum={row[0]!r}, outcome={row[1]!r}, item={row[2]!r}"
+            )
         seen.add(row)
         view = view_index[response.stratum]
-        item = item_index[response.item]
+        item = item_index[response.key]
         passed = 1 if response.passed else 0
         view_observations[view].append((item, passed))
         item_observations[item].append((view, passed))
@@ -792,13 +913,12 @@ def fit_rasch(
             strata[view]: math.sqrt(max(ability_variances[view], 0.0))
             for view in range(len(strata))
         },
-        difficulties={(outcome, items[item]): easiness[item] for item in range(len(items))},
+        difficulties={items[item]: easiness[item] for item in range(len(items))},
         difficulty_sd={
-            (outcome, items[item]): math.sqrt(max(item_variances[item], 0.0))
-            for item in range(len(items))
+            items[item]: math.sqrt(max(item_variances[item], 0.0)) for item in range(len(items))
         },
         hyper=(sigma_theta, sigma_d),
-        outcomes=(outcome,),
+        outcomes=outcomes,
         diagnostics=_diagnose(strata, len(items), view_observations, item_observations),
         _ability_factor=tuple(tuple(row) for row in factor),
     )
@@ -823,6 +943,13 @@ def equated_rates(
     the observed banks). Pass a pinned bank to keep the adjusted score's
     meaning stable as items are added or retired.
 
+    The fit may cover several outcomes with one shared ability per view. The
+    reference bank is then grouped by outcome and each outcome is equated on
+    its own items, so the returned rate for ``(view, outcome)`` answers "what
+    would this view score on the reference items **for that outcome**?" using
+    the shared ability. That keeps the per-cell meaning unchanged while the
+    ability borrows strength across outcomes.
+
     @note: Equating is only as good as the link. When the fit is disconnected
         (``fit.diagnostics.connected`` is False) the reference items of one
         bank carry the *other* bank's difficulties from the prior, so the
@@ -836,7 +963,6 @@ def equated_rates(
         if reference_items:
             raise ValueError("cannot equate an empty fit")
         return {}
-    outcome = fit.outcomes[0]
     if reference_items is None:
         keys = list(fit.difficulties)
     else:
@@ -846,10 +972,13 @@ def equated_rates(
         unknown = [key for key in keys if key not in fit.difficulties]
         if unknown:
             raise ValueError(f"reference item not in the fit: {unknown[0]}")
-    difficulties = [fit.difficulties[key] for key in keys]
+    by_outcome: dict[str, list[float]] = {}
+    for outcome, item in keys:
+        by_outcome.setdefault(outcome, []).append(fit.difficulties[(outcome, item)])
     return {
         (stratum, outcome): sum(sigmoid(ability + value) for value in difficulties)
         / len(difficulties)
+        for outcome, difficulties in by_outcome.items()
         for stratum, ability in fit.abilities.items()
     }
 
@@ -858,7 +987,10 @@ __all__ = [
     "DEFAULT_MAX_ITER",
     "DEFAULT_SIGMA",
     "DEFAULT_TOL",
+    "FINGERPRINT_CHARS",
+    "FINGERPRINT_VERSION",
     "SCHUR_MAX_VIEWS",
+    "ItemDrift",
     "ItemKey",
     "ItemResponse",
     "RaschDiagnostics",
@@ -867,6 +999,7 @@ __all__ = [
     "bank_digest",
     "equated_rates",
     "fit_rasch",
+    "item_fingerprint",
     "item_key",
     "log1p_exp",
     "log_sigmoid",

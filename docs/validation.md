@@ -52,6 +52,25 @@ A zero `between_sd` means the observed spread is pure sampling noise:
 there is no measured dead zone to size, so the 1pp default stands
 (`derived` stays empty).
 
+## Windowed retrospective reads
+
+Each simulated series runs 12 epochs with 2,000
+effective pairs, Gaussian noise (sd 3pp) and a known
+trend; the retrospective read pools the last 6 epochs and
+compares the window's two halves, with the ROPE sized from its measured
+`between_sd` (the `calibrate=True` policy). `flips` counts sign changes
+between consecutive epoch movements — the flapping the window absorbs. A
+sustained move clears the ROPE; noise mostly reads `stable` (the central
+movement is inside the ROPE) or `insufficient` (it is outside but the
+interval is too wide to place it), instead of alternating epoch verdicts.
+
+| true trend (pp/epoch) | P(stable) | P(improving) | P(regressing) | P(insufficient) | mean flips |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 0 | 0.680 | 0.015 | 0.015 | 0.290 | 2.59 |
+| 1 | 0.445 | 0.055 | 0.000 | 0.500 | 2.51 |
+| 3 | 0.035 | 0.660 | 0.000 | 0.305 | 1.71 |
+| 6 | 0.020 | 0.915 | 0.000 | 0.065 | 0.30 |
+
 ## Self-calibration of the regression prior
 
 `pi_prior` is the Beta prior on the share of cells that truly regressed.
@@ -148,6 +167,25 @@ ability estimates and the flattening from the Gaussian priors, both of
 which shrink toward zero. It is why the raw score and
 `difficulty_adjustment_pp` are always reported beside the adjusted one.
 
+### One ability across outcomes
+
+A single fit spans outcomes: item difficulties stay outcome-specific, but
+each view has one ability informed by every outcome it ran. The table
+below gives the ability error for a **thin** outcome (few items) when it
+is fitted alone versus when it borrows the same view's `wide` outcome
+(20 items); the truth is known to the simulation.
+
+| thin outcome items | thin-only ability RMSE | shared ability RMSE |
+| ---: | ---: | ---: |
+| 2 | 0.881 | 0.472 |
+| 4 | 0.757 | 0.484 |
+| 8 | 0.622 | 0.430 |
+
+Borrowing the view's other outcome cuts the thin outcome's ability error
+by roughly half at two items and still by a third at eight. Outcome-level
+difficulty is absorbed by that outcome's item easinesses, so the shared
+ability is not biased by one outcome being uniformly harder.
+
 ## Shared-dependency incidents
 
 Cells tagged with the same `group` share an upstream dependency, so the
@@ -177,6 +215,30 @@ the group as one test both recovers the mild breaks the cells cannot
 prove alone and turns a broken dependency into one row and one flag,
 however many views it takes down. The per-cell gate still runs on every
 cell, so a single regressing view is never hidden by a healthy group.
+
+## Bank composition is not volatility
+
+A score can move because the views changed or because the bank did.
+Timeline points now carry a digest of the scored item keys, so the band
+estimates its between-epoch dispersion **within** each bank when the
+digest changes; only same-bank points can contribute volatility.
+`bank_stable` is `yes` when every point names the same bank, `no` when
+they differ (or only some do), and `n/a` for legacy points with no bank
+information, which keep the old whole-series estimate.
+
+| scenario | bank stable | between_sd | band width |
+| :--- | :--- | ---: | ---: |
+| stable bank, no change | yes | 0.00 | 18.89 |
+| stable bank, true move | yes | 0.00 | 18.71 |
+| retired 20/100 (attrition) | no | 0.00 | 18.80 |
+| bank edits, within-bank move | no | 4.13 | 16.63 |
+| legacy points (no bank) | n/a | 9.46 | 41.58 |
+
+The attrition row is the §7a reproduction: 60% on 100 pairs, then 75%
+on the 80 that remain after 20 hard items were retired. Cross-bank
+scoring booked `between_sd = 9.46` for that pure composition change; the
+bank digest now reads it as no between-epoch movement. The legacy row
+shows the old behaviour is retained where composition is unknown.
 
 ## Heterogeneity cannot read as improving
 

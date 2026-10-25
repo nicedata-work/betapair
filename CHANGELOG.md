@@ -190,20 +190,111 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   incident, so callers can tell "not flagged on the evidence" apart from "not
   admissible at all". Empty when no weight is 0, keeping an unweighted report
   bit-identical.
+- `betapair.irt.item_fingerprint(outcome, text)`: a short, versioned content
+  fingerprint (`fp1_<16 hex>`) of a question. The digest covers Unicode-NFC,
+  case-folded, whitespace-collapsed text plus the outcome it targets, so
+  formatting differences collapse while wording, punctuation and the outcome
+  do not. A reworded question gets a new fingerprint, and a fingerprint change
+  under an unchanged id is detectable drift.
+- `betapair.irt.ItemDrift(outcome, item, expected, observed)`: one id observed
+  with two different fingerprints. `HealthTracker.observe(...,
+  fingerprint=...)` (and `PairRecord.fingerprint`) records the first
+  fingerprint seen per global `(outcome, item)`; later mismatches are
+  deduplicated and exposed as `HealthTracker.drift`, with
+  `HealthTracker.fingerprint_of(outcome, item)` returning the binding. The
+  first fingerprint survives `advance`, `merge`, snapshots and restarts, so an
+  edited question cannot be silently re-baselined, and a merge disagreement
+  becomes a drift row rather than rewriting identity.
+- `HealthReport.drift`: the content-fingerprint mismatches, sorted and
+  de-duplicated. Reported, not gated — the score, delta and verdict are
+  unchanged — because identity is the caller's contract and silently re-keying
+  the row would hide the mixed evidence. `REPORT_VERSION` moved to 12; the
+  snapshot keys `"fingerprints"`/`"drift"` are additive (`SNAPSHOT_VERSION`
+  stays 3).
+- `betapair.irt.RaschDiagnostics.shared_items` and `prior_only`: the global
+  count of item keys observed by more than one view, and the explicit caveat
+  for a multi-view fit that shares no item. Unlike `weakest_link` (the
+  pair-wise minimum), the global count is not hidden by one disjoint view
+  pair. `prior_only` is false for a single-view fit, where there is no
+  cross-view comparison to make. `IrTSummary` (and so `HealthReport.irt`)
+  carries both (summed and any-of across the fitted outcomes), so an adjusted
+  report states when its comparison rests on the prior rather than on data.
+- `RetrospectiveWindow` and `series.retrospective()`: a stabilised read of
+  the most recent `window` score epochs. The level is the pair-mass pooled
+  score with the headline's Beta interval, `delta_pp` compares the pooled first
+  and second halves, `trend_pp` is the pair-weighted slope, and `flips` counts
+  sign changes between consecutive movements. The verdict is level-only: a
+  credible movement clears the ROPE, `stable` means the central movement is
+  inside it, and `insufficient` means the window cannot place the movement. It
+  never overrides a credible per-cell regression.
+  `HealthTracker.retrospective(window=...)` runs it off `timeline`, and
+  `HealthTracker.report(retrospective_window=...)` attaches it as
+  `HealthReport.retrospective` (opt-in; the headline status is unchanged).
+
+- `ScorePoint.score_held`/`paired`/`retired`/`failed`/`bank`: timeline
+  points can now record the bank they were scored on. `bank` is a digest of
+  the active `(outcome, item)` keys, the counts come from the tracker/report,
+  and all keys are additive in `ScorePoint.snapshot()` (snapshot v3 still
+  loads). `ScoreBand.bank_stable` is `True` when every point names the same
+  bank, `False` when they differ (or only some carry one), and `None` for
+  legacy points. When it is `False`, `score_band` estimates between-epoch
+  dispersion within each bank only, so retiring hard items (60% on 100 pairs →
+  75% on 80) reads `between_sd = 0.0` instead of booking attrition as
+  volatility; a genuine move on a stable bank is unchanged.
+- `fit_rasch` accepts **all outcomes at once**: item difficulties stay
+  outcome-specific, but each view has one shared ability informed by every
+  outcome it ran. The multi-facet fit is the same alternating Newton, so no
+  optimiser enters; `RaschFit.probability` takes an explicit `outcome` for a
+  multi-outcome fit, and `equated_rates` groups the reference bank by outcome
+  and equates each on its own items with the shared ability.
+  `report(adjust_difficulty=True)` now fits once and draws the shared `theta`
+  once, so a view's cells move together instead of pretending to be
+  independent fits. `docs/validation.md` measures the borrowing: a thin
+  outcome's ability RMSE falls from 0.881 to 0.472 (2 items) and 0.622 to
+  0.430 (8 items) against a 20-item outcome.
 
 ### Changed
 
-- `REPORT_VERSION` is now 11 (added `HealthReport.groups`, the per-incident
-  roll-up). v10 added `CellContribution.group`, the shared-dependency label;
-  v9 added `irt.reference`, the resolved reference bank, to the report JSON;
-  v8 added `score_adjusted`/
+- `report.py` no longer owns the schema, the regression gate and the
+  assembler at once. The pydantic models and the pure-data policy objects
+  (`Calibration`, `RetrospectiveWindow`, `Weighting`, `CellCoverage`,
+  `UnpairedCell`, `Status`, `REPORT_VERSION`, `DEFAULT_CATEGORY`) moved to
+  `betapair.models`, and the spike-and-slab gate plus `delta_status` moved to
+  `betapair.gate`. The move breaks the old `report <-> series` import cycle:
+  `series` now imports `models`, and `report` imports `series` at module
+  level (the two function-local imports and the `TYPE_CHECKING` block are
+  gone). Existing `betapair.report` and `betapair` imports keep working —
+  `report` re-exports the moved names.
+- `build_report`'s assembly is decomposed into `_resolve_inputs`,
+  `_score_levels`, `_fit_hierarchy` and `_assemble`, with a single
+  `_insufficient_report` helper for the two cold-start returns. Configuration
+  is bundled in a new exported, frozen `ReportOptions` dataclass, validated on
+  construction and shared by `build_report` and `HealthTracker.report`;
+  `build_report(cells, **kwargs)` remains as a compatibility facade over it.
+- The stable logistic helpers (`sigmoid`, `log1p_exp`) moved to
+  `betapair.beta`, so `betapair.irt` and `betapair.gate` share one
+  implementation instead of maintaining byte-identical copies. `irt.sigmoid`
+  and `irt.log1p_exp` still resolve (re-exported).
+- `REPORT_VERSION` is now 14 (added `HealthReport.retrospective`, the opt-in
+  windowed level/verdict). v13 added `irt.shared_items`/`irt.prior_only`, the
+  cross-view linking diagnostic; v12 added `HealthReport.drift`, the
+  content-fingerprint mismatch rows; v11 added `HealthReport.groups`, the
+  per-incident roll-up; v10 added `CellContribution.group`, the
+  shared-dependency label; v9 added `irt.reference`, the resolved reference
+  bank, to the report JSON; v8 added `score_adjusted`/
   `difficulty_adjustment_pp`/`irt` and the per-cell equated rate; v7 added
   `score_unpaired`/`unpaired` and `unresolved_share`; v6 added
   `score_low`/`score_high`; v5 added `failed`. The tracker snapshot format is
   unchanged at v3: `"failed"`, `"pi_mean"`, `"unresolved_share"`, the IRT
   config (`"adjust_difficulty"`, `"sigma_theta"`, `"sigma_d"`,
-  `"reference_items"`, `"reference_bank"`) and `"groups"` are additive
-  encodings, and a payload without them still loads.
+  `"reference_items"`, `"reference_bank"`), `"groups"`, `"fingerprints"` and
+  `"drift"` are additive encodings, and a payload without them still loads;
+  the new composition keys are additive within each `timeline` point.
+- `fit_rasch` no longer rejects mixed outcomes (F1): the one-ability-per-view
+  model supersedes the per-outcome call. Single-outcome calls are unchanged;
+  `fit_rasch([]).probability(...)` still raises and a multi-outcome
+  `probability` now requires the outcome. The `REPORT_VERSION` stays 14 — the
+  report shape did not change, only the values of an opted-in adjustment.
 
 ### Fixed
 

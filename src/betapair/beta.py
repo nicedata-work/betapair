@@ -204,12 +204,19 @@ def _log_gamma_sample(rng: random.Random, shape: float) -> float:
             return math.log(d) + math.log(v)
 
 
-def _logistic(value: float) -> float:
+def sigmoid(value: float) -> float:
     """Numerically stable logistic function; never overflows."""
     if value >= 0.0:
         return 1.0 / (1.0 + math.exp(-value))
     exp_value = math.exp(value)
     return exp_value / (1.0 + exp_value)
+
+
+def log1p_exp(value: float) -> float:
+    """``log(1 + exp(value))`` without overflow."""
+    if value > 0.0:
+        return value + math.log1p(math.exp(-value))
+    return math.log1p(math.exp(value))
 
 
 def beta_sample(rng: random.Random, a: float, b: float) -> float:
@@ -225,4 +232,4 @@ def beta_sample(rng: random.Random, a: float, b: float) -> float:
     if a <= 0.0 or b <= 0.0:
         raise ValueError(f"shape parameters must be positive, got a={a}, b={b}")
     log_ratio = _log_gamma_sample(rng, a) - _log_gamma_sample(rng, b)
-    return min(max(_logistic(log_ratio), _MIN_RATE), _MAX_RATE)
+    return min(max(sigmoid(log_ratio), _MIN_RATE), _MAX_RATE)

@@ -9,7 +9,13 @@ extends it to many strata at once:
   posterior predictive homogeneity guardrail;
 * :mod:`betapair.irt` — the global item-identity contract (``ItemResponse``,
   ``item_key``) for the latent-difficulty model;
-* :mod:`betapair.report` — the assembled report models and ``build_report()``;
+* :mod:`betapair.gate` — the dependence-aware regression gate and the ROPE
+  layer verdict;
+* :mod:`betapair.models` — the serialisable report schema and the pure-data
+  policy objects (the only pydantic users);
+* :mod:`betapair.report` — ``build_report()``, the decision policy and the
+  assembly steps;
+* :mod:`betapair.series` — score-over-time dispersion and windowed reads;
 * :mod:`betapair.tracker` — streaming/batch accumulation and JSON snapshots.
 
 The intended surface is small::
@@ -23,7 +29,7 @@ The intended surface is small::
     report.score, report.delta_pp, report.contributions, report.guardrail
 
 Nothing in the numeric core imports numpy/scipy/pandas; ``pydantic`` is used
-only by :mod:`betapair.report` for the serialisable report models.
+only by :mod:`betapair.models` for the serialisable report schema.
 """
 
 from betapair.beta import beta_cdf, beta_pdf, beta_ppf, beta_sf
@@ -39,6 +45,7 @@ from betapair.hierarchy import (
     pooled_counts,
 )
 from betapair.irt import (
+    ItemDrift,
     ItemKey,
     ItemResponse,
     RaschDiagnostics,
@@ -47,6 +54,7 @@ from betapair.irt import (
     bank_digest,
     equated_rates,
     fit_rasch,
+    item_fingerprint,
     item_key,
 )
 from betapair.mcnemar import McNemarResult, SwitchEvidence, mcnemar, switch_evidence
@@ -67,6 +75,8 @@ from betapair.report import (
     McNemarSummary,
     ReferenceBankSummary,
     RegressionModel,
+    ReportOptions,
+    RetrospectiveWindow,
     Status,
     UnpairedCell,
     Weighting,
@@ -79,7 +89,7 @@ from betapair.report import (
     verdicts_from_model,
     weighting,
 )
-from betapair.series import ScoreBand, ScorePoint, score_band
+from betapair.series import ScoreBand, ScorePoint, retrospective, score_band
 from betapair.tracker import ERROR, FAILED, RETIRED, HealthTracker, PairRecord
 
 __all__ = [
@@ -105,6 +115,7 @@ __all__ = [
     "HierarchySummary",
     "Homogeneity",
     "IrTSummary",
+    "ItemDrift",
     "ItemKey",
     "ItemResponse",
     "McNemarResult",
@@ -115,6 +126,8 @@ __all__ = [
     "ReferenceBank",
     "ReferenceBankSummary",
     "RegressionModel",
+    "ReportOptions",
+    "RetrospectiveWindow",
     "ScoreBand",
     "ScorePoint",
     "Status",
@@ -134,12 +147,14 @@ __all__ = [
     "fit",
     "fit_rasch",
     "homogeneity_ppc",
+    "item_fingerprint",
     "item_key",
     "mcnemar",
     "parse_category_weights",
     "pooled_counts",
     "regression_model",
     "resolve_calibration",
+    "retrospective",
     "score_band",
     "switch_evidence",
     "verdicts_from_model",

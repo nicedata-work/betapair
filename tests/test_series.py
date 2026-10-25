@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import math
 import unittest
 
-from betapair import HealthReport, ScorePoint, score_band
+from betapair import HealthReport, RetrospectiveWindow, ScorePoint, retrospective, score_band
 
 
 def point(score: float, pairs: float = 0.0) -> ScorePoint:
@@ -143,6 +144,203 @@ class ScoreBandTest(unittest.TestCase):
             score_band([60.0], level=0.0)
         with self.assertRaises(TypeError):
             score_band(["60"])  # type: ignore[list-item]
+
+
+class RetrospectiveTest(unittest.TestCase):
+    """A window pools the level and reads the verdict off its two halves."""
+
+    @staticmethod
+    def _series(scores: tuple[float, ...], pairs: float = 2000.0) -> list[ScorePoint]:
+        return [ScorePoint(score=score, pairs=pairs) for score in scores]
+
+    def test_level_is_the_pair_mass_pooled_score(self) -> None:
+        points = [ScorePoint(score=40.0, pairs=100.0), ScorePoint(score=60.0, pairs=300.0)]
+        window = retrospective(points)
+        self.assertAlmostEqual(window.score, 55.0, places=9)
+        low, high = ScorePoint(score=55.0, pairs=400.0).interval()
+        self.assertEqual((window.score_low, window.score_high), (low, high))
+        self.assertEqual(window.points, 2)
+
+    def test_more_points_narrow_the_windowed_level(self) -> None:
+        two = retrospective(self._series((50.0, 50.0)))
+        eight = retrospective(self._series((50.0,) * 8))
+        self.assertLess(eight.score_high - eight.score_low, two.score_high - two.score_low)
+
+    def test_a_sustained_rise_reads_improving(self) -> None:
+        window = retrospective(self._series((40.0, 42.0, 44.0, 46.0, 48.0, 50.0)), rope_pp=1.0)
+        self.assertEqual(window.status, "improving")
+        assert window.delta_pp is not None and window.delta_low is not None
+        self.assertGreater(window.delta_pp, 0.0)
+        self.assertGreater(window.delta_low, 1.0)
+
+    def test_a_sustained_fall_reads_regressing(self) -> None:
+        window = retrospective(self._series((50.0, 48.0, 46.0, 44.0, 42.0, 40.0)), rope_pp=1.0)
+        self.assertEqual(window.status, "regressing")
+        assert window.delta_high is not None
+        self.assertLess(window.delta_high, -1.0)
+
+    def test_a_flat_series_is_stable(self) -> None:
+        window = retrospective(self._series((50.0, 50.0, 50.0, 50.0)), rope_pp=1.0)
+        self.assertEqual(window.status, "stable")
+        self.assertAlmostEqual(window.delta_pp or 0.0, 0.0, places=9)
+
+    def test_a_wide_window_can_still_be_undecided(self) -> None:
+        # A 5pp move with 20 pairs per epoch: the interval crosses the ROPE and
+        # the point estimate is outside it, so the window does not pretend.
+        points = self._series((40.0, 45.0, 50.0, 55.0), pairs=20.0)
+        window = retrospective(points, rope_pp=1.0)
+        self.assertEqual(window.status, "insufficient")
+
+    def test_window_keeps_only_the_recent_points(self) -> None:
+        points = self._series((90.0, 50.0, 50.0, 50.0))
+        window = retrospective(points, window=2)
+        self.assertEqual(window.points, 2)
+        self.assertAlmostEqual(window.score, 50.0, places=9)
+
+    def test_flips_count_sign_changes(self) -> None:
+        # +2, -3, +4, -5: three sign changes.
+        window = retrospective(self._series((50.0, 52.0, 49.0, 53.0, 48.0)))
+        self.assertEqual(window.flips, 3)
+        self.assertEqual(retrospective(self._series((40.0, 42.0, 44.0, 46.0))).flips, 0)
+
+    def test_trend_is_the_pair_weighted_slope(self) -> None:
+        window = retrospective(self._series((50.0, 52.0, 54.0, 56.0)))
+        self.assertAlmostEqual(window.trend_pp or 0.0, 2.0, places=9)
+        # A single weighted point has no slope to measure.
+        self.assertIsNone(retrospective(self._series((50.0,))).trend_pp)
+
+    def test_a_single_point_has_no_delta(self) -> None:
+        window = retrospective(self._series((61.0,)))
+        self.assertIsNone(window.delta_pp)
+        self.assertIsNone(window.delta_low)
+        self.assertIsNone(window.delta_high)
+        self.assertEqual(window.status, "insufficient")
+        self.assertEqual(window.flips, 0)
+
+    def test_a_series_without_pairs_cannot_be_pooled(self) -> None:
+        with self.assertRaises(ValueError):
+            retrospective([ScorePoint(score=50.0), ScorePoint(score=52.0)])
+        with self.assertRaises(ValueError):
+            retrospective([])
+        with self.assertRaises(ValueError):
+            retrospective(self._series((50.0,)), window=0)
+        with self.assertRaises(ValueError):
+            retrospective(self._series((50.0,)), rope_pp=-1.0)
+        with self.assertRaises(ValueError):
+            retrospective(self._series((50.0,)), level=1.0)
+
+    def test_window_fields_validate_themselves(self) -> None:
+        with self.assertRaises(ValueError):
+            RetrospectiveWindow(50.0, 60.0, 55.0, None, None, None, None, 0, "stable", 1)
+        with self.assertRaises(ValueError):
+            RetrospectiveWindow(50.0, 55.0, 45.0, None, None, None, None, 0, "stable", 1)
+        with self.assertRaises(ValueError):
+            RetrospectiveWindow(101.0, 45.0, 155.0, None, None, None, None, 0, "stable", 1)
+        with self.assertRaises(ValueError):
+            RetrospectiveWindow(50.0, 45.0, 55.0, 2.0, 1.0, 1.5, None, 0, "stable", 1)
+        with self.assertRaises(ValueError):
+            RetrospectiveWindow(50.0, 45.0, 55.0, None, None, None, math.inf, 0, "stable", 1)
+        with self.assertRaises(ValueError):
+            RetrospectiveWindow(50.0, 45.0, 55.0, None, None, None, None, 0, "stable", 0)
+        with self.assertRaises(ValueError):
+            RetrospectiveWindow(50.0, 45.0, 55.0, None, None, None, None, 0, "stable", 1, 0)
+        with self.assertRaises(ValueError):
+            RetrospectiveWindow(50.0, 45.0, 55.0, 2.0, None, None, None, 0, "stable", 1)
+        with self.assertRaises(ValueError):
+            RetrospectiveWindow(50.0, 45.0, 55.0, 2.0, 1.0, 3.0, None, -1, "stable", 1)
+        with self.assertRaises(ValueError):
+            RetrospectiveWindow(50.0, 45.0, 55.0, 2.0, 1.0, 3.0, None, 0, "mixed", 1)
+
+    def test_results_are_deterministic(self) -> None:
+        points = self._series((48.0, 52.0, 51.0, 55.0, 54.0, 58.0))
+        self.assertEqual(retrospective(points), retrospective(points))
+
+
+class ScorePointCompositionTest(unittest.TestCase):
+    """A point can carry the bank it was scored on."""
+
+    def test_snapshot_round_trips_the_composition(self) -> None:
+        stored = ScorePoint(
+            score=75.0,
+            pairs=80.0,
+            epoch="e2",
+            low=70.0,
+            high=80.0,
+            score_held=60.0,
+            paired=80,
+            retired=20,
+            failed=3,
+            bank="abc123",
+        )
+        self.assertEqual(ScorePoint.from_snapshot(stored.snapshot()), stored)
+
+    def test_a_legacy_point_has_no_composition(self) -> None:
+        restored = ScorePoint.from_snapshot({"score": 50.0})
+        self.assertIsNone(restored.score_held)
+        self.assertIsNone(restored.paired)
+        self.assertIsNone(restored.retired)
+        self.assertIsNone(restored.failed)
+        self.assertIsNone(restored.bank)
+
+    def test_malformed_composition_is_rejected(self) -> None:
+        for payload in (
+            {"score": 50.0, "score_held": 101.0},
+            {"score": 50.0, "paired": -1},
+            {"score": 50.0, "paired": True},
+            {"score": 50.0, "retired": 1.5},
+            {"score": 50.0, "bank": ""},
+            {"score": 50.0, "bank": 7},
+        ):
+            with self.assertRaises(ValueError):
+                ScorePoint.from_snapshot(payload)
+
+
+class BankStableBandTest(unittest.TestCase):
+    """A bank change is composition, not volatility."""
+
+    def test_a_stable_bank_books_genuine_movement(self) -> None:
+        band = score_band(
+            [ScorePoint(60.0, pairs=100.0, bank="a"), ScorePoint(75.0, pairs=80.0, bank="a")]
+        )
+        self.assertTrue(band.bank_stable)
+        self.assertGreater(band.between_sd, 9.0)
+
+    def test_the_attrition_reproduction_does_not_book_volatility(self) -> None:
+        band = score_band(
+            [ScorePoint(60.0, pairs=100.0, bank="a"), ScorePoint(75.0, pairs=80.0, bank="b")]
+        )
+        self.assertFalse(band.bank_stable)
+        self.assertEqual(band.between_sd, 0.0)
+        self.assertGreater(band.width, 0.0)  # the sampling noise is still shown
+
+    def test_movement_is_measured_within_each_bank(self) -> None:
+        band = score_band(
+            [
+                ScorePoint(60.0, pairs=2000.0, bank="a"),
+                ScorePoint(66.0, pairs=2000.0, bank="a"),
+                ScorePoint(80.0, pairs=2000.0, bank="b"),
+                ScorePoint(86.0, pairs=2000.0, bank="b"),
+            ]
+        )
+        self.assertFalse(band.bank_stable)
+        # The within-bank step is 6pp (~4pp dispersion); the cross-bank jump
+        # (~11pp dispersion) is ignored.
+        self.assertLess(band.between_sd, 6.0)
+        self.assertGreater(band.between_sd, 3.0)
+
+    def test_no_bank_information_keeps_the_old_estimate(self) -> None:
+        band = score_band([ScorePoint(60.0, pairs=100.0), ScorePoint(75.0, pairs=80.0)])
+        self.assertIsNone(band.bank_stable)
+        self.assertGreater(band.between_sd, 9.0)
+
+    def test_partial_bank_information_is_not_stable(self) -> None:
+        band = score_band([ScorePoint(60.0, pairs=100.0, bank="a"), ScorePoint(75.0, pairs=80.0)])
+        self.assertFalse(band.bank_stable)
+        self.assertEqual(band.between_sd, 0.0)
+
+    def test_a_single_point_reports_its_bank_state(self) -> None:
+        self.assertTrue(score_band([ScorePoint(60.0, pairs=100.0, bank="a")]).bank_stable)
+        self.assertIsNone(score_band([ScorePoint(60.0, pairs=100.0)]).bank_stable)
 
 
 if __name__ == "__main__":

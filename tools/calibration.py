@@ -24,6 +24,8 @@ FDR rule), so the natural questions are:
 * does the difficulty-adjusted interval cover, and how much does weak bank
   linking cost the equated score?
 * does equating actually remove a bank's difficulty from the level?
+* does a windowed retrospective read stabilise a noisy series without hiding a
+  sustained move?
 
 Everything is seeded, so the tables are reproducible. These are the frequentist
 operating characteristics of a Bayesian procedure: the FDR target is a
@@ -52,6 +54,8 @@ from betapair import (
     fit_rasch,
     regression_model,
     resolve_calibration,
+    retrospective,
+    score_band,
 )
 from betapair.irt import sigmoid
 
@@ -95,6 +99,12 @@ IRT_IMBALANCE_ANCHORS = 12
 IRT_IMBALANCE_ITEMS = 10
 IRT_IMBALANCE_TRIALS = 150
 IMBALANCE_OFFSETS = (0.0, 1.0, 2.0, 3.0)
+#: Shared-ability table: trials, views, the wide outcome's items, and the thin
+#: outcome's item counts swept.
+SHARED_TRIALS = 50
+SHARED_VIEWS = 4
+SHARED_WIDE_ITEMS = 20
+SHARED_THIN_ITEMS = (2, 4, 8)
 #: Shared-dependency table: groups per layer, cells per group, discordant pairs
 #: per cell, and the switch rates a group-wide break is swept over.
 GROUP_TRIALS = 100
@@ -105,6 +115,14 @@ GROUP_GROUPS = 6
 GROUP_CELLS = 10
 GROUP_DISCORDANT = 20
 GROUP_BREAK_RATES = (0.45, 0.40, 0.35, 0.30, 0.25, 0.15)
+#: Retrospective table: epochs per simulated series, the window, effective pairs
+#: per epoch, noise sd, and the per-epoch trends swept.
+RETRO_TRIALS = 200
+RETRO_EPOCHS = 12
+RETRO_WINDOW = 6
+RETRO_PAIRS = 2000.0
+RETRO_VOLATILITY = 3.0
+RETRO_TRENDS = (0.0, 1.0, 3.0, 6.0)
 
 
 def _draw(rng: random.Random, n: int, q: float) -> tuple[int, int]:
@@ -521,6 +539,49 @@ def bank_imbalance(
     return rows
 
 
+def shared_ability_borrowing() -> list[tuple[int, float, float]]:
+    """Ability error for a thin outcome, alone vs borrowing the wide outcome.
+
+    Two outcomes share their views; the ``wide`` outcome has
+    :data:`SHARED_WIDE_ITEMS` items and the ``thin`` one is varied. Rows are
+    ``(thin items, thin-only ability RMSE, shared ability RMSE)`` against the
+    simulated truth. This is the F1 claim: one ability per view means a thin
+    outcome's level is estimated from the whole view, not from its few items.
+    """
+    import statistics
+
+    rows: list[tuple[int, float, float]] = []
+    for thin in SHARED_THIN_ITEMS:
+        rng = random.Random(2027)
+        alone: list[float] = []
+        shared: list[float] = []
+        for _ in range(SHARED_TRIALS):
+            views = [f"v{index}" for index in range(SHARED_VIEWS)]
+            theta = {view: rng.gauss(0.0, 1.0) for view in views}
+            responses: list[ItemResponse] = []
+            for outcome, count in (("answer", SHARED_WIDE_ITEMS), ("spec", thin)):
+                difficulties = {f"q{index}": rng.gauss(0.0, 1.0) for index in range(count)}
+                for view in views:
+                    for item, difficulty in difficulties.items():
+                        probability = sigmoid(theta[view] + difficulty)
+                        responses.append(
+                            ItemResponse(view, outcome, item, rng.random() < probability)
+                        )
+            combined = fit_rasch(responses)
+            thin_only = fit_rasch(
+                [response for response in responses if response.outcome == "spec"]
+            )
+
+            alone.append(
+                (statistics.fmean((thin_only.abilities[v] - theta[v]) ** 2 for v in views)) ** 0.5
+            )
+            shared.append(
+                (statistics.fmean((combined.abilities[v] - theta[v]) ** 2 for v in views)) ** 0.5
+            )
+        rows.append((thin, statistics.fmean(alone), statistics.fmean(shared)))
+    return rows
+
+
 def _group_layer(rng: random.Random, q: float | None = None, broken: int = 0) -> list[Cell]:
     """A layer of groups; the first ``broken`` switch at ``q`` instead of .5.
 
@@ -587,6 +648,95 @@ def group_incidents() -> tuple[float, float, float, list[tuple[float, float, flo
     )
 
 
+def retrospective_stability() -> list[tuple[float, float, float, float, float, float]]:
+    """Windowed verdicts for a noisy series with a known per-epoch trend.
+
+    Each trial is a straight trend plus Gaussian noise; the ROPE is sized from
+    the window's measured ``between_sd`` (the ``calibrate=True`` policy). Rows
+    are ``(trend, P(stable), P(improving), P(regressing), P(insufficient), mean
+    flips)``. A stationary series should mostly read stable/undecided rather
+    than alternate; a sustained move should clear the ROPE.
+    """
+    rows: list[tuple[float, float, float, float, float, float]] = []
+    for trend in RETRO_TRENDS:
+        counts = {"stable": 0, "improving": 0, "regressing": 0, "insufficient": 0}
+        flips = 0.0
+        for trial in range(RETRO_TRIALS):
+            rng = random.Random(2026 + trial)
+            points = [
+                ScorePoint(
+                    score=max(
+                        0.0,
+                        min(
+                            100.0,
+                            50.0 + trend * index + rng.gauss(0.0, RETRO_VOLATILITY),
+                        ),
+                    ),
+                    pairs=RETRO_PAIRS,
+                )
+                for index in range(RETRO_EPOCHS)
+            ]
+            between = score_band(points[-RETRO_WINDOW:]).between_sd
+            window = retrospective(
+                points,
+                window=RETRO_WINDOW,
+                rope_pp=between if between > 0.0 else 1.0,
+            )
+            counts[window.status] += 1
+            flips += window.flips / RETRO_TRIALS
+        total = float(RETRO_TRIALS)
+        rows.append(
+            (
+                trend,
+                counts["stable"] / total,
+                counts["improving"] / total,
+                counts["regressing"] / total,
+                counts["insufficient"] / total,
+                flips,
+            )
+        )
+    return rows
+
+
+def bank_composition() -> list[tuple[str, bool | None, float, float]]:
+    """Band behaviour across bank-stable, attrition and legacy series.
+
+    Rows are ``(scenario, bank_stable, between_sd, band width)``. The
+    ``retired 20/100`` row is the §7a reproduction: the same views, 20 hard
+    items withdrawn, scores 60% -> 75%. Booking that jump as volatility used to
+    give ``between_sd = 9.46``; the bank digest now identifies it as composition.
+    """
+    scenarios = {
+        "stable bank, no change": [
+            ScorePoint(score=60.0, pairs=100.0, bank="a"),
+            ScorePoint(score=60.0, pairs=100.0, bank="a"),
+        ],
+        "stable bank, true move": [
+            ScorePoint(score=60.0, pairs=100.0, bank="a"),
+            ScorePoint(score=64.0, pairs=100.0, bank="a"),
+        ],
+        "retired 20/100 (attrition)": [
+            ScorePoint(score=60.0, pairs=100.0, bank="a"),
+            ScorePoint(score=75.0, pairs=80.0, bank="b", score_held=60.0),
+        ],
+        "bank edits, within-bank move": [
+            ScorePoint(score=60.0, pairs=2000.0, bank="a"),
+            ScorePoint(score=66.0, pairs=2000.0, bank="a"),
+            ScorePoint(score=80.0, pairs=2000.0, bank="b"),
+            ScorePoint(score=86.0, pairs=2000.0, bank="b"),
+        ],
+        "legacy points (no bank)": [
+            ScorePoint(score=60.0, pairs=100.0),
+            ScorePoint(score=75.0, pairs=80.0),
+        ],
+    }
+    rows = []
+    for name, points in scenarios.items():
+        band = score_band(points)
+        rows.append((name, band.bank_stable, band.between_sd, band.width))
+    return rows
+
+
 def heterogeneous_never_reads_improving(trials: int = 200, seed: int = 0) -> int:
     """Count layers that are heterogeneous but still report ``improving``."""
     rng = random.Random(seed)
@@ -648,11 +798,14 @@ def build_markdown() -> str:
     violations = heterogeneous_never_reads_improving()
     null_any, null_incidents, null_cell_flags, group_rows = group_incidents()
     stability_rows = verdict_stability()
+    retrospective_rows = retrospective_stability()
+    bank_rows = bank_composition()
     prior_rows = prior_calibration()
     coverage_rows = coverage_calibration()
     irt_coverage = adjusted_interval_coverage()
     linking_rows = linking_regimes()
     imbalance_rows = bank_imbalance()
+    shared_rows = shared_ability_borrowing()
     lines += [
         "",
         "## Verdict stability as volatility changes",
@@ -675,6 +828,28 @@ def build_markdown() -> str:
         "A zero `between_sd` means the observed spread is pure sampling noise:",
         "there is no measured dead zone to size, so the 1pp default stands",
         "(`derived` stays empty).",
+        "",
+        "## Windowed retrospective reads",
+        "",
+        f"Each simulated series runs {RETRO_EPOCHS} epochs with {RETRO_PAIRS:,.0f}",
+        f"effective pairs, Gaussian noise (sd {RETRO_VOLATILITY:g}pp) and a known",
+        f"trend; the retrospective read pools the last {RETRO_WINDOW} epochs and",
+        "compares the window's two halves, with the ROPE sized from its measured",
+        "`between_sd` (the `calibrate=True` policy). `flips` counts sign changes",
+        "between consecutive epoch movements — the flapping the window absorbs. A",
+        "sustained move clears the ROPE; noise mostly reads `stable` (the central",
+        "movement is inside the ROPE) or `insufficient` (it is outside but the",
+        "interval is too wide to place it), instead of alternating epoch verdicts.",
+        "",
+        "| true trend (pp/epoch) | P(stable) | P(improving) | P(regressing) | P(insufficient) | mean flips |",
+        "| ---: | ---: | ---: | ---: | ---: | ---: |",
+    ]
+    for trend, stable, improving, regressing, insufficient, flips in retrospective_rows:
+        lines.append(
+            f"| {trend:g} | {stable:.3f} | {improving:.3f} | {regressing:.3f} | "
+            f"{insufficient:.3f} | {flips:.2f} |"
+        )
+    lines += [
         "",
         "## Self-calibration of the regression prior",
         "",
@@ -776,6 +951,26 @@ def build_markdown() -> str:
         "which shrink toward zero. It is why the raw score and",
         "`difficulty_adjustment_pp` are always reported beside the adjusted one.",
         "",
+        "### One ability across outcomes",
+        "",
+        "A single fit spans outcomes: item difficulties stay outcome-specific, but",
+        "each view has one ability informed by every outcome it ran. The table",
+        "below gives the ability error for a **thin** outcome (few items) when it",
+        "is fitted alone versus when it borrows the same view's `wide` outcome",
+        f"({SHARED_WIDE_ITEMS} items); the truth is known to the simulation.",
+        "",
+        "| thin outcome items | thin-only ability RMSE | shared ability RMSE |",
+        "| ---: | ---: | ---: |",
+    ]
+    for thin, alone, shared in shared_rows:
+        lines.append(f"| {thin} | {alone:.3f} | {shared:.3f} |")
+    lines += [
+        "",
+        "Borrowing the view's other outcome cuts the thin outcome's ability error",
+        "by roughly half at two items and still by a third at eight. Outcome-level",
+        "difficulty is absorbed by that outcome's item easinesses, so the shared",
+        "ability is not biased by one outcome being uniformly harder.",
+        "",
         "## Shared-dependency incidents",
         "",
         "Cells tagged with the same `group` share an upstream dependency, so the",
@@ -803,6 +998,30 @@ def build_markdown() -> str:
         "prove alone and turns a broken dependency into one row and one flag,",
         "however many views it takes down. The per-cell gate still runs on every",
         "cell, so a single regressing view is never hidden by a healthy group.",
+        "",
+        "## Bank composition is not volatility",
+        "",
+        "A score can move because the views changed or because the bank did.",
+        "Timeline points now carry a digest of the scored item keys, so the band",
+        "estimates its between-epoch dispersion **within** each bank when the",
+        "digest changes; only same-bank points can contribute volatility.",
+        "`bank_stable` is `yes` when every point names the same bank, `no` when",
+        "they differ (or only some do), and `n/a` for legacy points with no bank",
+        "information, which keep the old whole-series estimate.",
+        "",
+        "| scenario | bank stable | between_sd | band width |",
+        "| :--- | :--- | ---: | ---: |",
+    ]
+    for name, bank_stable, between_sd, width in bank_rows:
+        label = "n/a" if bank_stable is None else ("yes" if bank_stable else "no")
+        lines.append(f"| {name} | {label} | {between_sd:.2f} | {width:.2f} |")
+    lines += [
+        "",
+        "The attrition row is the §7a reproduction: 60% on 100 pairs, then 75%",
+        "on the 80 that remain after 20 hard items were retired. Cross-bank",
+        "scoring booked `between_sd = 9.46` for that pure composition change; the",
+        "bank digest now reads it as no between-epoch movement. The legacy row",
+        "shows the old behaviour is retained where composition is unknown.",
         "",
         "## Heterogeneity cannot read as improving",
         "",

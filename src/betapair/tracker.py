@@ -48,6 +48,15 @@ observed under two views is **one** item. The caller owns that contract (the
 ``item`` string must be stable and shared across views); :meth:`item_responses`
 exposes the resolved rows under it. See :mod:`betapair.irt`.
 
+Item identity has a second guard: pass a content fingerprint beside the id
+(``observe(..., fingerprint=...)``, usually ``irt.item_fingerprint(outcome, text)``)
+and the tracker records the first fingerprint seen for ``(outcome, item)``. A
+later observation of the same id with different content becomes an
+:class:`~betapair.irt.ItemDrift` row on :attr:`HealthTracker.drift` and in the
+report — the id still refers to two questions, but it is never silent. The
+first fingerprint wins, including across :meth:`merge` and :meth:`advance`, so
+a restart or an epoch roll cannot re-baseline an edited question.
+
 Categories are per **stratum**, not per item: pass
 ``categories={"model_a": "tier-1"}`` once, or bind one later with
 :meth:`set_category`. ``category_weights`` then says how much each category
@@ -76,16 +85,19 @@ from dataclasses import dataclass
 from typing import Literal
 
 from betapair.hierarchy import DRAWS, PPC_DRAWS, Cell
-from betapair.irt import DEFAULT_SIGMA, ItemKey, ItemResponse, ReferenceBank
+from betapair.irt import DEFAULT_SIGMA, ItemDrift, ItemKey, ItemResponse, ReferenceBank, bank_digest
 from betapair.report import (
     DEFAULT_CATEGORY,
     CellCoverage,
     HealthReport,
+    ReportOptions,
+    RetrospectiveWindow,
     UnpairedCell,
     build_report,
     weighting,
 )
 from betapair.series import ScoreBand, ScorePoint, score_band
+from betapair.series import retrospective as _retrospective
 
 #: Snapshot *format* version — internal to the JSON payload and independent
 #: of the package version in ``pyproject.toml``. It moves when the payload
@@ -93,7 +105,9 @@ from betapair.series import ScoreBand, ScorePoint, score_band
 #: rejects any other version. Within a version, additive keys are fine:
 #: a v3 payload with no ``timeline`` still loads, defaulted to empty, and one
 #: with no ``retired_ledger`` loads with an empty ledger. ``groups`` joined the
-#: same way: absent means no view has a shared-dependency label.
+#: same way: absent means no view has a shared-dependency label, and
+#: ``fingerprints``/``drift`` are additive too — absent means none were
+#: supplied or observed.
 SNAPSHOT_VERSION = 3
 
 
@@ -379,6 +393,47 @@ def _record_rows(value: object) -> list[list[object]]:
     return rows
 
 
+def _fingerprint_rows(value: object) -> list[tuple[str, str, str]]:
+    """Validate the snapshot's ``[outcome, item, fingerprint]`` rows."""
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise ValueError(f"snapshot fingerprints must be a list, got {value!r}")
+    rows: list[tuple[str, str, str]] = []
+    for raw in value:
+        if not isinstance(raw, list) or len(raw) != 3:
+            raise ValueError(
+                f"snapshot fingerprints must be [outcome, item, fingerprint], got {raw!r}"
+            )
+        outcome, item, fingerprint = raw
+        if not all(isinstance(part, str) and part for part in (outcome, item, fingerprint)):
+            raise ValueError(f"snapshot fingerprint fields must be non-empty strings, got {raw!r}")
+        rows.append((outcome, item, fingerprint))
+    return rows
+
+
+def _drift_rows(value: object) -> list[tuple[str, str, str, str]]:
+    """Validate the snapshot's ``[outcome, item, expected, observed]`` rows."""
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise ValueError(f"snapshot drift must be a list, got {value!r}")
+    rows: list[tuple[str, str, str, str]] = []
+    for raw in value:
+        if not isinstance(raw, list) or len(raw) != 4:
+            raise ValueError(
+                f"snapshot drift rows must be [outcome, item, expected, observed], got {raw!r}"
+            )
+        parts = raw
+        if not all(isinstance(part, str) and part for part in parts):
+            raise ValueError(f"snapshot drift fields must be non-empty strings, got {raw!r}")
+        outcome, item, expected, observed = parts
+        if expected == observed:
+            raise ValueError(f"snapshot drift row needs two different fingerprints, got {raw!r}")
+        rows.append((outcome, item, expected, observed))
+    return rows
+
+
 def _ledger_rows(value: object) -> list[list[object]]:
     """Validate the retirement ledger's ``[stratum, outcome, item, last]`` rows."""
     if value is None:
@@ -427,6 +482,14 @@ class PairRecord:
     item: str
     baseline: Side
     candidate: Side
+    fingerprint: str | None = None
+    """Optional content fingerprint of the question (see
+    :func:`betapair.irt.item_fingerprint`).
+
+    ``None`` means the caller did not supply one. When supplied, the tracker
+    keeps the first fingerprint seen for ``(outcome, item)`` and reports any
+    later id whose content changed.
+    """
 
 
 class HealthTracker:
@@ -538,6 +601,10 @@ class HealthTracker:
         views changing. ``None`` means the item was withdrawn before it was
         ever measured in a paired epoch.
         """
+        self._fingerprints: dict[ItemKey, str] = {}
+        self._drift: dict[tuple[str, str, str], ItemDrift] = {}
+        """Content drift, keyed by ``(outcome, item, observed)`` so repeated
+        observations of the same changed content do not duplicate the row."""
 
     def observe(
         self,
@@ -546,6 +613,7 @@ class HealthTracker:
         item: str,
         baseline: Side,
         candidate: Side,
+        fingerprint: str | None = None,
     ) -> None:
         """Record (or overwrite) one item's paired outcome.
 
@@ -556,20 +624,34 @@ class HealthTracker:
             underlying question across views and epochs, because
             :meth:`item_responses` keys items globally by
             ``(outcome, item)`` — see :mod:`betapair.irt`.
+        @param fingerprint: Optional content fingerprint of the question, from
+            :func:`betapair.irt.item_fingerprint`. The first value seen for
+            ``(outcome, item)`` is remembered; a later different value is
+            recorded as an :class:`~betapair.irt.ItemDrift` rather than
+            silently re-keying the row.
         @param baseline: PASS/FAIL in the baseline epoch, ``None`` if not run,
             :data:`ERROR` if the harness failed to evaluate it, or
             :data:`FAILED` if the view itself failed.
         @param candidate: PASS/FAIL in the candidate epoch, ``None`` if
             pending, :data:`ERROR` if the harness failed to evaluate it, or
             :data:`FAILED` if the view itself failed.
-        @raise ValueError: If any of ``stratum``/``outcome``/``item`` is empty.
+        @raise ValueError: If any of ``stratum``/``outcome``/``item`` is empty,
+            or ``fingerprint`` is an empty string.
         """
         if not stratum or not outcome or not item:
             raise ValueError("stratum, outcome and item must be non-empty")
+        if fingerprint is not None and not fingerprint:
+            raise ValueError("fingerprint must be non-empty when set")
         key = (stratum, outcome)
         baseline_side = _check_side(baseline, "baseline")
         candidate_side = _check_side(candidate, "candidate")
         self._records.setdefault(key, {})[item] = (baseline_side, candidate_side)
+        if fingerprint is not None:
+            expected = self._fingerprints.setdefault((outcome, item), fingerprint)
+            if expected != fingerprint:
+                self._drift[(outcome, item, fingerprint)] = ItemDrift(
+                    outcome=outcome, item=item, expected=expected, observed=fingerprint
+                )
         if _retired(baseline_side) or _retired(candidate_side):
             self.retired_ledger.setdefault(key, {})[item] = _last_result(
                 candidate_side, baseline_side
@@ -644,6 +726,7 @@ class HealthTracker:
                 record.item,
                 record.baseline,
                 record.candidate,
+                record.fingerprint,
             )
         return len(records)
 
@@ -718,6 +801,16 @@ class HealthTracker:
                 self.groups.setdefault(stratum, group)
             for category, weight in other.category_weights.items():
                 self.category_weights.setdefault(category, weight)
+        # Identity is first-seen, not a preference: an existing fingerprint is
+        # never rewritten by a merge, and a disagreement becomes a drift row.
+        for (outcome, item), fingerprint in other._fingerprints.items():
+            expected = self._fingerprints.setdefault((outcome, item), fingerprint)
+            if expected != fingerprint:
+                self._drift[(outcome, item, fingerprint)] = ItemDrift(
+                    outcome=outcome, item=item, expected=expected, observed=fingerprint
+                )
+        for row in other._drift.values():
+            self._drift.setdefault((row.outcome, row.item, row.observed), row)
 
     def advance(
         self,
@@ -787,12 +880,27 @@ class HealthTracker:
         if pairs <= 0.0:
             return None
         passed = sum(policy.weight(cell) * cell.passed for cell in cells)
+        score = 100.0 * passed / pairs
+        bank = bank_digest(
+            [
+                (outcome, item)
+                for (_stratum, outcome), items in self._records.items()
+                for item, (baseline, candidate) in items.items()
+                if _state(baseline, candidate) == "paired"
+            ]
+        )
         return ScorePoint(
-            score=100.0 * passed / pairs,
+            score=score,
             epoch=self.candidate_epoch if epoch is None else epoch,
             pairs=pairs,
             pi_mean=self._last_pi_mean,
             unresolved_share=self._unresolved_share(),
+            # The held level is the score itself until an item leaves the bank.
+            score_held=score if self.retired == 0 else None,
+            paired=self.paired,
+            retired=self.retired,
+            failed=self.failed,
+            bank=bank,
         )
 
     def record_score(self, *, epoch: str | None = None) -> ScorePoint | None:
@@ -861,6 +969,25 @@ class HealthTracker:
     def retired(self) -> int:
         """Records withdrawn from the bank in the current epoch."""
         return self._count("retired")
+
+    @property
+    def drift(self) -> list[ItemDrift]:
+        """Item ids whose content fingerprint changed, sorted for determinism.
+
+        Empty unless a fingerprint was supplied to :meth:`observe` and a later
+        observation of the same ``(outcome, item)`` carried a different one.
+        The first fingerprint seen is the reference; it survives
+        :meth:`advance`, :meth:`merge` and a snapshot round-trip, so an edited
+        question is reported however the tracker is resumed.
+        """
+        return [
+            self._drift[key]
+            for key in sorted(self._drift, key=lambda key: (key[0], key[1], key[2]))
+        ]
+
+    def fingerprint_of(self, outcome: str, item: str) -> str | None:
+        """The first content fingerprint recorded for a global item, if any."""
+        return self._fingerprints.get((outcome, item))
 
     def held_counts(self) -> dict[CellKey, tuple[int, int]]:
         """Retired items per cell with a known outcome, as ``(items, passes)``.
@@ -1024,6 +1151,37 @@ class HealthTracker:
                 )
         return out
 
+    def retrospective(
+        self,
+        *,
+        window: int | None = None,
+        rope_pp: float | None = None,
+        level: float | None = None,
+    ) -> RetrospectiveWindow:
+        """Pool the last few timeline epochs into one stabilised reading.
+
+        Uses this tracker's :attr:`timeline` (the epochs :meth:`advance` has
+        recorded) and its configured ROPE/interval coverage. The level is the
+        pair-mass pooled score of the window; the verdict compares the window's
+        two halves, so a genuinely moving metric still says so while a noisy one
+        stops alternating. This is a level-only reading and never overrides a
+        credible per-cell regression in :meth:`report`.
+
+        @param window: Points to keep from the end of the timeline; ``None``
+            uses every recorded epoch.
+        @param rope_pp: ROPE override, in percentage points.
+        @param level: Interval mass override.
+        @raise ValueError: If the timeline is empty, has no effective pair
+            count, or an argument is out of range (see
+            :func:`betapair.series.retrospective`).
+        """
+        return _retrospective(
+            self.timeline,
+            window=window,
+            rope_pp=self.rope_pp if rope_pp is None else rope_pp,
+            level=self.prob_interval if level is None else level,
+        )
+
     def report(
         self,
         *,
@@ -1034,6 +1192,7 @@ class HealthTracker:
         rope_pp: float | None = None,
         max_unresolved_share: float | None = None,
         calibrate: bool = False,
+        retrospective_window: int | None = None,
         adjust_difficulty: bool | None = None,
         reference_items: Sequence[ItemKey] | None = None,
         reference_bank: ReferenceBank | None = None,
@@ -1044,6 +1203,9 @@ class HealthTracker:
             :attr:`timeline` instead of the hand-set defaults (see
             :class:`~betapair.report.Calibration`). Off by default, so a
             report is unchanged until a caller opts in.
+        @param retrospective_window: Attach a stabilised read of the most recent
+            this-many timeline points to ``HealthReport.retrospective``. The
+            headline status is unchanged; see :meth:`retrospective`.
         @param adjust_difficulty: Fit the difficulty model and report an
             equated level (see :func:`betapair.report.build_report`). ``None``
             uses this tracker's own :attr:`adjust_difficulty` config; the
@@ -1059,8 +1221,7 @@ class HealthTracker:
             from this one.
         """
         adjust = self.adjust_difficulty if adjust_difficulty is None else adjust_difficulty
-        report = build_report(
-            self.cells(),
+        options = ReportOptions(
             weights=self.weights,
             category_weights=self.category_weights,
             default_category=self.default_category,
@@ -1081,6 +1242,7 @@ class HealthTracker:
             retired=self.retired,
             coverage=self.coverage(),
             held_counts=self.held_counts(),
+            drift=self.drift,
             max_unresolved_share=(
                 self.max_unresolved_share if max_unresolved_share is None else max_unresolved_share
             ),
@@ -1088,6 +1250,7 @@ class HealthTracker:
             candidate_epoch=self.candidate_epoch,
             history=self.timeline,
             calibrate=calibrate,
+            retrospective_window=retrospective_window,
             unpaired_cells=self.unpaired_cells(),
             responses=self.item_responses() if adjust else None,
             adjust_difficulty=adjust,
@@ -1096,6 +1259,7 @@ class HealthTracker:
             sigma_theta=self.sigma_theta,
             sigma_d=self.sigma_d,
         )
+        report = build_report(self.cells(), options=options)
         self._last_pi_mean = report.pi_mean
         return report
 
@@ -1147,6 +1311,11 @@ class HealthTracker:
                 for (stratum, outcome), items in sorted(self.retired_ledger.items())
                 for item, last in sorted(items.items())
             ],
+            "fingerprints": [
+                [outcome, item, fingerprint]
+                for (outcome, item), fingerprint in sorted(self._fingerprints.items())
+            ],
+            "drift": [[row.outcome, row.item, row.expected, row.observed] for row in self.drift],
         }
 
     @classmethod
@@ -1218,6 +1387,32 @@ class HealthTracker:
                 )
             key = (str(stratum), str(outcome))
             tracker.retired_ledger.setdefault(key, {})[str(item)] = last
+        for outcome, item, fingerprint in _fingerprint_rows(payload.get("fingerprints")):
+            known = tracker._fingerprints.get((outcome, item))
+            if known is None:
+                tracker._fingerprints[(outcome, item)] = fingerprint
+            elif known != fingerprint:
+                raise ValueError(
+                    "snapshot fingerprints disagree for "
+                    f"{outcome}/{item}: {known!r} != {fingerprint!r}"
+                )
+        for outcome, item, expected, observed in _drift_rows(payload.get("drift")):
+            known = tracker._fingerprints.get((outcome, item))
+            if known is None:
+                tracker._fingerprints[(outcome, item)] = expected
+            elif known != expected:
+                raise ValueError(
+                    "snapshot drift row disagrees with the canonical fingerprint for "
+                    f"{outcome}/{item}: {expected!r} != {known!r}"
+                )
+            row = ItemDrift(outcome=outcome, item=item, expected=expected, observed=observed)
+            prior = tracker._drift.get((outcome, item, observed))
+            if prior is not None and prior != row:
+                raise ValueError(
+                    "snapshot drift rows disagree for "
+                    f"{outcome}/{item} -> {observed}: {prior.expected!r} != {expected!r}"
+                )
+            tracker._drift[(outcome, item, observed)] = row
         raw_timeline = payload.get("timeline", [])
         if not isinstance(raw_timeline, list):
             raise ValueError(f"snapshot timeline must be a list, got {raw_timeline!r}")

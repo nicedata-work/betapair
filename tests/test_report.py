@@ -5,7 +5,7 @@ from __future__ import annotations
 import random
 import unittest
 
-from betapair import DEFAULT_CATEGORY, ItemResponse, ReferenceBank, bank_digest
+from betapair import DEFAULT_CATEGORY, ItemDrift, ItemResponse, ReferenceBank, bank_digest
 from betapair.hierarchy import Cell
 from betapair.report import (
     COVERAGE_MARGIN,
@@ -21,6 +21,7 @@ from betapair.report import (
     Calibration,
     CellCoverage,
     HealthReport,
+    ReportOptions,
     UnpairedCell,
     _score_interval,
     build_report,
@@ -762,6 +763,53 @@ class ThresholdConsistencyTest(unittest.TestCase):
     def test_rope_must_be_non_negative(self) -> None:
         with self.assertRaises(ValueError):
             build_report([cell("a", 8, 2, 20)], rope_pp=-1.0, **FAST)
+
+
+class ReportOptionsTest(unittest.TestCase):
+    """The shared config bundle validates where it is set, not where it is used."""
+
+    def test_options_bundle_matches_keyword_arguments(self) -> None:
+        cells = [cell("a", 3, 1, 10), cell("b", 1, 2, 10)]
+        self.assertEqual(
+            build_report(cells, options=ReportOptions(**FAST)).model_dump(),
+            build_report(cells, **FAST).model_dump(),
+        )
+
+    def test_options_and_overrides_are_mutually_exclusive(self) -> None:
+        with self.assertRaises(TypeError):
+            build_report([cell("a", 1, 1, 4)], options=ReportOptions(), alpha=0.1)
+
+    def test_alpha_must_be_in_range(self) -> None:
+        with self.assertRaises(ValueError):
+            ReportOptions(alpha=0.9)
+
+    def test_rope_must_be_non_negative(self) -> None:
+        with self.assertRaises(ValueError):
+            ReportOptions(rope_pp=-1.0)
+
+    def test_coverage_threshold_must_be_a_share(self) -> None:
+        with self.assertRaises(ValueError):
+            ReportOptions(max_unresolved_share=1.5)
+
+    def test_unresolved_share_must_be_a_share(self) -> None:
+        with self.assertRaises(ValueError):
+            ReportOptions(unresolved_share=2.0)
+
+    def test_reference_bank_and_items_are_mutually_exclusive(self) -> None:
+        with self.assertRaises(ValueError):
+            ReportOptions(
+                reference_items=[("answer", "q1")],
+                reference_bank=ReferenceBank("ref", "v1", (("answer", "q1"),)),
+            )
+
+    def test_retrospective_window_must_be_positive(self) -> None:
+        with self.assertRaises(ValueError):
+            ReportOptions(retrospective_window=0)
+
+    def test_all_muted_weights_take_the_insufficient_path(self) -> None:
+        report = build_report([cell("a", 3, 1, 10)], weights={"answer": 0.0}, **FAST)
+        self.assertEqual(report.status, "insufficient")
+        self.assertEqual(report.guardrail.reason, "all outcome weights are zero")
 
 
 class CoverageGateTest(unittest.TestCase):
@@ -1567,6 +1615,226 @@ class ReferenceBankTest(unittest.TestCase):
         self.assertEqual(restored.irt, report.irt)
         assert restored.irt is not None and restored.irt.reference is not None
         self.assertEqual(restored.irt.reference.name, "standard")
+
+
+class DriftReportTest(unittest.TestCase):
+    """Content-fingerprint drift is reported, never gated or re-keyed."""
+
+    def test_no_drift_is_empty(self) -> None:
+        self.assertEqual(build_report([cell("a", 4, 1, 20)], **FAST).drift, [])
+
+    def test_drift_is_sorted_and_deduplicated(self) -> None:
+        later = ItemDrift("answer", "q2", "fp1_a", "fp1_b")
+        first = ItemDrift("answer", "q1", "fp1_c", "fp1_d")
+        report = build_report([cell("a", 4, 1, 20)], drift=[later, first, later], **FAST)
+        self.assertEqual(report.drift, [first, later])
+        # Reported, not gated: the level, delta and verdict are unchanged.
+        baseline = build_report([cell("a", 4, 1, 20)], **FAST)
+        self.assertEqual(report.score, baseline.score)
+        self.assertEqual(report.delta_pp, baseline.delta_pp)
+        self.assertEqual(report.status, baseline.status)
+
+    def test_json_round_trip_keeps_drift(self) -> None:
+        row = ItemDrift("answer", "q1", "fp1_a", "fp1_b")
+        report = build_report([cell("a", 4, 1, 20)], drift=[row], **FAST)
+        restored = HealthReport.model_validate_json(report.model_dump_json())
+        self.assertEqual(restored.drift, [row])
+        self.assertEqual(restored.version, REPORT_VERSION)
+
+
+def _disjoint_banks() -> tuple[list[Cell], list[ItemResponse]]:
+    """Two views on banks that share no item, so linking is prior-only."""
+    cells = [
+        cell("a", improved=10, regressed=0, pairs=20, unchanged_pass=0),
+        cell("b", improved=10, regressed=0, pairs=20, unchanged_pass=10),
+    ]
+    responses = [
+        ItemResponse("a", "answer", f"a{index}", index % 2 == 0) for index in range(20)
+    ] + [ItemResponse("b", "answer", f"b{index}", index % 2 == 0) for index in range(20)]
+    return cells, responses
+
+
+class SharedItemsReportTest(unittest.TestCase):
+    """C3: zero shared items must be stated, not left implicit."""
+
+    def test_linked_banks_report_the_overlap(self) -> None:
+        cells, responses = _difficulty_banks()
+        report = build_report(cells, adjust_difficulty=True, responses=responses, **FAST)
+        assert report.irt is not None
+        self.assertEqual(report.irt.shared_items, 10)
+        self.assertFalse(report.irt.prior_only)
+        self.assertTrue(report.irt.connected)
+
+    def test_disjoint_banks_say_the_comparison_is_prior_only(self) -> None:
+        cells, responses = _disjoint_banks()
+        report = build_report(cells, adjust_difficulty=True, responses=responses, **FAST)
+        assert report.irt is not None
+        self.assertEqual(report.irt.shared_items, 0)
+        self.assertTrue(report.irt.prior_only)
+        self.assertFalse(report.irt.connected)
+        self.assertEqual(report.irt.weakest_link, 0)
+
+    def test_a_single_view_is_not_prior_only(self) -> None:
+        only = cell("only", improved=10, regressed=0, pairs=20, unchanged_pass=5)
+        responses = [
+            ItemResponse("only", "answer", f"q{index}", index % 2 == 0) for index in range(20)
+        ]
+        report = build_report([only], adjust_difficulty=True, responses=responses, **FAST)
+        assert report.irt is not None
+        self.assertEqual(report.irt.shared_items, 0)
+        self.assertFalse(report.irt.prior_only)
+
+    def test_the_linking_diagnostic_round_trips_json(self) -> None:
+        cells, responses = _disjoint_banks()
+        report = build_report(cells, adjust_difficulty=True, responses=responses, **FAST)
+        restored = HealthReport.model_validate_json(report.model_dump_json())
+        self.assertEqual(restored.irt, report.irt)
+        self.assertEqual(restored.version, REPORT_VERSION)
+        assert restored.irt is not None
+        self.assertTrue(restored.irt.prior_only)
+
+
+class RetrospectiveReportTest(unittest.TestCase):
+    """The windowed read is opt-in, additive, and never overrides the gate."""
+
+    @staticmethod
+    def _history() -> list[ScorePoint]:
+        return [
+            ScorePoint(score=40.0 + 2 * index, pairs=5000.0, epoch=f"e{index}")
+            for index in range(6)
+        ]
+
+    def test_off_by_default(self) -> None:
+        report = build_report([cell("a", 4, 1, 20)], history=self._history(), **FAST)
+        self.assertIsNone(report.retrospective)
+
+    def test_a_window_is_attached_when_asked(self) -> None:
+        report = build_report(
+            [cell("a", 4, 1, 20)], history=self._history(), retrospective_window=6, **FAST
+        )
+        assert report.retrospective is not None
+        self.assertEqual(report.retrospective.points, 6)
+        self.assertEqual(report.retrospective.status, "improving")
+        self.assertEqual(report.retrospective.window, 6)
+
+    def test_an_empty_history_yields_none(self) -> None:
+        report = build_report([cell("a", 4, 1, 20)], history=[], retrospective_window=3, **FAST)
+        self.assertIsNone(report.retrospective)
+
+    def test_a_bad_window_is_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            build_report(
+                [cell("a", 4, 1, 20)], history=self._history(), retrospective_window=0, **FAST
+            )
+
+    def test_a_windowed_stable_does_not_hide_a_flagged_regression(self) -> None:
+        history = [ScorePoint(score=50.0, pairs=5000.0) for _ in range(4)]
+        report = build_report(
+            [cell("bad", 0, 20, 20)], history=history, retrospective_window=4, **FAST
+        )
+        assert report.retrospective is not None
+        self.assertEqual(report.retrospective.status, "stable")
+        self.assertEqual(report.status, "regressing")
+
+    def test_json_round_trip_keeps_the_window(self) -> None:
+        report = build_report(
+            [cell("a", 4, 1, 20)], history=self._history(), retrospective_window=4, **FAST
+        )
+        restored = HealthReport.model_validate_json(report.model_dump_json())
+        self.assertEqual(restored.retrospective, report.retrospective)
+        self.assertEqual(restored.version, REPORT_VERSION)
+
+
+class TimelineCompositionTest(unittest.TestCase):
+    """A timeline point carries the bank composition behind its score."""
+
+    def test_from_report_carries_counts_and_the_held_level(self) -> None:
+        cells = [cell("a", 4, 1, 20)]
+        coverage = [CellCoverage(stratum="a", outcome="answer", paired=20)]
+        report = build_report(cells, coverage=coverage, retired=3, failed=2, **FAST)
+        point = ScorePoint.from_report(report)
+        assert point is not None
+        self.assertEqual(point.paired, 20)
+        self.assertEqual(point.retired, 3)
+        self.assertEqual(point.failed, 2)
+        self.assertEqual(point.score_held, report.score_held)
+        self.assertIsNone(point.bank)
+
+    def test_an_unscored_report_is_still_not_a_point(self) -> None:
+        self.assertIsNone(ScorePoint.from_report(build_report([], **FAST)))
+
+
+class SharedAbilityReportTest(unittest.TestCase):
+    """F1: one ability per view across outcomes, items stay outcome-specific."""
+
+    @staticmethod
+    def _banks() -> tuple[list[Cell], list[ItemResponse]]:
+        rng = random.Random(9)
+        responses = []
+        for view in ("a", "b"):
+            responses += [
+                ItemResponse(view, "answer", f"a{index}", rng.random() < 0.6) for index in range(10)
+            ]
+            responses += [
+                ItemResponse(view, "spec", f"s{index}", rng.random() < 0.4) for index in range(3)
+            ]
+        cells = [
+            cell("a", 6, 4, 10, outcome="answer"),
+            cell("b", 6, 4, 10, outcome="answer"),
+            cell("a", 1, 2, 3, outcome="spec"),
+            cell("b", 1, 2, 3, outcome="spec"),
+        ]
+        return cells, responses
+
+    def test_one_fit_covers_every_outcome(self) -> None:
+        cells, responses = self._banks()
+        report = build_report(cells, adjust_difficulty=True, responses=responses, **FAST)
+        assert report.irt is not None
+        self.assertEqual(report.irt.outcomes, ["answer", "spec"])
+        self.assertEqual(report.irt.observed_pairs, len(responses))
+        self.assertEqual(report.irt.items, 13)
+        self.assertIsNotNone(report.score_adjusted)
+
+    def test_every_cell_gets_an_equated_rate(self) -> None:
+        cells, responses = self._banks()
+        report = build_report(cells, adjust_difficulty=True, responses=responses, **FAST)
+        equated = {
+            (row.stratum, row.outcome)
+            for row in report.contributions
+            if row.equated_pass_rate is not None
+        }
+        self.assertEqual(equated, {cell.key for cell in cells})
+
+    def test_a_pinned_bank_still_resolves_per_outcome(self) -> None:
+        cells, responses = self._banks()
+        bank = ReferenceBank.from_responses(responses, name="std", version="1")
+        report = build_report(
+            cells,
+            adjust_difficulty=True,
+            responses=responses,
+            reference_bank=bank,
+            **FAST,
+        )
+        assert report.irt is not None and report.irt.reference is not None
+        self.assertEqual(report.irt.reference.available, 13)
+        self.assertEqual(report.irt.reference.items, 13)
+
+    def test_a_pin_naming_an_unfitted_item_is_rejected(self) -> None:
+        cells, responses = self._banks()
+        with self.assertRaises(ValueError):
+            build_report(
+                cells,
+                adjust_difficulty=True,
+                responses=responses,
+                reference_items=[("answer", "missing")],
+                **FAST,
+            )
+
+    def test_the_shared_fit_is_deterministic(self) -> None:
+        cells, responses = self._banks()
+        first = build_report(cells, adjust_difficulty=True, responses=responses, **FAST)
+        second = build_report(cells, adjust_difficulty=True, responses=responses, **FAST)
+        self.assertEqual(first.model_dump_json(), second.model_dump_json())
 
 
 if __name__ == "__main__":

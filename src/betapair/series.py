@@ -29,12 +29,13 @@ import math
 import statistics
 from collections.abc import Iterable
 from dataclasses import dataclass
+from itertools import pairwise
 from statistics import NormalDist
 
 from betapair.beta import beta_ppf
-from betapair.report import HealthReport
+from betapair.models import HealthReport, RetrospectiveWindow, Status
 
-__all__ = ["ScoreBand", "ScorePoint", "score_band"]
+__all__ = ["RetrospectiveWindow", "ScoreBand", "ScorePoint", "retrospective", "score_band"]
 
 
 @dataclass(frozen=True)
@@ -55,6 +56,13 @@ class ScorePoint:
     (pending or harness-errored) when the point was recorded. It is ``None``
     for a bare score and is the observed distribution the next epoch's
     coverage threshold is calibrated from.
+
+    The remaining fields record the **bank** the score was computed on, so a
+    later band can tell a real move from a composition change: ``score_held``
+    is the level with retired items held at their last outcome,
+    ``paired``/``retired``/``failed`` are item counts, and ``bank`` is a digest
+    of the active (scored) item keys. All are optional — a bare score carries
+    none — and additive in the snapshot.
     """
 
     score: float
@@ -64,6 +72,11 @@ class ScorePoint:
     high: float | None = None
     pi_mean: float | None = None
     unresolved_share: float | None = None
+    score_held: float | None = None
+    paired: int | None = None
+    retired: int | None = None
+    failed: int | None = None
+    bank: str | None = None
 
     @classmethod
     def from_report(cls, report: HealthReport) -> ScorePoint | None:
@@ -83,6 +96,10 @@ class ScorePoint:
             high=report.score_high,
             pi_mean=report.pi_mean,
             unresolved_share=report.unresolved_share,
+            score_held=report.score_held,
+            paired=report.coverage.paired,
+            retired=report.retired,
+            failed=report.failed,
         )
 
     def interval(self, level: float = 0.95) -> tuple[float, float]:
@@ -119,6 +136,11 @@ class ScorePoint:
             "high": self.high,
             "pi_mean": self.pi_mean,
             "unresolved_share": self.unresolved_share,
+            "score_held": self.score_held,
+            "paired": self.paired,
+            "retired": self.retired,
+            "failed": self.failed,
+            "bank": self.bank,
         }
 
     @classmethod
@@ -136,6 +158,9 @@ class ScorePoint:
         high = _optional_number(payload.get("high"), "high")
         if (low is None) != (high is None):
             raise ValueError("score point needs both low and high, or neither")
+        score_held = _optional_number(payload.get("score_held"), "score_held")
+        if score_held is not None and not 0.0 <= score_held <= 100.0:
+            raise ValueError(f"score point score_held must be in [0, 100], got {score_held}")
         return cls(
             score=_number(payload.get("score"), "score"),
             epoch=epoch,
@@ -144,6 +169,11 @@ class ScorePoint:
             high=high,
             pi_mean=_optional_number(payload.get("pi_mean"), "pi_mean"),
             unresolved_share=_optional_number(payload.get("unresolved_share"), "unresolved_share"),
+            score_held=score_held,
+            paired=_optional_count(payload.get("paired"), "paired"),
+            retired=_optional_count(payload.get("retired"), "retired"),
+            failed=_optional_count(payload.get("failed"), "failed"),
+            bank=_optional_text(payload.get("bank"), "bank"),
         )
 
 
@@ -155,6 +185,14 @@ class ScoreBand:
     band around it. ``within_sd`` is the mean sampling noise of one epoch and
     ``between_sd`` the genuine epoch-to-epoch dispersion: when the whole
     observed spread is explained by sampling noise, ``between_sd`` is zero.
+
+    ``bank_stable`` says whether the points were all scored on the same bank:
+    ``True`` when every point carries a bank digest and they agree, ``False``
+    when the digests differ (or only some points carry one), and ``None`` when
+    no bank information was recorded at all. When it is ``False``, the
+    between-epoch dispersion is estimated **within** each bank only, so a
+    composition change (retiring hard items, adding new ones) is not booked as
+    genuine volatility; if no bank has two points, ``between_sd`` is zero.
     """
 
     center: float
@@ -165,6 +203,7 @@ class ScoreBand:
     within_sd: float
     between_sd: float
     window: int | None = None
+    bank_stable: bool | None = None
 
     @property
     def width(self) -> float:
@@ -191,6 +230,10 @@ def score_band(
         spread of an *individual* epoch's score, not the much narrower
         uncertainty of the mean. A single point has no dispersion to estimate,
         so it falls back to its own interval.
+    @note: When the points carry different bank digests, ``between_sd`` is
+        estimated within each bank only (see :attr:`ScoreBand.bank_stable`), so
+        attrition or a bank edit is not mistaken for volatility. Points with no
+        bank information keep the old whole-series estimate.
     @raise ValueError: On an empty (or fully unscored) series, a window below
         one, or a level outside (0, 1).
     """
@@ -206,6 +249,11 @@ def score_band(
 
     scores = [point.score for point in data]
     center = statistics.fmean(scores)
+    banks = [point.bank for point in data]
+    if all(bank is None for bank in banks):
+        bank_stable: bool | None = None
+    else:
+        bank_stable = all(bank is not None and bank == banks[0] for bank in banks)
     z = NormalDist().inv_cdf(0.5 + 0.5 * level)
     within_variance = statistics.fmean(
         (((high - low) / (2.0 * z)) ** 2 for low, high in (p.interval(level) for p in data))
@@ -223,9 +271,29 @@ def score_band(
             within_sd=within_sd,
             between_sd=0.0,
             window=window,
+            bank_stable=bank_stable,
         )
 
-    between_variance = max(0.0, statistics.variance(scores) - within_variance)
+    if bank_stable is False:
+        grouped: dict[str, list[ScorePoint]] = {}
+        for point in data:
+            if point.bank is not None:
+                grouped.setdefault(point.bank, []).append(point)
+        estimates = []
+        for members in grouped.values():
+            if len(members) < 2:
+                continue
+            member_scores = [point.score for point in members]
+            member_within = statistics.fmean(
+                (
+                    ((high - low) / (2.0 * z)) ** 2
+                    for low, high in (point.interval(level) for point in members)
+                )
+            )
+            estimates.append(max(0.0, statistics.variance(member_scores) - member_within))
+        between_variance = statistics.fmean(estimates) if estimates else 0.0
+    else:
+        between_variance = max(0.0, statistics.variance(scores) - within_variance)
     half_width = z * math.sqrt(between_variance + within_variance)
     return ScoreBand(
         center=center,
@@ -236,6 +304,7 @@ def score_band(
         within_sd=within_sd,
         between_sd=math.sqrt(between_variance),
         window=window,
+        bank_stable=bank_stable,
     )
 
 
@@ -269,3 +338,137 @@ def _optional_number(value: object, field: str) -> float | None:
     if value is None:
         return None
     return _number(value, field)
+
+
+def _optional_count(value: object, field: str) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"score point {field} must be an integer, got {value!r}")
+    if value < 0:
+        raise ValueError(f"score point {field} must be non-negative, got {value}")
+    return value
+
+
+def _optional_text(value: object, field: str) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"score point {field} must be non-empty text, got {value!r}")
+    return value
+
+
+def _pooled_level(points: list[ScorePoint], level: float) -> tuple[float, float, float] | None:
+    """Pair-mass pooled score and its Beta interval, or ``None`` without pairs."""
+    weighted = [point for point in points if point.pairs > 0.0]
+    if not weighted:
+        return None
+    pairs = math.fsum(point.pairs for point in weighted)
+    successes = math.fsum(point.pairs * point.score / 100.0 for point in weighted)
+    score = 100.0 * successes / pairs
+    low, high = ScorePoint(score=score, pairs=pairs).interval(level)
+    return score, low, high
+
+
+def _flips(scores: list[float]) -> int:
+    """Sign changes between consecutive movements, ignoring exact ties."""
+    signs = [
+        1 if later > earlier else -1 for earlier, later in pairwise(scores) if later != earlier
+    ]
+    return sum(1 for left, right in pairwise(signs) if left != right)
+
+
+def _trend(points: list[ScorePoint]) -> float | None:
+    """Pair-weighted least-squares slope of score on epoch index."""
+    weighted = [(index, point) for index, point in enumerate(points) if point.pairs > 0.0]
+    if len(weighted) < 2:
+        return None
+    total = math.fsum(point.pairs for _index, point in weighted)
+    mean_x = math.fsum(index * point.pairs for index, point in weighted) / total
+    mean_y = math.fsum(point.score * point.pairs for _index, point in weighted) / total
+    variance = math.fsum(point.pairs * (index - mean_x) ** 2 for index, point in weighted)
+    covariance = math.fsum(
+        point.pairs * (index - mean_x) * (point.score - mean_y) for index, point in weighted
+    )
+    return covariance / variance
+
+
+def retrospective(
+    points: Iterable[ScorePoint | HealthReport | float | int],
+    *,
+    window: int | None = None,
+    rope_pp: float = 1.0,
+    level: float = 0.95,
+) -> RetrospectiveWindow:
+    """Stabilise a score series over its most recent ``window`` epochs.
+
+    The level is the pair-mass pooled score of the window, with the same
+    ``Beta(1 + k, 1 + n - k)`` interval rule as the headline; the verdict
+    compares the pooled first and second halves, with the conservative
+    interval ``[second.low - first.high, second.high - first.low]`` against
+    ``rope_pp``. Requiring the whole interval to clear the ROPE is deliberately
+    cautious: a window is for cutting flapping, not for manufacturing a change.
+
+    @param points: The series — :class:`ScorePoint`, raw percentages, or
+        :class:`~betapair.report.HealthReport` objects (unscored reports are
+        skipped), like :func:`score_band`.
+    @param window: Keep only the most recent this-many points; ``None`` uses
+        the whole series.
+    @param rope_pp: Region of practical equivalence, in percentage points.
+    @param level: Mass of the level and half-comparison intervals.
+    @return: The windowed level, half-to-half change, trend, flips and verdict.
+    @note: This is a **level-only** reading. It cannot see the current epoch's
+        per-cell evidence, so it never hides a credible regression; the report's
+        own ``status`` remains authoritative.
+    @note: At least one point must carry an effective pair count (as every
+        tracker timeline point does); a bare ``ScorePoint(score=...)`` series
+        has nothing to pool.
+    @raise ValueError: On an empty series, a window below one, a negative ROPE,
+        a level outside (0, 1), or a series with no effective pairs.
+    """
+    if not 0.0 < level < 1.0:
+        raise ValueError(f"level must be in (0, 1), got {level}")
+    if rope_pp < 0.0:
+        raise ValueError(f"rope_pp must be non-negative, got {rope_pp}")
+    if window is not None and window < 1:
+        raise ValueError(f"window must be at least 1, got {window}")
+    data = _as_points(points)
+    if window is not None:
+        data = data[-window:]
+    if not data:
+        raise ValueError("retrospective needs at least one scored point")
+    pooled = _pooled_level(data, level)
+    if pooled is None:
+        raise ValueError("retrospective needs at least one point with pairs > 0")
+    score, score_low, score_high = pooled
+
+    delta = delta_low = delta_high = None
+    status: Status = "insufficient"
+    if len(data) >= 2:
+        cut = len(data) // 2
+        first = _pooled_level(data[:cut], level)
+        second = _pooled_level(data[cut:], level)
+        if first is not None and second is not None:
+            delta = second[0] - first[0]
+            delta_low = second[1] - first[2]
+            delta_high = second[2] - first[1]
+            if delta_high < -rope_pp:
+                status = "regressing"
+            elif delta_low > rope_pp:
+                status = "improving"
+            elif abs(delta) <= rope_pp:
+                status = "stable"
+
+    return RetrospectiveWindow(
+        score=score,
+        score_low=score_low,
+        score_high=score_high,
+        delta_pp=delta,
+        delta_low=delta_low,
+        delta_high=delta_high,
+        trend_pp=_trend(data),
+        flips=_flips([point.score for point in data]),
+        status=status,
+        points=len(data),
+        window=window,
+    )

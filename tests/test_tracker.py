@@ -6,7 +6,7 @@ import json
 import random
 import unittest
 
-from betapair import ERROR, FAILED, RETIRED, HealthTracker, PairRecord, ReferenceBank
+from betapair import ERROR, FAILED, RETIRED, HealthTracker, PairRecord, ReferenceBank, ScorePoint
 
 FAST = {"draws": 96, "ppc_draws": 96}
 
@@ -644,7 +644,7 @@ class RetiredStateTest(unittest.TestCase):
         share if retirement were folded into pending, which would gate the
         layer to ``insufficient``.
         """
-        tracker = HealthTracker(**FAST)
+        tracker = HealthTracker(seed=0, **FAST)
         for index in range(4):
             tracker.observe("v", "answer", f"keep{index}", False, True)
         for index in range(10):
@@ -1392,6 +1392,265 @@ class GroupRetirementInvariantTest(unittest.TestCase):
         self.assertEqual(a.retired_held, 48)
         assert a.composition_effect_pp is not None
         self.assertLess(a.composition_effect_pp, 0.0)
+
+
+class FingerprintDriftTest(unittest.TestCase):
+    """A content fingerprint guards global item identity, not the local row."""
+
+    def test_the_first_fingerprint_is_remembered_and_replays_are_quiet(self) -> None:
+        tracker = HealthTracker(**FAST)
+        tracker.observe("v", "answer", "q1", False, True, "fp1_aaa")
+        self.assertEqual(tracker.fingerprint_of("answer", "q1"), "fp1_aaa")
+        self.assertIsNone(tracker.fingerprint_of("answer", "q2"))
+        self.assertEqual(tracker.drift, [])
+        tracker.observe("v", "answer", "q1", False, True, "fp1_aaa")
+        self.assertEqual(tracker.drift, [])
+
+    def test_changed_content_is_deduplicated_drift_and_keeps_the_first(self) -> None:
+        tracker = HealthTracker(**FAST)
+        tracker.observe("v", "answer", "q1", False, True, "fp1_aaa")
+        tracker.observe("v", "answer", "q1", True, False, "fp1_bbb")
+        tracker.observe("v2", "answer", "q1", True, False, "fp1_bbb")  # same change
+        tracker.observe("v", "answer", "q1", False, False, "fp1_ccc")
+        self.assertEqual(tracker.fingerprint_of("answer", "q1"), "fp1_aaa")
+        self.assertEqual(
+            [(row.expected, row.observed) for row in tracker.drift],
+            [("fp1_aaa", "fp1_bbb"), ("fp1_aaa", "fp1_ccc")],
+        )
+        # Rows stay per-cell (v and v2); only the global identity drifts.
+        self.assertEqual(tracker.paired, 2)
+
+    def test_the_same_fingerprint_across_views_links_the_item(self) -> None:
+        tracker = HealthTracker(**FAST)
+        tracker.observe("v1", "answer", "q1", False, True, "fp1_aaa")
+        tracker.observe("v2", "answer", "q1", False, True, "fp1_aaa")
+        self.assertEqual(tracker.drift, [])
+
+    def test_outcomes_own_their_fingerprints(self) -> None:
+        tracker = HealthTracker(**FAST)
+        tracker.observe("v", "answer", "q1", False, True, "fp1_aaa")
+        tracker.observe("v", "sql_valid", "q1", False, True, "fp1_bbb")
+        self.assertEqual(tracker.drift, [])
+
+    def test_an_empty_fingerprint_is_rejected(self) -> None:
+        tracker = HealthTracker(**FAST)
+        with self.assertRaises(ValueError):
+            tracker.observe("v", "answer", "q1", False, True, "")
+
+    def test_observe_many_carries_the_fingerprint(self) -> None:
+        tracker = HealthTracker(**FAST)
+        tracker.observe_many(
+            [
+                PairRecord(
+                    stratum="v",
+                    outcome="answer",
+                    item="q1",
+                    baseline=False,
+                    candidate=True,
+                    fingerprint="fp1_aaa",
+                )
+            ]
+        )
+        self.assertEqual(tracker.fingerprint_of("answer", "q1"), "fp1_aaa")
+
+    def test_advance_keeps_the_identity_guard(self) -> None:
+        tracker = HealthTracker(seed=0, candidate_epoch="e1", **FAST)
+        tracker.observe("v", "answer", "q1", False, True, "fp1_aaa")
+        tracker.advance(baseline_epoch="e1", candidate_epoch="e2")
+        self.assertEqual(tracker.paired, 0)
+        tracker.observe("v", "answer", "q1", True, False, "fp1_bbb")
+        self.assertEqual(tracker.fingerprint_of("answer", "q1"), "fp1_aaa")
+        self.assertEqual(len(tracker.drift), 1)
+
+    def test_snapshot_round_trips_fingerprints_and_drift(self) -> None:
+        tracker = HealthTracker(seed=0, **FAST)
+        tracker.observe("v", "answer", "q1", False, True, "fp1_aaa")
+        tracker.observe("v2", "answer", "q1", True, False, "fp1_bbb")
+        restored = HealthTracker.from_json(tracker.to_json(), **FAST)
+        self.assertEqual(restored.snapshot(), tracker.snapshot())
+        self.assertEqual(restored.fingerprint_of("answer", "q1"), "fp1_aaa")
+        self.assertEqual(
+            [(row.expected, row.observed) for row in restored.drift],
+            [("fp1_aaa", "fp1_bbb")],
+        )
+        self.assertEqual(
+            [(row.item, row.observed) for row in tracker.report().drift], [("q1", "fp1_bbb")]
+        )
+
+    def test_merge_keeps_the_first_fingerprint_and_records_the_disagreement(self) -> None:
+        primary = HealthTracker(seed=0, **FAST)
+        primary.observe("v", "answer", "q1", False, True, "fp1_aaa")
+        secondary = HealthTracker(seed=0, **FAST)
+        secondary.observe("v2", "answer", "q1", False, True, "fp1_bbb")
+        primary.merge(secondary)
+        self.assertEqual(primary.fingerprint_of("answer", "q1"), "fp1_aaa")
+        self.assertEqual(
+            [(row.expected, row.observed) for row in primary.drift],
+            [("fp1_aaa", "fp1_bbb")],
+        )
+
+        # `prefer` decides the row, never the identity: the first binding stands.
+        fresh = HealthTracker(seed=0, **FAST)
+        fresh.observe("v", "answer", "q1", False, True, "fp1_aaa")
+        other = HealthTracker(seed=0, **FAST)
+        other.observe("v2", "answer", "q1", False, True, "fp1_bbb")
+        fresh.merge(other, prefer="self")
+        self.assertEqual(fresh.fingerprint_of("answer", "q1"), "fp1_aaa")
+        self.assertEqual(len(fresh.drift), 1)
+
+    def test_merge_fills_a_missing_fingerprint_without_drift(self) -> None:
+        primary = HealthTracker(seed=0, **FAST)
+        primary.observe("v", "answer", "q1", False, True)
+        secondary = HealthTracker(seed=0, **FAST)
+        secondary.observe("v2", "answer", "q1", False, True, "fp1_aaa")
+        primary.merge(secondary)
+        self.assertEqual(primary.fingerprint_of("answer", "q1"), "fp1_aaa")
+        self.assertEqual(primary.drift, [])
+
+    def test_a_drift_row_without_a_fingerprint_row_restores_its_canonical(self) -> None:
+        tracker = HealthTracker.from_snapshot(
+            {
+                "version": 3,
+                "records": [],
+                "drift": [["answer", "q1", "fp1_aaa", "fp1_bbb"]],
+            }
+        )
+        self.assertEqual(tracker.fingerprint_of("answer", "q1"), "fp1_aaa")
+        self.assertEqual(len(tracker.drift), 1)
+
+    def test_malformed_snapshot_fingerprints_and_drift_are_rejected(self) -> None:
+        for payload in (
+            {"version": 3, "records": [], "fingerprints": "nope"},
+            {"version": 3, "records": [], "fingerprints": [["answer"]]},
+            {"version": 3, "records": [], "fingerprints": [["answer", "q1"]]},
+            {"version": 3, "records": [], "fingerprints": [["", "q1", "fp1_a"]]},
+            {"version": 3, "records": [], "fingerprints": [["answer", "q1", 3]]},
+            {"version": 3, "records": [], "drift": "nope"},
+            {"version": 3, "records": [], "drift": [["answer", "q1", "fp1_a"]]},
+            {"version": 3, "records": [], "drift": [["", "q1", "fp1_a", "fp1_b"]]},
+            {"version": 3, "records": [], "drift": [["answer", "q1", "fp1_a", 3]]},
+            {"version": 3, "records": [], "drift": [["answer", "q1", "fp1_a", "fp1_a"]]},
+            {
+                "version": 3,
+                "records": [],
+                "fingerprints": [["answer", "q1", "fp1_a"]],
+                "drift": [["answer", "q1", "fp1_b", "fp1_c"]],
+            },
+            {
+                "version": 3,
+                "records": [],
+                "fingerprints": [["answer", "q1", "fp1_a"], ["answer", "q1", "fp1_b"]],
+            },
+            {
+                "version": 3,
+                "records": [],
+                "fingerprints": [["answer", "q1", "fp1_a"]],
+                "drift": [
+                    ["answer", "q1", "fp1_a", "fp1_b"],
+                    ["answer", "q1", "fp1_x", "fp1_b"],
+                ],
+            },
+        ):
+            with self.assertRaises(ValueError):
+                HealthTracker.from_snapshot(payload)
+
+
+class RetrospectiveTrackerTest(unittest.TestCase):
+    """The windowed read runs off the tracker's own timeline."""
+
+    @staticmethod
+    def _tracker(seed: int = 0) -> HealthTracker:
+        tracker = HealthTracker(seed=seed, **FAST)
+        tracker.timeline.extend(
+            ScorePoint(score=40.0 + 2 * index, pairs=5000.0, epoch=f"e{index}")
+            for index in range(6)
+        )
+        return tracker
+
+    def test_the_timeline_is_pooled_into_one_reading(self) -> None:
+        window = self._tracker().retrospective(window=6)
+        self.assertEqual(window.points, 6)
+        self.assertEqual(window.window, 6)
+        self.assertEqual(window.status, "improving")
+        self.assertGreater(window.score, 40.0)
+
+    def test_rope_and_level_can_be_overridden(self) -> None:
+        tracker = self._tracker()
+        self.assertEqual(tracker.retrospective(window=6, rope_pp=100.0).status, "stable")
+        self.assertEqual(tracker.retrospective(window=6, level=0.5).points, 6)
+        with self.assertRaises(ValueError):
+            tracker.retrospective(level=1.0)
+        with self.assertRaises(ValueError):
+            tracker.retrospective(window=0)
+
+    def test_an_empty_timeline_is_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            HealthTracker(**FAST).retrospective()
+
+    def test_report_attaches_the_window_from_the_timeline(self) -> None:
+        tracker = self._tracker()
+        tracker.observe("v", "answer", "q1", False, True)
+        report = tracker.report(retrospective_window=4)
+        assert report.retrospective is not None
+        self.assertEqual(report.retrospective.points, 4)
+        self.assertEqual(report.retrospective.status, "improving")
+        self.assertIsNone(tracker.report().retrospective)
+
+    def test_advance_records_points_the_window_can_read(self) -> None:
+        tracker = HealthTracker(seed=0, candidate_epoch="e0", **FAST)
+        for epoch in range(4):
+            for index in range(200):
+                tracker.observe("v", "answer", f"q{index}", False, index < 100 + 20 * epoch)
+            tracker.advance(baseline_epoch=f"e{epoch}", candidate_epoch=f"e{epoch + 1}")
+        self.assertEqual(len(tracker.timeline), 4)
+        window = tracker.retrospective(window=4)
+        self.assertEqual(window.points, 4)
+        self.assertEqual(window.status, "improving")
+
+
+class BankCompositionTest(unittest.TestCase):
+    """Timeline points carry the scored bank so attrition is not volatility."""
+
+    def test_timeline_records_the_bank_and_counts(self) -> None:
+        tracker = HealthTracker(seed=1, **FAST)
+        for index in range(10):
+            tracker.observe("v", "answer", f"q{index}", index < 5, index < 5)
+        point = tracker.record_score(epoch="e1")
+        assert point is not None
+        self.assertIsNotNone(point.bank)
+        self.assertEqual((point.paired, point.retired, point.failed), (10, 0, 0))
+        self.assertEqual(point.score_held, point.score)
+
+    def test_a_retired_bank_is_not_booked_as_volatility(self) -> None:
+        tracker = HealthTracker(seed=1, **FAST)
+        for index in range(100):
+            tracker.observe("v", "answer", f"q{index}", index < 60, index < 60)
+        tracker.record_score(epoch="e1")
+        for index in range(20):
+            tracker.retire("v", "answer", f"q{60 + index}")
+        for index in range(100):
+            if 60 <= index < 80:
+                continue
+            tracker.observe("v", "answer", f"q{index}", index < 60, index < 60)
+        tracker.record_score(epoch="e2")
+        band = tracker.score_band(window=2)
+        self.assertEqual([point.score for point in tracker.timeline], [60.0, 75.0])
+        self.assertEqual(tracker.timeline[1].retired, 20)
+        self.assertIsNone(tracker.timeline[1].score_held)
+        self.assertFalse(band.bank_stable)
+        self.assertEqual(band.between_sd, 0.0)
+
+    def test_a_stable_bank_keeps_the_old_band(self) -> None:
+        tracker = HealthTracker(seed=1, **FAST)
+        for index in range(100):
+            tracker.observe("v", "answer", f"q{index}", index < 60, index < 60)
+        tracker.record_score(epoch="e1")
+        for index in range(100):
+            tracker.observe("v", "answer", f"q{index}", index < 60, index < 75)
+        tracker.record_score(epoch="e2")
+        band = tracker.score_band(window=2)
+        self.assertTrue(band.bank_stable)
+        self.assertGreater(band.between_sd, 9.0)
 
 
 if __name__ == "__main__":

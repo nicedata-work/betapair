@@ -5,10 +5,12 @@ from __future__ import annotations
 import math
 import random
 import statistics
+import unicodedata
 import unittest
 from dataclasses import replace
 
 from betapair import (
+    ItemDrift,
     ItemResponse,
     RaschDiagnostics,
     RaschFit,
@@ -16,9 +18,11 @@ from betapair import (
     bank_digest,
     equated_rates,
     fit_rasch,
+    item_fingerprint,
     item_key,
 )
 from betapair.irt import (
+    FINGERPRINT_CHARS,
     SCHUR_MAX_VIEWS,
     ItemKey,
     _backtrack,
@@ -294,14 +298,50 @@ class EdgeCaseTest(unittest.TestCase):
                 ]
             )
 
-    def test_mixed_outcomes_are_rejected(self) -> None:
+    def test_outcomes_share_one_ability_per_view(self) -> None:
+        # "answer" says a is much stronger than b; "spec" says the opposite.
+        # The shared ability sits between the two independent estimates.
+        responses = [ItemResponse("a", "answer", f"q{index}", True) for index in range(20)] + [
+            ItemResponse("b", "answer", f"q{index}", False) for index in range(20)
+        ]
+        responses += [ItemResponse("a", "spec", f"s{index}", False) for index in range(2)]
+        responses += [ItemResponse("b", "spec", f"s{index}", True) for index in range(2)]
+        shared = fit_rasch(responses)
+        answer = fit_rasch([r for r in responses if r.outcome == "answer"])
+        spec = fit_rasch([r for r in responses if r.outcome == "spec"])
+        self.assertEqual(shared.outcomes, ("answer", "spec"))
+        shared_gap = shared.abilities["a"] - shared.abilities["b"]
+        self.assertLess(shared_gap, answer.abilities["a"] - answer.abilities["b"])
+        self.assertGreater(shared_gap, spec.abilities["a"] - spec.abilities["b"])
+        self.assertIn(("spec", "s0"), shared.difficulties)
+        self.assertIn(("answer", "q0"), shared.difficulties)
+
+    def test_a_multi_outcome_fit_needs_the_outcome_to_predict(self) -> None:
+        fit = fit_rasch(
+            [
+                ItemResponse("v", "answer", "q", True),
+                ItemResponse("v", "spec", "q", True),
+            ]
+        )
+        self.assertAlmostEqual(
+            fit.probability("v", "q", "answer"), fit.probability("v", "q", "spec")
+        )
         with self.assertRaises(ValueError):
-            fit_rasch(
-                [
-                    ItemResponse("v", "answer", "q", True),
-                    ItemResponse("v", "sql_valid", "q", True),
-                ]
-            )
+            fit.probability("v", "q")
+        with self.assertRaises(KeyError):
+            fit_rasch([]).probability("v", "q")
+        rates = equated_rates(fit)
+        self.assertEqual(set(rates), {("v", "answer"), ("v", "spec")})
+
+    def test_the_same_item_string_under_two_outcomes_is_two_items(self) -> None:
+        fit = fit_rasch(
+            [
+                ItemResponse("v", "answer", "q", True),
+                ItemResponse("v", "spec", "q", False),
+            ]
+        )
+        self.assertEqual(set(fit.difficulties), {("answer", "q"), ("spec", "q")})
+        self.assertGreater(fit.difficulties[("answer", "q")], fit.difficulties[("spec", "q")])
 
     def test_invalid_hyperparameters_are_rejected(self) -> None:
         response = [ItemResponse("v", "answer", "q", True)]
@@ -548,6 +588,8 @@ class DiagnosticsTest(unittest.TestCase):
         self.assertEqual(disjoint.diagnostics.components, 2)
         self.assertFalse(disjoint.diagnostics.connected)
         self.assertEqual(disjoint.diagnostics.weakest_link, 0)
+        self.assertEqual(disjoint.diagnostics.shared_items, 0)
+        self.assertTrue(disjoint.diagnostics.prior_only)
         self.assertGreater(
             statistics.fmean(disjoint.ability_sd.values()),
             statistics.fmean(anchored.ability_sd.values()),
@@ -558,6 +600,8 @@ class DiagnosticsTest(unittest.TestCase):
         self.assertEqual(anchored.diagnostics.components, 1)
         self.assertTrue(anchored.diagnostics.connected)
         self.assertEqual(anchored.diagnostics.weakest_link, 4)
+        self.assertEqual(anchored.diagnostics.shared_items, 4)
+        self.assertFalse(anchored.diagnostics.prior_only)
 
     def test_weakest_link_is_the_sparsest_view_pair(self) -> None:
         responses = [
@@ -568,6 +612,7 @@ class DiagnosticsTest(unittest.TestCase):
         diagnostics = fit_rasch(responses).diagnostics
         self.assertEqual(diagnostics.components, 1)
         self.assertEqual(diagnostics.weakest_link, 3)
+        self.assertEqual(diagnostics.shared_items, 3)
 
     def test_separated_views_are_flagged(self) -> None:
         responses = [ItemResponse("perfect", "answer", f"q{i}", True) for i in range(6)]
@@ -600,7 +645,24 @@ class DiagnosticsTest(unittest.TestCase):
         self.assertEqual(diagnostics.components, 1)
         self.assertTrue(diagnostics.connected)
         self.assertEqual(diagnostics.weakest_link, 0)
+        self.assertEqual(diagnostics.shared_items, 0)
+        self.assertFalse(diagnostics.prior_only)  # no cross-view comparison to make
         self.assertEqual(diagnostics.prior_dominated, ())
+
+    def test_shared_items_is_global_not_the_sparsest_pair(self) -> None:
+        # a and b share three anchors; c is disjoint. weakest_link is 0 but
+        # three items still carry cross-view evidence, so this is not prior-only.
+        responses = [
+            ItemResponse(view, "answer", f"s{index}", True)
+            for view in ("a", "b")
+            for index in range(3)
+        ]
+        responses += [ItemResponse("c", "answer", f"c{index}", True) for index in range(3)]
+        diagnostics = fit_rasch(responses).diagnostics
+        self.assertEqual(diagnostics.shared_items, 3)
+        self.assertEqual(diagnostics.weakest_link, 0)
+        self.assertFalse(diagnostics.connected)
+        self.assertFalse(diagnostics.prior_only)
 
     def test_an_empty_fit_has_neutral_diagnostics(self) -> None:
         self.assertEqual(fit_rasch([]).diagnostics, RaschDiagnostics())
@@ -610,6 +672,8 @@ class DiagnosticsTest(unittest.TestCase):
             RaschDiagnostics(components=-1)
         with self.assertRaises(ValueError):
             RaschDiagnostics(weakest_link=-1)
+        with self.assertRaises(ValueError):
+            RaschDiagnostics(shared_items=-1)
         with self.assertRaises(ValueError):
             RaschDiagnostics(separated_items=-1)
         with self.assertRaises(ValueError):
@@ -653,6 +717,69 @@ class ReferenceBankTest(unittest.TestCase):
             ReferenceBank("a", "1", keys).digest,
             ReferenceBank("a", "1", (("answer", "q1"),)).digest,
         )
+
+
+class FingerprintTest(unittest.TestCase):
+    """A content fingerprint identifies meaning, not formatting."""
+
+    TEXT = "What is the total revenue by region?"
+
+    def test_format_is_versioned_and_short(self) -> None:
+        fingerprint = item_fingerprint("answer", self.TEXT)
+        self.assertTrue(fingerprint.startswith("fp1_"))
+        self.assertEqual(len(fingerprint), len("fp1_") + FINGERPRINT_CHARS)
+        self.assertTrue(all(char in "0123456789abcdef" for char in fingerprint[4:]))
+
+    def test_formatting_does_not_mint_a_new_fingerprint(self) -> None:
+        base = item_fingerprint("answer", self.TEXT)
+        self.assertEqual(base, item_fingerprint("answer", f"  {self.TEXT}  "))
+        self.assertEqual(base, item_fingerprint("answer", "what is the TOTAL revenue\nby region?"))
+        self.assertEqual(base, item_fingerprint("answer", "What  is the total revenue\tby region?"))
+        composed = "What is the total revenue by r\u00e9gion?"
+        decomposed = unicodedata.normalize("NFD", composed)
+        self.assertNotEqual(composed, decomposed)
+        self.assertEqual(
+            item_fingerprint("answer", composed), item_fingerprint("answer", decomposed)
+        )
+
+    def test_wording_and_outcome_do_mint_a_new_fingerprint(self) -> None:
+        base = item_fingerprint("answer", self.TEXT)
+        self.assertNotEqual(base, item_fingerprint("answer", "What is the total revenue by month?"))
+        self.assertNotEqual(base, item_fingerprint("answer", "What is the total revenue by region"))
+        self.assertNotEqual(base, item_fingerprint("sql_valid", self.TEXT))
+
+    def test_determinism_across_calls(self) -> None:
+        self.assertEqual(
+            item_fingerprint("answer", self.TEXT), item_fingerprint("answer", self.TEXT)
+        )
+
+    def test_empty_inputs_are_rejected(self) -> None:
+        for outcome, text in (("", self.TEXT), ("answer", ""), ("answer", "   ")):
+            with self.assertRaises(ValueError):
+                item_fingerprint(outcome, text)
+
+
+class ItemDriftTest(unittest.TestCase):
+    """A drift row pairs the first fingerprint with a later, different one."""
+
+    def test_key_and_fields(self) -> None:
+        row = ItemDrift("answer", "q1", "fp1_aaa", "fp1_bbb")
+        self.assertEqual(row.key, ("answer", "q1"))
+        self.assertEqual((row.expected, row.observed), ("fp1_aaa", "fp1_bbb"))
+
+    def test_empty_fields_are_rejected(self) -> None:
+        for args in (
+            ("", "q1", "fp1_a", "fp1_b"),
+            ("answer", "", "fp1_a", "fp1_b"),
+            ("answer", "q1", "", "fp1_b"),
+            ("answer", "q1", "fp1_a", ""),
+        ):
+            with self.assertRaises(ValueError):
+                ItemDrift(*args)
+
+    def test_identical_fingerprints_are_not_drift(self) -> None:
+        with self.assertRaises(ValueError):
+            ItemDrift("answer", "q1", "fp1_aaa", "fp1_aaa")
 
 
 if __name__ == "__main__":
