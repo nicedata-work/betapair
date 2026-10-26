@@ -1,11 +1,20 @@
-![betapair](https://raw.githubusercontent.com/nicedata-work/betapair/main/docs/betapair.png)
+<div align="center">
 
-# betapair
+<img src="https://raw.githubusercontent.com/nicedata-work/betapair/main/docs/betapair.png" alt="betapair" width="200" />
 
-One question, answered:
+<h1>betapair</h1>
 
-> We ran the same set of items before and after a change. Did anything really
-> get better or worse, and which groups are responsible?
+<p><em>One question, answered:</em><br />
+We ran the same set of items before and after a change.<br />
+Did anything really get better or worse, and which groups are responsible?</p>
+
+<p>
+  <a href="https://github.com/nicedata-work/betapair/actions/workflows/ci.yml"><img src="https://img.shields.io/badge/coverage-99%25-brightgreen?label=coverage" alt="coverage: 99%" /></a>
+  <a href="https://github.com/nicedata-work/betapair/releases/latest"><img src="https://img.shields.io/github/v/release/nicedata-work/betapair?label=release&amp;sort=semver" alt="latest release" /></a>
+  <a href="https://pypi.org/project/betapair/"><img src="https://img.shields.io/pypi/v/betapair?label=pypi" alt="PyPI version" /></a>
+</p>
+
+</div>
 
 `betapair` takes paired pass/fail results (each item measured twice), works out
 whether the change is real, and points at the groups that moved. It is small
@@ -40,6 +49,12 @@ uv sync --extra dev
 
 If you already have the totals, `mcnemar()` turns them into an answer.
 
+<details>
+<summary><b>Example: turn two totals into a verdict</b></summary>
+
+<details>
+<summary>Code</summary>
+
 ```python
 from betapair import mcnemar
 
@@ -49,6 +64,8 @@ result = mcnemar(n_improved=12, n_regressed=3)
 print("chance it really improved:", round(result.p_improved, 4))
 print("likely range             :", round(result.eti_low, 3), "to", round(result.eti_high, 3))
 ```
+
+</details>
 
 ```
 chance it really improved: 0.9894
@@ -60,13 +77,18 @@ luck. The range is where the true improvement rate most likely sits. Items that
 did not change are ignored — only the ones that moved tell you about the
 change.
 
+</details>
+
 ## Many groups at once
 
 Usually you have several groups and several items. `HealthTracker` collects the
 results and `report()` sums them up.
 
 <details>
-<summary>Show example</summary>
+<summary><b>Example: score many groups at once</b></summary>
+
+<details>
+<summary>Code</summary>
 
 ```python
 from betapair import HealthTracker
@@ -92,6 +114,8 @@ for c in report.contributions:
     print(f"  {c.stratum:8s} {c.verdict:10s} change={c.delta_pp_contribution:+5.1f}pp")
 ```
 
+</details>
+
 ```
 score      : 70.0
 range      : 47.8 to 85.4
@@ -102,8 +126,6 @@ guardrail  : ok
   group_a  improving  change=+20.0pp
   group_b  stable     change=+10.0pp
 ```
-
-</details>
 
 * `score` is the pass rate **after** the change, `baseline` the pass rate
   **before**, and `delta_pp` the change in percentage points.
@@ -118,6 +140,8 @@ guardrail  : ok
 * `group_b` is `stable` even though it improved: the improvement is real but
   not yet strong enough on its own to call.
 
+</details>
+
 ## The first run, and new views
 
 A paired score needs a before **and** an after. On the very first run there is
@@ -127,7 +151,10 @@ reports them as an absolute level, so a dashboard has something to show while
 the baseline is still missing:
 
 <details>
-<summary>Show example</summary>
+<summary><b>Example: the first run has no baseline</b></summary>
+
+<details>
+<summary>Code</summary>
 
 ```python
 for q in range(10):
@@ -139,6 +166,8 @@ print(report.score)  # None - the paired score needs a baseline
 print(report.score_unpaired)  # 70.0 - the candidate epoch's own level
 print(report.unpaired)  # 10 rows behind it
 ```
+
+</details>
 
 </details>
 
@@ -154,7 +183,10 @@ A good average can hide a broken group. `betapair` checks for that and names the
 group.
 
 <details>
-<summary>Show example</summary>
+<summary><b>Example: a good average hides a broken group</b></summary>
+
+<details>
+<summary>Code</summary>
 
 ```python
 from betapair import HealthTracker
@@ -172,6 +204,8 @@ print("status    :", report.status)
 print("guardrail :", report.guardrail.status, report.guardrail.flagged)
 ```
 
+</details>
+
 ```
 score     : 50.0
 delta (pp): 0.0
@@ -179,11 +213,11 @@ status    : regressing
 guardrail : heterogeneous ['group_b/quiz']
 ```
 
-</details>
-
 The average did not move at all, but `group_b` clearly got worse, so the report
 is `regressing` and `flagged` names the culprit. This is the most important
 safety feature.
+
+</details>
 
 ## Watching the score move over time
 
@@ -192,7 +226,10 @@ one score per finished epoch, and `score_band()` turns that history into a
 range: how much the score moves once sampling noise is taken out.
 
 <details>
-<summary>Show example</summary>
+<summary><b>Example: separate noise from real movement</b></summary>
+
+<details>
+<summary>Code</summary>
 
 ```python
 from betapair import HealthTracker
@@ -210,6 +247,8 @@ print("noise       :", round(band.within_sd, 2), "pp")
 print("movement    :", round(band.between_sd, 2), "pp")
 ```
 
+</details>
+
 ```
 avg score   : 70.0
 likely range: 63.7 to 76.3
@@ -217,17 +256,22 @@ noise       : 3.22 pp
 movement    : 0.0 pp
 ```
 
-</details>
-
 `within_sd` is the per-epoch sampling noise — it shrinks as more items run —
 and `between_sd` is real epoch-to-epoch movement. When the whole observed
 spread is explained by noise, `between_sd` is 0 and the band is just the
 noise; a volatile metric widens it. `window=3` keeps the band responsive to a
-recent regime change. A series can also be passed to `score_band()` directly,
-as percentages or as reports:
+recent regime change.
+
+</details>
+
+A series can also be passed to `score_band()` directly, as percentages or as
+reports:
 
 <details>
-<summary>Show example</summary>
+<summary><b>Example: band a series directly</b></summary>
+
+<details>
+<summary>Code</summary>
 
 ```python
 from betapair import score_band
@@ -238,22 +282,29 @@ print(round(band.low, 1), "to", round(band.high, 1))  # 59.8 to 88.5
 
 </details>
 
+</details>
+
 You can record a point without rolling the epoch with `tracker.record_score()`,
 and the timeline survives `to_json()`/`from_json()`.
 
-**See which thresholds the report used.** Every decision threshold has a
-hand-set default, and the report publishes the resolved set. Passing the
-tracker's own `timeline` as calibration history lets the report size those
-thresholds from the measured series rather than a fixed constant:
+<details>
+<summary><b>See which thresholds the report used</b></summary>
+
+Every decision threshold has a hand-set default, and the report publishes the
+resolved set. Passing the tracker's own `timeline` as calibration history lets
+the report size those thresholds from the measured series rather than a fixed
+constant:
 
 <details>
-<summary>See which thresholds the report used</summary>
+<summary>Code</summary>
 
 ```python
 report = tracker.report(calibrate=True)
 print(report.calibration.rope_pp)  # the resolved ROPE, in pp
 print(report.calibration.derived)  # thresholds taken from the series
 ```
+
+</details>
 
 </details>
 
@@ -279,10 +330,13 @@ generated into [`docs/validation.md`](https://github.com/nicedata-work/betapair/
 
 ## Everyday extras
 
-**Add many results at once** with `PairRecord`:
+<details>
+<summary><b>Add many results at once</b> — <code>PairRecord</code></summary>
+
+`PairRecord` hands several rows to `observe_many()` in one call.
 
 <details>
-<summary>Add many results at once</summary>
+<summary>Code</summary>
 
 ```python
 from betapair import HealthTracker, PairRecord
@@ -298,11 +352,16 @@ tracker.observe_many(
 
 </details>
 
-**Items with no result yet.** Use `None`; they are counted as `pending` and
-left out, so a half-finished run never looks like a regression:
+</details>
 
 <details>
-<summary>Items with no result yet</summary>
+<summary><b>Items with no result yet</b></summary>
+
+Use `None`; they are counted as `pending` and left out, so a half-finished run
+never looks like a regression:
+
+<details>
+<summary>Code</summary>
 
 ```python
 tracker.observe("group_a", "quiz", "q3", baseline=False, candidate=None)
@@ -311,12 +370,17 @@ print(tracker.pending)  # 1
 
 </details>
 
-**A failed evaluation.** Attribute it to whoever failed. `ERROR` means the
-*harness* could not evaluate the item (a worker died, an API returned 5xx): it
-is genuinely unresolved, so it is left out of the score and gates coverage.
+</details>
 
 <details>
-<summary>A failed evaluation</summary>
+<summary><b>A failed evaluation</b></summary>
+
+Attribute it to whoever failed. `ERROR` means the *harness* could not evaluate
+the item (a worker died, an API returned 5xx): it is genuinely unresolved, so
+it is left out of the score and gates coverage.
+
+<details>
+<summary>Code</summary>
 
 ```python
 from betapair import ERROR
@@ -334,7 +398,7 @@ test — a view cannot raise its own level by breaking on the questions it was
 failing:
 
 <details>
-<summary>Show example</summary>
+<summary>Code</summary>
 
 ```python
 from betapair import FAILED
@@ -345,11 +409,15 @@ print(tracker.failed)  # 1, counted against the score rather than dropped from i
 
 </details>
 
-**A question leaves the bank.** Retire it, so the score is not quietly
-redefined by the ones that remain:
+</details>
 
 <details>
-<summary>A question leaves the bank</summary>
+<summary><b>A question leaves the bank</b></summary>
+
+Retire it, so the score is not quietly redefined by the ones that remain:
+
+<details>
+<summary>Code</summary>
 
 ```python
 tracker.retire("group_a", "quiz", "q5")
@@ -370,15 +438,19 @@ by the views changing, so deleting the questions you were failing shows up as a
 number instead of an improvement. (Erroring out of them with `FAILED` needs no
 such bookkeeping: the failure is already in the score.)
 
-**Name questions consistently.** A row is identified by
-`(group, outcome, item)`, but an *item* is identified globally by
-`(outcome, item)`. Two views that use the same `item` string are recorded as
-seeing the **same** question — that overlap is what lets a difficulty model
-compare their levels later — so use one stable name per question across views
-and epochs. A renamed question is a different item:
+</details>
 
 <details>
-<summary>Name questions consistently</summary>
+<summary><b>Name questions consistently</b></summary>
+
+A row is identified by `(group, outcome, item)`, but an *item* is identified
+globally by `(outcome, item)`. Two views that use the same `item` string are
+recorded as seeing the **same** question — that overlap is what lets a
+difficulty model compare their levels later — so use one stable name per
+question across views and epochs. A renamed question is a different item:
+
+<details>
+<summary>Code</summary>
 
 ```python
 from betapair import item_key
@@ -391,6 +463,8 @@ item_key("quiz", "q5")  # ('quiz', 'q5')
 The resolved rows are available under that key with `tracker.item_responses()`;
 pending, `ERROR` and retired rows are omitted.
 
+</details>
+
 ## Comparing views on different question banks
 
 `score` is a pass rate on whatever questions each view happened to run. If
@@ -400,7 +474,10 @@ model (Rasch/IRT) to the candidate responses and reports the level each view
 would score on a common **reference bank**, so the two become comparable:
 
 <details>
-<summary>Show example</summary>
+<summary><b>Example: equate views that ran different banks</b></summary>
+
+<details>
+<summary>Code</summary>
 
 ```python
 from betapair import HealthTracker
@@ -420,13 +497,13 @@ print("adjusted  :", round(report.score_adjusted, 1))
 print("shift (pp):", round(report.difficulty_adjustment_pp, 1))
 ```
 
+</details>
+
 ```
 raw       : 66.7
 adjusted  : 63.3
 shift (pp): -3.3
 ```
-
-</details>
 
 * `score_adjusted` is the same weighted micro-average as `score`, but over
 each view's equated rate, and `score_adjusted_low`/`score_adjusted_high` are
@@ -438,12 +515,17 @@ equating.
 * It is opt-in. With `adjust_difficulty` off (the default) every number is
 bit-identical to a report built without it.
 
-**Pin the reference bank.** By default the reference bank is every item
-observed, which shrinks as questions are retired and shifts what the adjusted
-score means. A named, versioned bank keeps the number comparable across epochs:
+</details>
 
 <details>
-<summary>Pin the reference bank</summary>
+<summary><b>Pin the reference bank</b></summary>
+
+By default the reference bank is every item observed, which shrinks as
+questions are retired and shifts what the adjusted score means. A named,
+versioned bank keeps the number comparable across epochs:
+
+<details>
+<summary>Code</summary>
 
 ```python
 from betapair import HealthTracker, ReferenceBank
@@ -460,6 +542,8 @@ tracker = HealthTracker(adjust_difficulty=True, reference_bank=bank)
 match. The bank is saved with the tracker's snapshot, so a resumed tracker
 scores the same way.
 
+</details>
+
 **Read the linking caveat.** Views are connected only through items they both
 ran. `report.irt` reports `connected` and `weakest_link` (the fewest shared
 items over any view pair), plus `prior_dominated` for views whose responses
@@ -470,10 +554,13 @@ The seeded evidence behind the adjusted interval's coverage, the cost of weak
 linking, and how much bank bias equating removes is generated into
 [`docs/validation.md`](https://github.com/nicedata-work/betapair/blob/main/docs/validation.md) by `tools/calibration.py`.
 
-**Some groups matter more.** Tag them and weight the tags:
+<details>
+<summary><b>Some groups matter more</b></summary>
+
+Tag them and weight the tags:
 
 <details>
-<summary>Some groups matter more</summary>
+<summary>Code</summary>
 
 ```python
 tracker = HealthTracker(
@@ -484,14 +571,18 @@ tracker = HealthTracker(
 
 </details>
 
-**Which groups share a dependency.** A *group* here is the second label a view
-can carry: the upstream thing it depends on — a source table, a domain, a
-metric family. Twenty views on one table are not twenty independent tests, so
-the regression gate reads the whole group as **one** test and reports an
-incident instead of a flag storm:
+</details>
 
 <details>
-<summary>Which groups share a dependency</summary>
+<summary><b>Which groups share a dependency</b></summary>
+
+A *group* here is the second label a view can carry: the upstream thing it
+depends on — a source table, a domain, a metric family. Twenty views on one
+table are not twenty independent tests, so the regression gate reads the whole
+group as **one** test and reports an incident instead of a flag storm:
+
+<details>
+<summary>Code</summary>
 
 ```python
 tracker = HealthTracker(groups={"sv_orders": "orders_table", "sv_lines": "orders_table"})
@@ -513,11 +604,15 @@ responsible — the same contribution decomposition used to investigate a
 downstream metric. Groups are persisted in the snapshot exactly like
 categories.
 
-**Start a new round.** `advance()` moves the "after" results into "before" and
-clears the slate:
+</details>
 
 <details>
-<summary>Start a new round</summary>
+<summary><b>Start a new round</b></summary>
+
+`advance()` moves the "after" results into "before" and clears the slate:
+
+<details>
+<summary>Code</summary>
 
 ```python
 tracker.advance(candidate_epoch="round_2")
@@ -525,16 +620,23 @@ tracker.advance(candidate_epoch="round_2")
 
 </details>
 
-**Save and load.** State is plain JSON, including the random seed, so a
-restored tracker gives the same numbers for the same data:
+</details>
 
 <details>
-<summary>Save and load</summary>
+<summary><b>Save and load</b></summary>
+
+State is plain JSON, including the random seed, so a restored tracker gives the
+same numbers for the same data:
+
+<details>
+<summary>Code</summary>
 
 ```python
 text = tracker.to_json()
 tracker = HealthTracker.from_json(text)
 ```
+
+</details>
 
 </details>
 
