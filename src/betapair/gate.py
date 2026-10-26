@@ -11,8 +11,9 @@ The logistic helpers are shared with :mod:`betapair.irt` from
 :mod:`betapair.beta` (imported here as ``sigmoid``/``log1p_exp``), so the two
 modules cannot drift apart.
 
-@note: The decision is Bayesian end to end: ``fdr`` below is a posterior
-    expected FDR, not a frequentist family-wise error rate.
+Notes:
+    The decision is Bayesian end to end: ``fdr`` below is a posterior
+        expected FDR, not a frequentist family-wise error rate.
 """
 
 from __future__ import annotations
@@ -25,6 +26,15 @@ from betapair.beta import beta_cdf, log1p_exp, log_beta, sigmoid
 from betapair.hierarchy import Cell
 from betapair.mcnemar import switch_evidence
 from betapair.models import Status
+
+__all__ = [
+    "CellVerdict",
+    "RegressionModel",
+    "cell_verdicts",
+    "delta_status",
+    "regression_model",
+    "verdicts_from_model",
+]
 
 
 @dataclass(frozen=True)
@@ -323,11 +333,16 @@ def regression_model(
     :func:`verdicts_from_model`. Grouping changes only *which units the FDR is
     computed over*, never the score or the delta.
 
-    @note: The decision is Bayesian end to end: ``fdr`` is a posterior expected
-        FDR, not a frequentist family-wise error rate, and no p-value enters.
-    @return: The fitted :class:`RegressionModel`.
-    @raise ValueError: If ``fdr`` is outside (0, 1), a prior shape is not
-        positive, or ``pi_points`` is below 2.
+    Returns:
+        The fitted :class:`RegressionModel`.
+
+    Raises:
+        ValueError: If ``fdr`` is outside (0, 1), a prior shape is not
+            positive, or ``pi_points`` is below 2.
+
+    Notes:
+        The decision is Bayesian end to end: ``fdr`` is a posterior expected
+            FDR, not a frequentist family-wise error rate, and no p-value enters.
     """
     if not 0.0 < fdr < 1.0:
         raise ValueError(f"fdr must be in (0, 1), got {fdr}")
@@ -446,10 +461,11 @@ def cell_verdicts(
     regressed (normalised so the overall sparsity is unchanged), and a weight
     of 0 mutes the cell.
 
-    @note: Unlike the previous weighted-Holm gate, nothing here is a p-value
-        or a family-wise error rate: the flag is a posterior decision under an
-        explicit spike-and-slab model. See ``docs/validation.md`` for the
-        frequentist operating characteristics of the procedure.
+    Notes:
+        Unlike the previous weighted-Holm gate, nothing here is a p-value
+            or a family-wise error rate: the flag is a posterior decision under an
+            explicit spike-and-slab model. See ``docs/validation.md`` for the
+            frequentist operating characteristics of the procedure.
     """
     model = regression_model(
         cells,
@@ -491,14 +507,16 @@ def delta_status(
     * ``stable`` when ``P(|delta| <= rope) >= 1 - alpha``;
     * ``insufficient`` when the draws do not support any of the above.
 
-    @note: Because the draws include the discordance-rate posterior, an
-        unchanged bank is not automatically ``insufficient``: as the pair
-        count grows the delta concentrates inside the ROPE, which is how
-        "20,000 items and nothing moved" becomes positive evidence of
-        stability.
-    @note: A credible regression always wins, even if the weighted net is
-        positive — that is the invariant that keeps one bad view from being
-        averaged away.
+    Notes:
+        Because the draws include the discordance-rate posterior, an
+            unchanged bank is not automatically ``insufficient``: as the pair
+            count grows the delta concentrates inside the ROPE, which is how
+            "20,000 items and nothing moved" becomes positive evidence of
+            stability.
+
+        A credible regression always wins, even if the weighted net is
+            positive — that is the invariant that keeps one bad view from being
+            averaged away.
     """
     if not delta_draws:
         return "insufficient"

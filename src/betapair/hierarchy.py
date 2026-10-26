@@ -70,6 +70,25 @@ PPC_DRAWS = 192
 #: every per-cell summary then costs a tenth of the work.
 GRID_WEIGHT_FLOOR = 1e-9
 
+__all__ = [
+    "DRAWS",
+    "KAPPA_MAX",
+    "KAPPA_MIN",
+    "KAPPA_POINTS",
+    "KAPPA_PRIOR",
+    "MU_POINTS",
+    "PPC_DRAWS",
+    "Cell",
+    "CellPosterior",
+    "CellPosteriors",
+    "HierarchyFit",
+    "Homogeneity",
+    "cell_posteriors",
+    "fit",
+    "homogeneity_ppc",
+    "pooled_counts",
+]
+
 
 @dataclass(frozen=True)
 class Cell:
@@ -126,31 +145,37 @@ class Cell:
 
     @property
     def key(self) -> tuple[str, str]:
+        """``(stratum, outcome)`` — the cell's identity in a report."""
         return (self.stratum, self.outcome)
 
     @property
     def discordant(self) -> int:
+        """Improved plus regressed — the pairs the McNemar test uses."""
         return self.improved + self.regressed
 
     @property
     def unchanged(self) -> int:
+        """Pairs that did not switch between the two epochs."""
         return self.pairs - self.discordant
 
     @property
     def baseline_passed(self) -> int:
+        """Baseline-epoch passes, reconstructed from the switch counts."""
         return self.passed - self.improved + self.regressed
 
     @property
     def pass_rate(self) -> float:
+        """Candidate-epoch pass rate in 0-1 (0 with no pairs)."""
         return 0.0 if self.pairs == 0 else self.passed / self.pairs
 
     @property
     def baseline_pass_rate(self) -> float:
+        """Baseline-epoch pass rate in 0-1 (0 with no pairs)."""
         return 0.0 if self.pairs == 0 else self.baseline_passed / self.pairs
 
 
 @dataclass(frozen=True)
-class Fit:
+class HierarchyFit:
     """Posterior over the pooled switch rate ``mu`` and concentration ``kappa``.
 
     @cvar points: ``(mu, kappa, posterior weight)`` triples, pruned to the grid
@@ -177,9 +202,10 @@ class Fit:
     def cell_p_improved(self, cell: Cell) -> float:
         """``P(phi_cell > .5 | data)`` — exact mixture, no sampling noise.
 
-        @note: The grid is already pruned to the points that carry mass, and
-            each per-point tail is memoised by :func:`beta_sf`, so refreshing
-            a report whose cells have not changed re-uses the whole mixture.
+        Notes:
+            The grid is already pruned to the points that carry mass, and
+                each per-point tail is memoised by :func:`beta_sf`, so refreshing
+                a report whose cells have not changed re-uses the whole mixture.
         """
         total = 0.0
         for mu, kappa, weight in self.points:
@@ -187,6 +213,12 @@ class Fit:
             b = (1.0 - mu) * kappa + cell.regressed
             total += weight * beta_sf(0.5, a, b)
         return total
+
+
+#: Deprecated alias — use :class:`HierarchyFit`. Kept so an explicit
+#: ``from betapair.hierarchy import Fit`` does not break; it is not part of the
+#: public surface (``__all__`` exports only :class:`HierarchyFit`).
+Fit = HierarchyFit
 
 
 @dataclass(frozen=True)
@@ -267,7 +299,7 @@ def fit(
     kappa_points: int = KAPPA_POINTS,
     kappa_min: float = KAPPA_MIN,
     kappa_max: float = KAPPA_MAX,
-) -> Fit:
+) -> HierarchyFit:
     """Posterior over ``(mu, kappa)`` by deterministic grid quadrature.
 
     The prior is ``mu ~ Beta(a0, b0)`` (uniform by default, matching the
@@ -275,21 +307,29 @@ def fit(
     Cells with no paired items drop out — they carry no information and would
     only dilute the returned ``cells`` count.
 
-    @note: Grid weights fold the prior density into the midpoint-rule spacing:
-        ``mu`` is uniform on [0, 1] while ``kappa`` is gridded in log space, so
-        its weight carries a ``dlog`` factor.
-    @note: The likelihood uses the **discordant** pair count as the binomial
-        ``n`` (McNemar). Using ``cell.pairs`` would count every unchanged item
-        as a failed switch and dilute ``mu`` toward 0 on a real question bank.
-    @note: Every grid-level number (the ``mu``/``kappa`` summaries) is
-        computed on the full grid *before* points below
-        :data:`GRID_WEIGHT_FLOOR` are pruned, so pruning cannot move them. The
-        per-cell summaries in :meth:`Fit.cell_mean` / :meth:`Fit.cell_p_improved`
-        read the pruned points directly — the dropped mass is below 1e-9, and
-        the smaller loop is what keeps a many-cell fit cheap.
-    @return: The fitted posterior, with ``points`` already pruned.
-    @raise ValueError: If the grid is degenerate (fewer than 2x2 points or an
-        invalid ``kappa`` span).
+    Returns:
+        The fitted posterior, with ``points`` already pruned.
+
+    Raises:
+        ValueError: If the grid is degenerate (fewer than 2x2 points or an
+            invalid ``kappa`` span).
+
+    Notes:
+        Grid weights fold the prior density into the midpoint-rule spacing:
+            ``mu`` is uniform on [0, 1] while ``kappa`` is gridded in log space, so
+            its weight carries a ``dlog`` factor.
+
+        The likelihood uses the **discordant** pair count as the binomial
+            ``n`` (McNemar). Using ``cell.pairs`` would count every unchanged item
+            as a failed switch and dilute ``mu`` toward 0 on a real question bank.
+
+        Every grid-level number (the ``mu``/``kappa`` summaries) is
+            computed on the full grid *before* points below
+            :data:`GRID_WEIGHT_FLOOR` are pruned, so pruning cannot move them. The
+            per-cell summaries in :meth:`HierarchyFit.cell_mean` /
+            :meth:`HierarchyFit.cell_p_improved`
+            read the pruned points directly — the dropped mass is below 1e-9, and
+            the smaller loop is what keeps a many-cell fit cheap.
     """
     if mu_points < 2 or kappa_points < 2:
         raise ValueError("grid resolution must be at least 2x2")
@@ -341,7 +381,7 @@ def fit(
     mean_mu = sum(mu * weight for mu, _, weight in points)
     mean_kappa = sum(kappa * weight for _, kappa, weight in points)
     points = tuple(point for point in points if point[2] >= GRID_WEIGHT_FLOOR)
-    return Fit(
+    return HierarchyFit(
         mu=mean_mu,
         mu_eti=(mu_lo, mu_hi),
         kappa=mean_kappa,
@@ -352,13 +392,14 @@ def fit(
     )
 
 
-def _sample_params(fit: Fit, draws: int, rng: random.Random) -> list[tuple[float, float]]:
+def _sample_params(fit: HierarchyFit, draws: int, rng: random.Random) -> list[tuple[float, float]]:
     """Draw ``(mu, kappa)`` pairs from the grid posterior (inverse-CDF).
 
-    @note: :func:`bisect.bisect_left` picks the first point whose cumulative
-        weight reaches the draw, exactly as a linear scan would, in
-        ``O(log n)`` instead of ``O(n)``. A single-cell fit keeps most of the
-        grid, so the scan is the whole cost of drawing at that size.
+    Notes:
+        :func:`bisect.bisect_left` picks the first point whose cumulative
+            weight reaches the draw, exactly as a linear scan would, in
+            ``O(log n)`` instead of ``O(n)``. A single-cell fit keeps most of the
+            grid, so the scan is the whole cost of drawing at that size.
     """
     cumulative: list[float] = []
     running = 0.0
@@ -377,7 +418,7 @@ def _sample_params(fit: Fit, draws: int, rng: random.Random) -> list[tuple[float
 
 
 def cell_posteriors(
-    fit: Fit,
+    fit: HierarchyFit,
     cells: list[Cell],
     *,
     draws: int = DRAWS,
@@ -399,9 +440,10 @@ def cell_posteriors(
     almost nothing moved, because it shrinks the discordance rate towards the
     prior rather than pinning it at the observed count.
 
-    @note: The discordance draws are taken after every switch-rate row so the
-        phi draws stay byte-identical to the pre-discordance model for a given
-        seed (reports remain comparable across a package upgrade).
+    Notes:
+        The discordance draws are taken after every switch-rate row so the
+            phi draws stay byte-identical to the pre-discordance model for a given
+            seed (reports remain comparable across a package upgrade).
     """
     if draws < 2:
         raise ValueError(f"draws must be at least 2, got {draws}")
@@ -472,6 +514,7 @@ class Homogeneity:
 
     @property
     def heterogeneous(self) -> bool:
+        """True when the predictive tail is below the usual 0.05 level."""
         return self.ppc < 0.05
 
 
@@ -494,17 +537,19 @@ def homogeneity_ppc(
     (``K``/``N`` the pooled discordant switches/trials). The reported ``ppc``
     is the fraction of replicated ``T`` reaching the observed one.
 
-    @note: Both the trial count and the Pearson statistic use the **discordant**
-        sub-population (``improved + regressed``); a cell with no discordant
-        pairs carries no information and is excluded.
-    @note: A large ``T`` means the cells do not share one switch rate — the
-        guardrail condition. Why not a Bayes factor for ``kappa``? Because the
-        pooled model is the ``kappa -> inf`` limit of the hierarchy, a boundary
-        null whose Bayes factor is dominated by prior mass in a tail the data
-        cannot inform (the Lindley/Bartlett effect). The predictive check asks
-        the question that matters for monitoring — "would a layer whose views
-        all moved together plausibly produce this spread?" — and is calibrated
-        under the null, which ``tests/test_hierarchy.py`` anchors.
+    Notes:
+        Both the trial count and the Pearson statistic use the **discordant**
+            sub-population (``improved + regressed``); a cell with no discordant
+            pairs carries no information and is excluded.
+
+        A large ``T`` means the cells do not share one switch rate — the
+            guardrail condition. Why not a Bayes factor for ``kappa``? Because the
+            pooled model is the ``kappa -> inf`` limit of the hierarchy, a boundary
+            null whose Bayes factor is dominated by prior mass in a tail the data
+            cannot inform (the Lindley/Bartlett effect). The predictive check asks
+            the question that matters for monitoring — "would a layer whose views
+            all moved together plausibly produce this spread?" — and is calibrated
+            under the null, which ``tests/test_hierarchy.py`` anchors.
     """
     data = [(cell.improved, cell.discordant) for cell in cells if cell.discordant > 0]
     trials = sum(n for _, n in data)

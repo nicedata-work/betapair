@@ -253,8 +253,50 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   outcome's ability RMSE falls from 0.881 to 0.472 (2 items) and 0.622 to
   0.430 (8 items) against a 20-item outcome.
 
+### Added
+
+- `betapair.__version__`, read from the installed distribution metadata
+  (`importlib.metadata`), and `betapair.HierarchyFit` — the hierarchical-pooling
+  fit renamed from the too-generic `Fit` and now the exported name. The old
+  `betapair.hierarchy.Fit` still resolves as an alias.
+- `HealthReport.load_json()`: parse persisted report JSON and reject a payload
+  whose `version` is not `REPORT_VERSION`. `model_validate_json` alone cannot
+  tell an old same-shaped payload from a current one; this is the load path
+  callers should use.
+
 ### Changed
 
+- Docstrings across the package moved from epytext-ish ``@param``/``@raise``/
+  ``@note`` tags to Google-style ``Args``/``Returns``/``Raises``/``Notes``
+  sections, so Sphinx/napoleon and IDEs can read them. `ruff` now runs the
+  `pydocstyle` rules under ``convention = "google"`` (magic methods and
+  ``__init__`` are exempted; tests and tools are out of scope).
+- Every public module declares an ``__all__``. A new
+  ``tests/test_surface.py`` asserts the top-level ``betapair.__all__`` matches
+  those declarations, so the exported surface cannot drift silently.
+- The three record sentinels (``ERROR``, ``RETIRED``, ``FAILED``) are now
+  members of one ``betapair.snapshot.Marker`` enum instead of three look-alike
+  singleton classes. The module-level constants are unchanged (and still
+  serialise to the same strings).
+- `.gitignore` no longer ignores all of ``docs/``; markdown there is visible,
+  so the tracked, CI-diffed ``docs/validation.md`` is no longer trapped in an
+  ignored tree.
+- The persisted pydantic models now enforce their own contract:
+  `extra="forbid"` rejects unknown keys, `frozen=True` makes a parsed report
+  immutable, scores/rates/counts carry `ge`/`le` bounds, and a
+  `model_validator` rejects half-present credible bounds (`score_low` without
+  `score_high`, a lone `delta_pp_low`, …). A malformed or edited payload is
+  now a read error instead of silently dropped or nonsensical data.
+- Decision knobs are validated where they are set, not where they are used.
+  A shared `betapair.models.validate_decision_config()` (also used by
+  `ReportOptions`) now backs `HealthTracker.__init__`, so
+  `HealthTracker(alpha=0.9)`, `draws=0`, `prob_interval=2.0` and `pi_points=0`
+  fail at construction; per-call `report()` overrides are validated too.
+- The tracker snapshot wire format moved to `betapair.snapshot`: the
+  `ERROR`/`RETIRED`/`FAILED` sentinels, the record-state predicate and the
+  `_parse_*` helpers. `HealthTracker` imports and re-exports the public names,
+  so `betapair.tracker.ERROR` and friends are unchanged; `tracker.py` lost
+  about 300 lines of serialisation code.
 - `report.py` no longer owns the schema, the regression gate and the
   assembler at once. The pydantic models and the pure-data policy objects
   (`Calibration`, `RetrospectiveWindow`, `Weighting`, `CellCoverage`,

@@ -86,6 +86,7 @@ from typing import Literal
 
 from betapair.hierarchy import DRAWS, PPC_DRAWS, Cell
 from betapair.irt import DEFAULT_SIGMA, ItemDrift, ItemKey, ItemResponse, ReferenceBank, bank_digest
+from betapair.models import validate_decision_config
 from betapair.report import (
     DEFAULT_CATEGORY,
     CellCoverage,
@@ -98,356 +99,37 @@ from betapair.report import (
 )
 from betapair.series import ScoreBand, ScorePoint, score_band
 from betapair.series import retrospective as _retrospective
-
-#: Snapshot *format* version — internal to the JSON payload and independent
-#: of the package version in ``pyproject.toml``. It moves when the payload
-#: shape changes (v3 added the score ``timeline``); :meth:`from_snapshot`
-#: rejects any other version. Within a version, additive keys are fine:
-#: a v3 payload with no ``timeline`` still loads, defaulted to empty, and one
-#: with no ``retired_ledger`` loads with an empty ledger. ``groups`` joined the
-#: same way: absent means no view has a shared-dependency label, and
-#: ``fingerprints``/``drift`` are additive too — absent means none were
-#: supplied or observed.
-SNAPSHOT_VERSION = 3
-
-
-class _Errored:
-    """Sentinel for an evaluation that failed, distinct from pending ``None``.
-
-    ``None`` means "not evaluated yet"; ``ERROR`` means "evaluated and the
-    evaluation itself failed". Both are unresolved, but an error is a health
-    signal in its own right and must survive a snapshot, so it gets its own
-    state instead of being folded into pending.
-    """
-
-    __slots__ = ()
-
-    def __repr__(self) -> str:
-        return "ERROR"
-
-
-#: Marker for a side whose evaluation errored (as opposed to ``None`` = pending).
-ERROR = _Errored()
-
-
-class _Retired:
-    """Sentinel for an item withdrawn from the question bank.
-
-    ``None`` means "not evaluated yet"; :data:`ERROR` means "evaluated and the
-    evaluation itself failed"; ``RETIRED`` means "no longer part of the bank".
-    A retired item is a *structural* change to the comparison rather than
-    missing data, so it is excluded from the score and the paired test without
-    counting as unresolved — and it is counted on its own so a shrinking bank
-    is visible instead of silently redefining the denominator.
-    """
-
-    __slots__ = ()
-
-    def __repr__(self) -> str:
-        return "RETIRED"
-
-
-#: Marker for a side whose item has been withdrawn from the bank.
-RETIRED = _Retired()
-
-
-class _Failed:
-    """Sentinel for a *view-caused* evaluation failure, scored as a failure.
-
-    ``False`` means "evaluated and the item did not pass"; :data:`FAILED` means
-    "evaluated and the evaluation itself failed because the view did". The two
-    are kept apart so the failure stays visible in the counts, but they score
-    the same: a view that times out on the questions it was failing must not
-    improve its own level by removing them from the denominator. Because a
-    failure is a real result, the record stays ``paired`` — it enters the level
-    and the paired test with no ledger and no composition term.
-    """
-
-    __slots__ = ()
-
-    def __repr__(self) -> str:
-        return "FAILED"
-
-
-#: Marker for a side whose evaluation failed and the failure was the view's fault.
-FAILED = _Failed()
-
-Side = bool | None | _Errored | _Retired | _Failed
-CellKey = tuple[str, str]
-Pair = tuple[Side, Side]
-
-
-#: One record's state. The single predicate every counter uses, so
-#: ``coverage()``, ``cells()`` and the ``paired``/``pending``/``errored``/
-#: ``retired`` properties can never disagree about a record.
-State = Literal["paired", "pending", "errored", "retired"]
-
-
-def _errored(value: object) -> bool:
-    return isinstance(value, _Errored)
-
-
-def _retired(value: object) -> bool:
-    return isinstance(value, _Retired)
-
-
-def _failed(value: object) -> bool:
-    return isinstance(value, _Failed)
-
-
-def _outcome(value: Side) -> bool | None:
-    """The result a side *scores as*, or ``None`` when it has no result.
-
-    :data:`FAILED` is a view-caused failure, so it scores as ``False``. That
-    one line is what makes a failure enter the level instead of shrinking its
-    denominator. ``None``, :data:`ERROR` and :data:`RETIRED` carry no result.
-    """
-    if isinstance(value, bool):
-        return value
-    if _failed(value):
-        return False
-    return None
-
-
-def _last_result(*sides: Side) -> bool | None:
-    """The first real outcome among ``sides``, or ``None`` if there is none.
-
-    Callers pass the more recent side first, so a retirement keeps the latest
-    thing actually known about the item rather than an older one. A
-    view-caused failure counts as a real outcome: it last scored as ``False``.
-    """
-    for side in sides:
-        result = _outcome(side)
-        if result is not None:
-            return result
-    return None
-
-
-def _state(baseline: Side, candidate: Side) -> State:
-    """A record is ``paired`` only when both sides are real results.
-
-    @note: Retirement outranks the other states. It is a statement about the
-        item, not about an evaluation attempt, so it holds whichever side
-        carries it. A harness error outranks a view-caused failure for the same
-        reason in reverse: an unresolved record cannot be scored.
-    """
-    if _retired(baseline) or _retired(candidate):
-        return "retired"
-    if _errored(baseline) or _errored(candidate):
-        return "errored"
-    if baseline is None or candidate is None:
-        return "pending"
-    # A real result on both sides. A ``FAILED`` side is a result (it scores as
-    # a failure), so it lands here as ``paired`` rather than gating coverage.
-    return "paired"
-
-
-def _check_side(value: object, field: str) -> Side:
-    """Narrow a caller-supplied side, rejecting anything off the type.
-
-    @raise ValueError: If ``value`` is not ``True``, ``False``, ``None``,
-        :data:`ERROR`, :data:`FAILED` or :data:`RETIRED`.
-    """
-    if (
-        value is None
-        or isinstance(value, bool)
-        or _errored(value)
-        or _retired(value)
-        or _failed(value)
-    ):
-        return value  # type: ignore[return-value]
-    raise ValueError(f"{field} must be True, False, None, ERROR, RETIRED or FAILED, got {value!r}")
-
-
-def _serialise_side(value: Side) -> object:
-    if _errored(value):
-        return "error"
-    if _retired(value):
-        return "retired"
-    if _failed(value):
-        return "failed"
-    return value
-
-
-def _parse_side(value: object, field: str = "side") -> Side:
-    if value == "error":
-        return ERROR
-    if value == "retired":
-        return RETIRED
-    if value == "failed":
-        return FAILED
-    return _check_side(value, field)
-
-
-def _text_or_none(value: object, field: str) -> str | None:
-    if value is None or isinstance(value, str):
-        return value
-    raise ValueError(f"snapshot {field} must be a string or null, got {value!r}")
-
-
-def _number_mapping(value: object, field: str) -> dict[str, float]:
-    if value is None:
-        return {}
-    if not isinstance(value, dict):
-        raise ValueError(f"snapshot {field} must be an object, got {value!r}")
-    out: dict[str, float] = {}
-    for name, raw in value.items():
-        if isinstance(raw, bool) or not isinstance(raw, (int, float)):
-            raise ValueError(f"snapshot {field}[{name!r}] must be a number, got {raw!r}")
-        out[str(name)] = float(raw)
-    return out
-
-
-def _string_mapping(value: object, field: str) -> dict[str, str]:
-    if value is None:
-        return {}
-    if not isinstance(value, dict):
-        raise ValueError(f"snapshot {field} must be an object, got {value!r}")
-    out: dict[str, str] = {}
-    for name, raw in value.items():
-        if not isinstance(raw, str):
-            raise ValueError(f"snapshot {field}[{name!r}] must be a string, got {raw!r}")
-        out[str(name)] = raw
-    return out
-
-
-def _positive_number(value: object, field: str) -> float:
-    """Validate a positive numeric configuration value (rejects bools)."""
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise ValueError(f"{field} must be a number, got {value!r}")
-    if value <= 0.0:
-        raise ValueError(f"{field} must be positive, got {value}")
-    return float(value)
-
-
-def _boolean(value: object, field: str) -> bool:
-    """Validate a boolean configuration value (rejects the usual truthy ints)."""
-    if not isinstance(value, bool):
-        raise ValueError(f"{field} must be a bool, got {value!r}")
-    return value
-
-
-def _parse_reference_items(value: object) -> tuple[ItemKey, ...] | None:
-    """Validate a pinned reference bank, or ``None`` for the observed union.
-
-    The bank is a sequence of global ``(outcome, item)`` keys. ``None`` means
-    each outcome's observed union; an explicitly empty bank is rejected,
-    because it would equate onto nothing rather than onto the union.
-    """
-    if value is None:
-        return None
-    if not isinstance(value, (list, tuple)):
-        raise ValueError(f"reference_items must be a list or null, got {value!r}")
-    items: list[ItemKey] = []
-    for entry in value:
-        if not isinstance(entry, (list, tuple)) or len(entry) != 2:
-            raise ValueError(f"reference item must be [outcome, item], got {entry!r}")
-        outcome, item = entry
-        if not isinstance(outcome, str) or not isinstance(item, str):
-            raise ValueError(f"reference item must be [outcome, item] strings, got {entry!r}")
-        if not outcome or not item:
-            raise ValueError(f"reference item parts must be non-empty, got {entry!r}")
-        items.append((outcome, item))
-    if not items:
-        raise ValueError("reference_items must not be empty; use None for the observed union")
-    if len(set(items)) != len(items):
-        raise ValueError("reference_items must not repeat an item")
-    return tuple(sorted(items))
-
-
-def _parse_reference_bank(value: object) -> ReferenceBank | None:
-    """Validate a snapshot-encoded versioned reference bank.
-
-    A bank is ``{"name", "version", "items": [[outcome, item], ...]}``. The
-    item rows go through the same validation as ``reference_items`` (non-empty,
-    no repeats) and :class:`~betapair.irt.ReferenceBank` re-checks its own
-    invariants.
-    """
-    if value is None:
-        return None
-    if not isinstance(value, dict):
-        raise ValueError(f"reference_bank must be an object or null, got {value!r}")
-    name = value.get("name")
-    version = value.get("version")
-    if not isinstance(name, str) or not isinstance(version, str):
-        raise ValueError("reference_bank name and version must be strings")
-    items = _parse_reference_items(value.get("items"))
-    if items is None:
-        raise ValueError("reference_bank items must be a non-empty list")
-    return ReferenceBank(name=name, version=version, items=items)
-
-
-def _record_rows(value: object) -> list[list[object]]:
-    if value is None:
-        return []
-    if not isinstance(value, list):
-        raise ValueError(f"snapshot records must be a list, got {value!r}")
-    rows: list[list[object]] = []
-    for raw in value:
-        if not isinstance(raw, list) or len(raw) != 5:
-            raise ValueError(
-                "snapshot records must be [stratum, outcome, item, baseline, candidate], "
-                f"got {raw!r}"
-            )
-        rows.append(list(raw))
-    return rows
-
-
-def _fingerprint_rows(value: object) -> list[tuple[str, str, str]]:
-    """Validate the snapshot's ``[outcome, item, fingerprint]`` rows."""
-    if value is None:
-        return []
-    if not isinstance(value, list):
-        raise ValueError(f"snapshot fingerprints must be a list, got {value!r}")
-    rows: list[tuple[str, str, str]] = []
-    for raw in value:
-        if not isinstance(raw, list) or len(raw) != 3:
-            raise ValueError(
-                f"snapshot fingerprints must be [outcome, item, fingerprint], got {raw!r}"
-            )
-        outcome, item, fingerprint = raw
-        if not all(isinstance(part, str) and part for part in (outcome, item, fingerprint)):
-            raise ValueError(f"snapshot fingerprint fields must be non-empty strings, got {raw!r}")
-        rows.append((outcome, item, fingerprint))
-    return rows
-
-
-def _drift_rows(value: object) -> list[tuple[str, str, str, str]]:
-    """Validate the snapshot's ``[outcome, item, expected, observed]`` rows."""
-    if value is None:
-        return []
-    if not isinstance(value, list):
-        raise ValueError(f"snapshot drift must be a list, got {value!r}")
-    rows: list[tuple[str, str, str, str]] = []
-    for raw in value:
-        if not isinstance(raw, list) or len(raw) != 4:
-            raise ValueError(
-                f"snapshot drift rows must be [outcome, item, expected, observed], got {raw!r}"
-            )
-        parts = raw
-        if not all(isinstance(part, str) and part for part in parts):
-            raise ValueError(f"snapshot drift fields must be non-empty strings, got {raw!r}")
-        outcome, item, expected, observed = parts
-        if expected == observed:
-            raise ValueError(f"snapshot drift row needs two different fingerprints, got {raw!r}")
-        rows.append((outcome, item, expected, observed))
-    return rows
-
-
-def _ledger_rows(value: object) -> list[list[object]]:
-    """Validate the retirement ledger's ``[stratum, outcome, item, last]`` rows."""
-    if value is None:
-        return []
-    if not isinstance(value, list):
-        raise ValueError(f"snapshot retired_ledger must be a list, got {value!r}")
-    rows: list[list[object]] = []
-    for raw in value:
-        if not isinstance(raw, list) or len(raw) != 4:
-            raise ValueError(
-                f"snapshot retired_ledger rows must be [stratum, outcome, item, last], got {raw!r}"
-            )
-        rows.append(list(raw))
-    return rows
+from betapair.snapshot import (
+    ERROR,
+    FAILED,
+    RETIRED,
+    SNAPSHOT_VERSION,
+    CellKey,
+    Pair,
+    Side,
+    State,
+    _boolean,
+    _check_side,
+    _drift_rows,
+    _failed,
+    _fingerprint_rows,
+    _last_result,
+    _ledger_rows,
+    _number_mapping,
+    _outcome,
+    _parse_reference_bank,
+    _parse_reference_items,
+    _parse_side,
+    _positive_number,
+    _record_rows,
+    _retired,
+    _serialise_side,
+    _state,
+    _string_mapping,
+    _text_or_none,
+)
+
+__all__ = ["ERROR", "FAILED", "RETIRED", "HealthTracker", "PairRecord"]
 
 
 def _generate_seed() -> int:
@@ -582,6 +264,26 @@ class HealthTracker:
         report's ``irt.reference`` so the adjusted score's meaning is auditable
         across epochs. Mutually exclusive with :attr:`reference_items`.
         """
+        # Validate the numeric decision knobs here, where they are configured,
+        # so a bad tracker fails at construction rather than inside a draw (or
+        # silently producing nonsense). Shared with ReportOptions so the direct
+        # ``build_report`` path enforces exactly the same bounds.
+        validate_decision_config(
+            alpha=self.alpha,
+            rope_pp=self.rope_pp,
+            max_unresolved_share=self.max_unresolved_share,
+            prob_interval=self.prob_interval,
+            draws=self.draws,
+            ppc_draws=self.ppc_draws,
+            pi_points=self.pi_points,
+            a0=self.a0,
+            b0=self.b0,
+            a_d=self.a_d,
+            b_d=self.b_d,
+            pi_prior=self.pi_prior,
+            sigma_theta=self.sigma_theta,
+            sigma_d=self.sigma_d,
+        )
         self._records: dict[CellKey, dict[str, Pair]] = {}
         self.timeline: list[ScorePoint] = []
         self._last_pi_mean: float | None = None
@@ -617,26 +319,29 @@ class HealthTracker:
     ) -> None:
         """Record (or overwrite) one item's paired outcome.
 
-        @param stratum: View/stratum the item belongs to.
-        @param outcome: Outcome name within the view.
-        @param item: Stable item key; re-observing the same key overwrites.
-            Following the IRT contract, it must be identical for the same
-            underlying question across views and epochs, because
-            :meth:`item_responses` keys items globally by
-            ``(outcome, item)`` — see :mod:`betapair.irt`.
-        @param fingerprint: Optional content fingerprint of the question, from
-            :func:`betapair.irt.item_fingerprint`. The first value seen for
-            ``(outcome, item)`` is remembered; a later different value is
-            recorded as an :class:`~betapair.irt.ItemDrift` rather than
-            silently re-keying the row.
-        @param baseline: PASS/FAIL in the baseline epoch, ``None`` if not run,
-            :data:`ERROR` if the harness failed to evaluate it, or
-            :data:`FAILED` if the view itself failed.
-        @param candidate: PASS/FAIL in the candidate epoch, ``None`` if
-            pending, :data:`ERROR` if the harness failed to evaluate it, or
-            :data:`FAILED` if the view itself failed.
-        @raise ValueError: If any of ``stratum``/``outcome``/``item`` is empty,
-            or ``fingerprint`` is an empty string.
+        Args:
+            stratum: View/stratum the item belongs to.
+            outcome: Outcome name within the view.
+            item: Stable item key; re-observing the same key overwrites.
+                Following the IRT contract, it must be identical for the same
+                underlying question across views and epochs, because
+                :meth:`item_responses` keys items globally by
+                ``(outcome, item)`` — see :mod:`betapair.irt`.
+            fingerprint: Optional content fingerprint of the question, from
+                :func:`betapair.irt.item_fingerprint`. The first value seen for
+                ``(outcome, item)`` is remembered; a later different value is
+                recorded as an :class:`~betapair.irt.ItemDrift` rather than
+                silently re-keying the row.
+            baseline: PASS/FAIL in the baseline epoch, ``None`` if not run,
+                :data:`ERROR` if the harness failed to evaluate it, or
+                :data:`FAILED` if the view itself failed.
+            candidate: PASS/FAIL in the candidate epoch, ``None`` if
+                pending, :data:`ERROR` if the harness failed to evaluate it, or
+                :data:`FAILED` if the view itself failed.
+
+        Raises:
+            ValueError: If any of ``stratum``/``outcome``/``item`` is empty,
+                or ``fingerprint`` is an empty string.
         """
         if not stratum or not outcome or not item:
             raise ValueError("stratum, outcome and item must be non-empty")
@@ -668,10 +373,13 @@ class HealthTracker:
         Retiring an item the tracker has never seen is allowed and records
         ``None``, meaning "withdrawn before it was ever measured".
 
-        @note: The tracker cannot infer retirement from silence — an item that
-            is simply never observed again stays ``pending``, exactly as
-            before. Only an explicit retirement makes the bank change visible.
-        @raise ValueError: If any of ``stratum``/``outcome``/``item`` is empty.
+        Raises:
+            ValueError: If any of ``stratum``/``outcome``/``item`` is empty.
+
+        Notes:
+            The tracker cannot infer retirement from silence — an item that
+                is simply never observed again stays ``pending``, exactly as
+                before. Only an explicit retirement makes the bank change visible.
         """
         if not stratum or not outcome or not item:
             raise ValueError("stratum, outcome and item must be non-empty")
@@ -703,8 +411,9 @@ class HealthTracker:
         observing. ``None`` clears it; the group changes no number by itself,
         it only lets cells that fail together be reported as one incident.
 
-        @raise ValueError: If ``group`` is an empty string — ``None`` clears,
-            an empty string is never a label.
+        Raises:
+            ValueError: If ``group`` is an empty string — ``None`` clears,
+                an empty string is never a label.
         """
         if group is not None and not group:
             raise ValueError("group must be non-empty when set")
@@ -747,16 +456,21 @@ class HealthTracker:
         two different comparisons and calling the result one report would
         silently mix baselines.
 
-        @param other: Tracker whose records and config are merged in.
-        @param prefer: Whose value to keep when both sides have one;
-            ``"other"`` (default) is the fresher in-flight evaluation.
-        @param on_epoch_mismatch: What to do when the epochs differ.
-        @note: Only current records and config are folded in. Each tracker
-            keeps its own :attr:`timeline`; merging histories is the caller's
-            decision, because only the caller knows whether the two series
-            describe the same epochs.
-        @raise ValueError: If the epochs differ and ``on_epoch_mismatch`` is
-            ``"raise"`` (the default).
+        Args:
+            other: Tracker whose records and config are merged in.
+            prefer: Whose value to keep when both sides have one;
+                ``"other"`` (default) is the fresher in-flight evaluation.
+            on_epoch_mismatch: What to do when the epochs differ.
+
+        Raises:
+            ValueError: If the epochs differ and ``on_epoch_mismatch`` is
+                ``"raise"`` (the default).
+
+        Notes:
+            Only current records and config are folded in. Each tracker
+                keeps its own :attr:`timeline`; merging histories is the caller's
+                decision, because only the caller knows whether the two series
+                describe the same epochs.
         """
         if on_epoch_mismatch not in ("raise", "ignore"):
             raise ValueError(f"unknown on_epoch_mismatch {on_epoch_mismatch!r}")
@@ -824,16 +538,19 @@ class HealthTracker:
         Call this at a refresh boundary. Rows that carry no values at all are
         dropped, so memory stays proportional to one epoch's item count.
 
-        @param baseline_epoch: Label of the epoch that just finished; defaults
-            to the current candidate label.
-        @param candidate_epoch: Label of the next candidate epoch.
-        @param record: Append the finished epoch's score to :attr:`timeline`
-            before rolling, so a chain of advances preserves the history a
-            :meth:`score_band` needs.
-        @note: Only a real result can become the next baseline. A
-            :data:`FAILED` candidate is a real result and is promoted as
-            ``False``; a pending, errored or retired one has nothing to
-            promote.
+        Args:
+            baseline_epoch: Label of the epoch that just finished; defaults
+                to the current candidate label.
+            candidate_epoch: Label of the next candidate epoch.
+            record: Append the finished epoch's score to :attr:`timeline`
+                before rolling, so a chain of advances preserves the history a
+                :meth:`score_band` needs.
+
+        Notes:
+            Only a real result can become the next baseline. A
+                :data:`FAILED` candidate is a real result and is promoted as
+                ``False``; a pending, errored or retired one has nothing to
+                promote.
         """
         if record:
             finished = self.candidate_epoch if baseline_epoch is None else baseline_epoch
@@ -919,7 +636,8 @@ class HealthTracker:
     def score_band(self, *, window: int | None = None, level: float = 0.95) -> ScoreBand:
         """Reference band over :attr:`timeline`; see :func:`betapair.series.score_band`.
 
-        @raise ValueError: If the timeline is empty (no epoch recorded yet).
+        Raises:
+            ValueError: If the timeline is empty (no epoch recorded yet).
         """
         return score_band(self.timeline, window=window, level=level)
 
@@ -963,6 +681,7 @@ class HealthTracker:
 
     @property
     def paired(self) -> int:
+        """Records with a real result on both sides of the comparison."""
         return self._count("paired")
 
     @property
@@ -1134,7 +853,8 @@ class HealthTracker:
         ``item`` string under two strata is one item seen twice, and a
         different string is a different item. Sorted for determinism.
 
-        @return: Responses sorted by ``(stratum, outcome, item)``.
+        Returns:
+            Responses sorted by ``(stratum, outcome, item)``.
         """
         out: list[ItemResponse] = []
         for (stratum, outcome), items in sorted(self._records.items()):
@@ -1167,13 +887,16 @@ class HealthTracker:
         stops alternating. This is a level-only reading and never overrides a
         credible per-cell regression in :meth:`report`.
 
-        @param window: Points to keep from the end of the timeline; ``None``
-            uses every recorded epoch.
-        @param rope_pp: ROPE override, in percentage points.
-        @param level: Interval mass override.
-        @raise ValueError: If the timeline is empty, has no effective pair
-            count, or an argument is out of range (see
-            :func:`betapair.series.retrospective`).
+        Args:
+            window: Points to keep from the end of the timeline; ``None``
+                uses every recorded epoch.
+            rope_pp: ROPE override, in percentage points.
+            level: Interval mass override.
+
+        Raises:
+            ValueError: If the timeline is empty, has no effective pair
+                count, or an argument is out of range (see
+                :func:`betapair.series.retrospective`).
         """
         return _retrospective(
             self.timeline,
@@ -1199,26 +922,35 @@ class HealthTracker:
     ) -> HealthReport:
         """Compute the metric from whatever has arrived so far.
 
-        @param calibrate: Size the decision thresholds from this tracker's own
-            :attr:`timeline` instead of the hand-set defaults (see
-            :class:`~betapair.report.Calibration`). Off by default, so a
-            report is unchanged until a caller opts in.
-        @param retrospective_window: Attach a stabilised read of the most recent
-            this-many timeline points to ``HealthReport.retrospective``. The
-            headline status is unchanged; see :meth:`retrospective`.
-        @param adjust_difficulty: Fit the difficulty model and report an
-            equated level (see :func:`betapair.report.build_report`). ``None``
-            uses this tracker's own :attr:`adjust_difficulty` config; the
-            responses come from :meth:`item_responses`.
-        @param reference_items: Pinned reference bank for this call; ``None``
-            uses :attr:`reference_items`, which itself may be ``None`` (each
-            outcome's observed union).
-        @param reference_bank: Versioned pinned bank for this call; ``None``
-            uses :attr:`reference_bank`. Mutually exclusive with
-            ``reference_items`` (see :func:`betapair.report.build_report`).
-        @note: The report's ``pi_mean`` is remembered for the next recorded
-            point, so the *following* epoch can calibrate its regression prior
-            from this one.
+        Args:
+            draws: Override the tracker's posterior draw count for this call.
+            ppc_draws: Override the posterior-predictive draw count.
+            seed: Override the tracker's RNG seed (keeps a series reproducible).
+            alpha: Override the single posterior decision threshold.
+            rope_pp: Override the ROPE half-width, in percentage points.
+            max_unresolved_share: Override the coverage gate's unresolved share.
+            calibrate: Size the decision thresholds from this tracker's own
+                :attr:`timeline` instead of the hand-set defaults (see
+                :class:`~betapair.report.Calibration`). Off by default, so a
+                report is unchanged until a caller opts in.
+            retrospective_window: Attach a stabilised read of the most recent
+                this-many timeline points to ``HealthReport.retrospective``. The
+                headline status is unchanged; see :meth:`retrospective`.
+            adjust_difficulty: Fit the difficulty model and report an
+                equated level (see :func:`betapair.report.build_report`). ``None``
+                uses this tracker's own :attr:`adjust_difficulty` config; the
+                responses come from :meth:`item_responses`.
+            reference_items: Pinned reference bank for this call; ``None``
+                uses :attr:`reference_items`, which itself may be ``None`` (each
+                outcome's observed union).
+            reference_bank: Versioned pinned bank for this call; ``None``
+                uses :attr:`reference_bank`. Mutually exclusive with
+                ``reference_items`` (see :func:`betapair.report.build_report`).
+
+        Notes:
+            The report's ``pi_mean`` is remembered for the next recorded
+                point, so the *following* epoch can calibrate its regression prior
+                from this one.
         """
         adjust = self.adjust_difficulty if adjust_difficulty is None else adjust_difficulty
         options = ReportOptions(
@@ -1322,11 +1054,14 @@ class HealthTracker:
     def from_snapshot(cls, payload: dict[str, object], **config: object) -> HealthTracker:
         """Rebuild a tracker from :meth:`snapshot` output (JSON already parsed).
 
-        @param payload: Parsed :meth:`snapshot` mapping.
-        @param config: Extra keyword arguments forwarded to ``__init__``.
-        @raise ValueError: If the snapshot version is missing or not supported,
-            or a record is not a five-element ``[stratum, outcome, item,
-            baseline, candidate]`` list with valid sides.
+        Args:
+            payload: Parsed :meth:`snapshot` mapping.
+            config: Extra keyword arguments forwarded to ``__init__``.
+
+        Raises:
+            ValueError: If the snapshot version is missing or not supported,
+                or a record is not a five-element ``[stratum, outcome, item,
+                baseline, candidate]`` list with valid sides.
         """
         version = payload.get("version")
         if version != SNAPSHOT_VERSION:
@@ -1420,10 +1155,12 @@ class HealthTracker:
         return tracker
 
     def to_json(self, *, indent: int | None = None) -> str:
+        """Serialise :meth:`snapshot` to JSON, with sorted keys."""
         return json.dumps(self.snapshot(), indent=indent, sort_keys=True)
 
     @classmethod
     def from_json(cls, text: str, **config: object) -> HealthTracker:
+        """Rebuild a tracker from :meth:`to_json` output."""
         return cls.from_snapshot(json.loads(text), **config)
 
     def __len__(self) -> int:

@@ -36,6 +36,21 @@ _MIN_RATE = math.ulp(0.0)
 _MAX_RATE = math.nextafter(1.0, 0.0)
 
 
+__all__ = [
+    "beta_cdf",
+    "beta_mean",
+    "beta_pdf",
+    "beta_ppf",
+    "beta_sample",
+    "beta_sf",
+    "log1p_exp",
+    "log_beta",
+    "log_beta_binomial",
+    "log_choose",
+    "sigmoid",
+]
+
+
 def log_beta(a: float, b: float) -> float:
     """``ln B(a, b)`` — via ``lgamma`` so large shape parameters stay finite."""
     return math.lgamma(a) + math.lgamma(b) - math.lgamma(a + b)
@@ -49,7 +64,8 @@ def log_choose(n: int, k: int) -> float:
 def beta_pdf(x: float, a: float, b: float) -> float:
     """Beta density; the closed-form limit is used at the two boundaries.
 
-    @raise ValueError: If either shape parameter is not positive.
+    Raises:
+        ValueError: If either shape parameter is not positive.
     """
     if a <= 0 or b <= 0:
         raise ValueError(f"shape parameters must be positive, got a={a}, b={b}")
@@ -69,9 +85,10 @@ def beta_pdf(x: float, a: float, b: float) -> float:
 def _beta_cf(x: float, a: float, b: float) -> float:
     """Continued fraction for the incomplete beta function (Lentz's method).
 
-    @note: Iterated to :data:`_FP_EPS` with a hard :data:`_CF_ITMAX` cap. A
-        vanishing denominator is floored at :data:`_FP_MIN` instead of being
-        divided through, which keeps the recursion finite on extreme shapes.
+    Notes:
+        Iterated to :data:`_FP_EPS` with a hard :data:`_CF_ITMAX` cap. A
+            vanishing denominator is floored at :data:`_FP_MIN` instead of being
+            divided through, which keeps the recursion finite on extreme shapes.
     """
     qab = a + b
     qap = a + 1.0
@@ -103,9 +120,12 @@ def _beta_cf(x: float, a: float, b: float) -> float:
 def beta_cdf(x: float, a: float, b: float) -> float:
     """Regularized incomplete beta ``I_x(a, b)`` — the beta CDF.
 
-    @note: The continued fraction converges fastest on the smaller of ``x`` and
-        ``1 - x``, so the larger side is evaluated by reflection about .5.
-    @raise ValueError: If either shape parameter is not positive.
+    Raises:
+        ValueError: If either shape parameter is not positive.
+
+    Notes:
+        The continued fraction converges fastest on the smaller of ``x`` and
+            ``1 - x``, so the larger side is evaluated by reflection about .5.
     """
     if a <= 0 or b <= 0:
         raise ValueError(f"shape parameters must be positive, got a={a}, b={b}")
@@ -131,10 +151,13 @@ def beta_sf(x: float, a: float, b: float) -> float:
     changed. Caching the tail (rather than the whole posterior) keeps the
     expensive continued fraction out of that repeated path.
 
-    @note: The shapes are reconstructed from the same grid arithmetic on
-        every fit, so a hit is bit-identical to a fresh evaluation — the cache
-        cannot change a reported number.
-    @raise ValueError: If either shape parameter is not positive.
+    Raises:
+        ValueError: If either shape parameter is not positive.
+
+    Notes:
+        The shapes are reconstructed from the same grid arithmetic on
+            every fit, so a hit is bit-identical to a fresh evaluation — the cache
+            cannot change a reported number.
     """
     if a <= 0.0 or b <= 0.0:
         raise ValueError(f"shape parameters must be positive, got a={a}, b={b}")
@@ -144,9 +167,12 @@ def beta_sf(x: float, a: float, b: float) -> float:
 def beta_ppf(p: float, a: float, b: float) -> float:
     """Beta quantile by bisection on :func:`beta_cdf` (monotone, robust).
 
-    @note: :data:`_PPF_ITMAX` halvings leave the bracket below double
-        resolution, so the midpoint is as sharp as the CDF allows.
-    @raise ValueError: If ``p`` is not strictly inside (0, 1).
+    Raises:
+        ValueError: If ``p`` is not strictly inside (0, 1).
+
+    Notes:
+        :data:`_PPF_ITMAX` halvings leave the bracket below double
+            resolution, so the midpoint is as sharp as the CDF allows.
     """
     if not 0.0 < p < 1.0:
         raise ValueError(f"p must be in (0, 1), got {p}")
@@ -161,6 +187,7 @@ def beta_ppf(p: float, a: float, b: float) -> float:
 
 
 def beta_mean(a: float, b: float) -> float:
+    """Mean of ``Beta(a, b)`` — ``a / (a + b)``."""
     return a / (a + b)
 
 
@@ -178,15 +205,18 @@ def log_beta_binomial(k: int, n: int, a: float, b: float) -> float:
 def _log_gamma_sample(rng: random.Random, shape: float) -> float:
     """``ln`` of a Gamma(shape, 1) draw — finite for any positive shape.
 
-    @raise ValueError: If ``shape`` is not positive.
+    Raises:
+        ValueError: If ``shape`` is not positive.
 
-    @note: Sampling the log keeps the beta ratio well defined when the draw is
-        subnormal: ``ln U**(1/shape)`` is finite even when ``U**(1/shape)``
-        underflows to zero, which is what collapsed the direct gamma ratio onto
-        a point mass for tiny shapes.
-    @note: ``shape < 1`` uses the boost identity in log space,
-        ``ln G(shape) = ln G(shape+1) + ln(U)/shape``, with ``log1p(-U)`` so
-        the ``U == 0`` corner stays finite.
+    Notes:
+        Sampling the log keeps the beta ratio well defined when the draw is
+            subnormal: ``ln U**(1/shape)`` is finite even when ``U**(1/shape)``
+            underflows to zero, which is what collapsed the direct gamma ratio onto
+            a point mass for tiny shapes.
+
+        ``shape < 1`` uses the boost identity in log space,
+            ``ln G(shape) = ln G(shape+1) + ln(U)/shape``, with ``log1p(-U)`` so
+            the ``U == 0`` corner stays finite.
     """
     if shape <= 0.0:
         raise ValueError(f"gamma shape must be positive, got {shape}")
@@ -222,12 +252,15 @@ def log1p_exp(value: float) -> float:
 def beta_sample(rng: random.Random, a: float, b: float) -> float:
     """Beta(a, b) draw via the gamma ratio — used for posterior intervals.
 
-    @note: The ratio is taken in log space and squashed by a stable logistic,
-        so a subnormal gamma draw cannot collapse the sample onto a point
-        mass. The result is clamped to (0, 1) only at the limits of double
-        precision, which keeps downstream log-odds finite without discarding
-        the spread of the tail.
-    @raise ValueError: If either shape parameter is not positive.
+    Raises:
+        ValueError: If either shape parameter is not positive.
+
+    Notes:
+        The ratio is taken in log space and squashed by a stable logistic,
+            so a subnormal gamma draw cannot collapse the sample onto a point
+            mass. The result is clamped to (0, 1) only at the limits of double
+            precision, which keeps downstream log-odds finite without discarding
+            the spread of the tail.
     """
     if a <= 0.0 or b <= 0.0:
         raise ValueError(f"shape parameters must be positive, got a={a}, b={b}")

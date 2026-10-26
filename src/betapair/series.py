@@ -110,7 +110,8 @@ class ScorePoint:
         ``score`` — so the interval never moves the point estimate. A point
         with no ``pairs`` carries no sampling width and returns itself.
 
-        @raise ValueError: If ``level`` is outside (0, 1).
+        Raises:
+            ValueError: If ``level`` is outside (0, 1).
         """
         if not 0.0 < level < 1.0:
             raise ValueError(f"level must be in (0, 1), got {level}")
@@ -147,7 +148,8 @@ class ScorePoint:
     def from_snapshot(cls, payload: object) -> ScorePoint:
         """Parse one :meth:`snapshot` mapping.
 
-        @raise ValueError: If a field is missing or has the wrong type.
+        Raises:
+            ValueError: If a field is missing or has the wrong type.
         """
         if not isinstance(payload, dict):
             raise ValueError(f"score point must be a mapping, got {payload!r}")
@@ -219,23 +221,31 @@ def score_band(
 ) -> ScoreBand:
     """Reference band for a score series, separating noise from volatility.
 
-    @param points: The series — :class:`ScorePoint`, raw percentages, or
-        :class:`~betapair.report.HealthReport` objects (unscored reports are
-        skipped).
-    @param window: Keep only the most recent this-many points; ``None`` uses
-        the whole series.
-    @param level: Mass of the reference band, e.g. ``.95`` for a 95% band.
-    @return: Center, bounds, and the within/between standard deviations.
-    @note: The band is ``center ± z * sqrt(between_sd^2 + within_sd^2)`` — the
-        spread of an *individual* epoch's score, not the much narrower
-        uncertainty of the mean. A single point has no dispersion to estimate,
-        so it falls back to its own interval.
-    @note: When the points carry different bank digests, ``between_sd`` is
-        estimated within each bank only (see :attr:`ScoreBand.bank_stable`), so
-        attrition or a bank edit is not mistaken for volatility. Points with no
-        bank information keep the old whole-series estimate.
-    @raise ValueError: On an empty (or fully unscored) series, a window below
-        one, or a level outside (0, 1).
+    Args:
+        points: The series — :class:`ScorePoint`, raw percentages, or
+            :class:`~betapair.report.HealthReport` objects (unscored reports are
+            skipped).
+        window: Keep only the most recent this-many points; ``None`` uses
+            the whole series.
+        level: Mass of the reference band, e.g. ``.95`` for a 95% band.
+
+    Returns:
+        Center, bounds, and the within/between standard deviations.
+
+    Raises:
+        ValueError: On an empty (or fully unscored) series, a window below
+            one, or a level outside (0, 1).
+
+    Notes:
+        The band is ``center ± z * sqrt(between_sd^2 + within_sd^2)`` — the
+            spread of an *individual* epoch's score, not the much narrower
+            uncertainty of the mean. A single point has no dispersion to estimate,
+            so it falls back to its own interval.
+
+        When the points carry different bank digests, ``between_sd`` is
+            estimated within each bank only (see :attr:`ScoreBand.bank_stable`), so
+            attrition or a bank edit is not mistaken for volatility. Points with no
+            bank information keep the old whole-series estimate.
     """
     if not 0.0 < level < 1.0:
         raise ValueError(f"level must be in (0, 1), got {level}")
@@ -409,22 +419,30 @@ def retrospective(
     ``rope_pp``. Requiring the whole interval to clear the ROPE is deliberately
     cautious: a window is for cutting flapping, not for manufacturing a change.
 
-    @param points: The series — :class:`ScorePoint`, raw percentages, or
-        :class:`~betapair.report.HealthReport` objects (unscored reports are
-        skipped), like :func:`score_band`.
-    @param window: Keep only the most recent this-many points; ``None`` uses
-        the whole series.
-    @param rope_pp: Region of practical equivalence, in percentage points.
-    @param level: Mass of the level and half-comparison intervals.
-    @return: The windowed level, half-to-half change, trend, flips and verdict.
-    @note: This is a **level-only** reading. It cannot see the current epoch's
-        per-cell evidence, so it never hides a credible regression; the report's
-        own ``status`` remains authoritative.
-    @note: At least one point must carry an effective pair count (as every
-        tracker timeline point does); a bare ``ScorePoint(score=...)`` series
-        has nothing to pool.
-    @raise ValueError: On an empty series, a window below one, a negative ROPE,
-        a level outside (0, 1), or a series with no effective pairs.
+    Args:
+        points: The series — :class:`ScorePoint`, raw percentages, or
+            :class:`~betapair.report.HealthReport` objects (unscored reports are
+            skipped), like :func:`score_band`.
+        window: Keep only the most recent this-many points; ``None`` uses
+            the whole series.
+        rope_pp: Region of practical equivalence, in percentage points.
+        level: Mass of the level and half-comparison intervals.
+
+    Returns:
+        The windowed level, half-to-half change, trend, flips and verdict.
+
+    Raises:
+        ValueError: On an empty series, a window below one, a negative ROPE,
+            a level outside (0, 1), or a series with no effective pairs.
+
+    Notes:
+        This is a **level-only** reading. It cannot see the current epoch's
+            per-cell evidence, so it never hides a credible regression; the report's
+            own ``status`` remains authoritative.
+
+        At least one point must carry an effective pair count (as every
+            tracker timeline point does); a bare ``ScorePoint(score=...)`` series
+            has nothing to pool.
     """
     if not 0.0 < level < 1.0:
         raise ValueError(f"level must be in (0, 1), got {level}")

@@ -26,6 +26,8 @@ from functools import lru_cache
 
 from betapair.beta import beta_mean, beta_pdf, beta_ppf, beta_sf
 
+__all__ = ["NULL_SWITCH_RATE", "McNemarResult", "SwitchEvidence", "mcnemar", "switch_evidence"]
+
 #: Null value of the switch rate: no net change between the two epochs.
 NULL_SWITCH_RATE = 0.5
 #: Cap on the memoised per-cell posteriors. A streaming report asks for the
@@ -113,9 +115,12 @@ def switch_evidence(
     counts, because a streaming refresh asks the same question of every cell
     whose data has not changed since the last report.
 
-    @note: The result is bit-identical to reading the same fields off
-        :func:`mcnemar`; only the interval and Bayes factors are skipped.
-    @raise ValueError: If counts are negative or prior shapes are not positive.
+    Raises:
+        ValueError: If counts are negative or prior shapes are not positive.
+
+    Notes:
+        The result is bit-identical to reading the same fields off
+            :func:`mcnemar`; only the interval and Bayes factors are skipped.
     """
     _validate(n_improved, n_regressed, a0, b0)
     return _switch_evidence(int(n_improved), int(n_regressed), float(a0), float(b0))
@@ -175,22 +180,30 @@ def mcnemar(
 ) -> McNemarResult:
     """Bayesian McNemar test from the two discordant counts.
 
-    @param n_improved: 0 → 1 switch count (``n_01`` in the McNemar table).
-    @param n_regressed: 1 → 0 switch count (``n_10`` in the McNemar table).
-    @param a0: Beta prior shape on the switch rate — uniform by default.
-    @param b0: Beta prior shape on the switch rate; ``(0.5, 0.5)`` gives
-        Jeffreys' prior.
-    @param prob_interval: Mass of the equal-tail credible interval.
-    @return: Posterior summary of the switch rate.
-    @note: The interval Bayes factor compares the interval null
-        ``H0: phi <= .5`` against ``H1: phi > .5`` as the ratio of posterior
-        odds to prior odds; the point null uses the Savage-Dickey density
-        ratio.
-    @note: Memoised on the exact inputs. A report that is refreshed without
-        new observations — a dashboard on a timer — reuses every cell's
-        posterior instead of recomputing the beta quantiles.
-    @raise ValueError: If counts are negative, prior shapes are not positive,
-        or ``prob_interval`` is outside (0, 1).
+    Args:
+        n_improved: 0 → 1 switch count (``n_01`` in the McNemar table).
+        n_regressed: 1 → 0 switch count (``n_10`` in the McNemar table).
+        a0: Beta prior shape on the switch rate — uniform by default.
+        b0: Beta prior shape on the switch rate; ``(0.5, 0.5)`` gives
+            Jeffreys' prior.
+        prob_interval: Mass of the equal-tail credible interval.
+
+    Returns:
+        Posterior summary of the switch rate.
+
+    Raises:
+        ValueError: If counts are negative, prior shapes are not positive,
+            or ``prob_interval`` is outside (0, 1).
+
+    Notes:
+        The interval Bayes factor compares the interval null
+            ``H0: phi <= .5`` against ``H1: phi > .5`` as the ratio of posterior
+            odds to prior odds; the point null uses the Savage-Dickey density
+            ratio.
+
+        Memoised on the exact inputs. A report that is refreshed without
+            new observations — a dashboard on a timer — reuses every cell's
+            posterior instead of recomputing the beta quantiles.
     """
     _validate(n_improved, n_regressed, a0, b0)
     if not 0.0 < prob_interval < 1.0:

@@ -77,31 +77,15 @@ invariant to ``theta + c, d - c``), keep perfectly separated views and items
 finite, and — importantly — let two disconnected banks borrow strength from a
 common distribution instead of diverging.
 
-@note: The fit is **penalised JML** (joint maximum likelihood). The two
-    parameter blocks are conditionally independent, so MAP is alternating 1-D
-    Newton with no optimiser and no matrix solve. Its incidental-parameter
-    bias is a small-sample effect that the ridge priors are the standard
-    mitigation for. Uncertainty on ``theta`` comes from the Schur complement of
-    the joint Hessian (items integrated out approximately); ``difficulty_sd``
-    is the conditional item sd given ``theta`` and therefore understates the
-    marginal, which is acceptable because items are nuisance here.
-
-Equating and diagnostics
-------------------------
-
-A fitted model turns a view's pass rate on *its own* bank into
-:func:`equated_rates` — the rate it would score on a common reference bank,
-``mean_i sigmoid(theta_v + d_i)``. That is what makes two views on a hard and
-an easy bank comparable.
-
-Comparability is only as good as the **link**: views are connected only
-through items they both ran. :class:`RaschDiagnostics` (carried on every
-:class:`RaschFit`) reports the view-item graph's ``components``/``connected``
-flags, the global ``shared_items`` count and the ``weakest_link`` pair-wise
-minimum, and the views/items that are perfectly separated
-(``prior_dominated``, ``separated_items``). Disjoint banks
-are still fitted — the priors bridge them — but that is an assumption the
-diagnostics surface rather than a measurement.
+Notes:
+    The fit is **penalised JML** (joint maximum likelihood). The two
+        parameter blocks are conditionally independent, so MAP is alternating 1-D
+        Newton with no optimiser and no matrix solve. Its incidental-parameter
+        bias is a small-sample effect that the ridge priors are the standard
+        mitigation for. Uncertainty on ``theta`` comes from the Schur complement of
+        the joint Hessian (items integrated out approximately); ``difficulty_sd``
+        is the conditional item sd given ``theta`` and therefore understates the
+        marginal, which is acceptable because items are nuisance here.
 """
 
 from __future__ import annotations
@@ -140,7 +124,8 @@ ItemKey = tuple[str, str]
 def item_key(outcome: str, item: str) -> ItemKey:
     """The global IRT key of an item, ``(outcome, item)``.
 
-    @raise ValueError: If ``outcome`` or ``item`` is empty.
+    Raises:
+        ValueError: If ``outcome`` or ``item`` is empty.
     """
     if not outcome or not item:
         raise ValueError("outcome and item must be non-empty")
@@ -180,7 +165,8 @@ def item_fingerprint(outcome: str, text: str) -> str:
     punctuation and the outcome are not. The ``fp1_`` prefix versions the
     normalisation, so a future change cannot silently reuse an old fingerprint.
 
-    @raise ValueError: If ``outcome`` or ``text`` is empty/blank.
+    Raises:
+        ValueError: If ``outcome`` or ``text`` is empty/blank.
     """
     if not outcome:
         raise ValueError("outcome must be non-empty")
@@ -216,6 +202,7 @@ class ItemDrift:
 
     @property
     def key(self) -> ItemKey:
+        """``(outcome, item)`` — the id whose fingerprints disagree."""
         return (self.outcome, self.item)
 
 
@@ -228,9 +215,10 @@ class ItemResponse:
     views, which is what links their ability estimates; a different ``item``
     string is a different item even when the underlying question is the same.
 
-    @note: A view-caused :data:`betapair.tracker.FAILED` is already a failure
-        by the time it reaches here, so it arrives as ``passed=False`` — a
-        response, not a hole.
+    Notes:
+        A view-caused :data:`betapair.tracker.FAILED` is already a failure
+            by the time it reaches here, so it arrives as ``passed=False`` — a
+            response, not a hole.
     """
 
     stratum: str
@@ -342,10 +330,11 @@ class RaschDiagnostics:
       set (their difficulties are prior-driven too, but there are usually many
       of them, so only the count is reported).
 
-    @note: A separated view or item still gets a finite estimate (the prior is
-        part of the model), but it should not be read as measured. A
-        ``connected=False`` fit with ``weakest_link == 0`` means the adjusted
-        numbers are prior-bridged; the fix is to add shared anchor items.
+    Notes:
+        A separated view or item still gets a finite estimate (the prior is
+            part of the model), but it should not be read as measured. A
+            ``connected=False`` fit with ``weakest_link == 0`` means the adjusted
+            numbers are prior-bridged; the fix is to add shared anchor items.
     """
 
     components: int = 0
@@ -407,12 +396,13 @@ class RaschFit:
     :class:`RaschDiagnostics`); it is part of the fit, not a separate call, so
     an equated number can never be read without its caveat.
 
-    @note: The fit is invariant to the additive split of the generating truth
-        (``theta + c, d - c`` within an outcome): the likelihood sees only the
-        sum, and the priors pin the decomposition, so the fitted probabilities
-        are unchanged. Because ``theta`` is shared, adding a very easy or very
-        hard outcome moves the per-outcome difficulties, not the shared
-        abilities.
+    Notes:
+        The fit is invariant to the additive split of the generating truth
+            (``theta + c, d - c`` within an outcome): the likelihood sees only the
+            sum, and the priors pin the decomposition, so the fitted probabilities
+            are unchanged. Because ``theta`` is shared, adding a very easy or very
+            hard outcome moves the per-outcome difficulties, not the shared
+            abilities.
     """
 
     abilities: dict[str, float]
@@ -432,9 +422,10 @@ class RaschFit:
         outcome; a multi-outcome fit needs it, because the same item string can
         name different ``(outcome, item)`` items.
 
-        @raise KeyError: If the stratum or the item is not in the fit, or the
-            fit covers no outcome.
-        @raise ValueError: If ``outcome`` is omitted for a multi-outcome fit.
+        Raises:
+            KeyError: If the stratum or the item is not in the fit, or the
+                fit covers no outcome.
+            ValueError: If ``outcome`` is omitted for a multi-outcome fit.
         """
         if outcome is None:
             if not self.outcomes:
@@ -457,9 +448,12 @@ class RaschFit:
         each draw maps to an equated rate, and the spread of the resulting
         aggregate is its interval.
 
-        @note: Deterministic for a given ``seed``; strata are drawn in sorted
-            order.
-        @raise ValueError: If ``draws`` is not positive.
+        Raises:
+            ValueError: If ``draws`` is not positive.
+
+        Notes:
+            Deterministic for a given ``seed``; strata are drawn in sorted
+                order.
         """
         if draws < 1:
             raise ValueError(f"draws must be at least 1, got {draws}")
@@ -541,8 +535,9 @@ def _cholesky(
     numerically positive-definite, which is the usual failure mode of a
     Schur complement built from floating-point weights.
 
-    @raise ValueError: If the matrix stays non-positive-definite after
-        ``max_tries`` attempts.
+    Raises:
+        ValueError: If the matrix stays non-positive-definite after
+            ``max_tries`` attempts.
     """
     size = len(matrix)
     boost = 0.0
@@ -804,12 +799,17 @@ def fit_rasch(
     the shared abilities without pooling one outcome's items into the other's
     difficulties.
 
-    @note: Deterministic: strata and items are processed in sorted order and no
-        randomness enters the MAP, so the same responses give the same fit.
-    @return: The :class:`RaschFit`; empty for no responses.
-    @raise ValueError: If a prior scale is not positive, ``max_iter < 1``,
-        ``tol`` is not positive, or a ``(stratum, outcome, item)`` row is
-        repeated.
+    Returns:
+        The :class:`RaschFit`; empty for no responses.
+
+    Raises:
+        ValueError: If a prior scale is not positive, ``max_iter < 1``,
+            ``tol`` is not positive, or a ``(stratum, outcome, item)`` row is
+            repeated.
+
+    Notes:
+        Deterministic: strata and items are processed in sorted order and no
+            randomness enters the MAP, so the same responses give the same fit.
     """
     if sigma_theta <= 0.0:
         raise ValueError(f"sigma_theta must be positive, got {sigma_theta}")
@@ -950,14 +950,19 @@ def equated_rates(
     the shared ability. That keeps the per-cell meaning unchanged while the
     ability borrows strength across outcomes.
 
-    @note: Equating is only as good as the link. When the fit is disconnected
-        (``fit.diagnostics.connected`` is False) the reference items of one
-        bank carry the *other* bank's difficulties from the prior, so the
-        convergence is an assumption — surfaced on the diagnostics, never
-        silently.
-    @return: ``(stratum, outcome) -> equated pass rate``, in 0-1.
-    @raise ValueError: If ``reference_items`` is empty, or names an item the
-        fit does not cover.
+    Returns:
+        ``(stratum, outcome) -> equated pass rate``, in 0-1.
+
+    Raises:
+        ValueError: If ``reference_items`` is empty, or names an item the
+            fit does not cover.
+
+    Notes:
+        Equating is only as good as the link. When the fit is disconnected
+            (``fit.diagnostics.connected`` is False) the reference items of one
+            bank carry the *other* bank's difficulties from the prior, so the
+            convergence is an assumption — surfaced on the diagnostics, never
+            silently.
     """
     if not fit.outcomes:
         if reference_items:

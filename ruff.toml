@@ -7,7 +7,8 @@ extend-exclude = [".venv"]
 [lint]
 select = [
   # Pyflakes (`F`), a subset of pycodestyle (`E`), import sorting (`I`),
-  # pyupgrade (`UP`), bugbear (`B`), simplify (`SIM`) and ruff's own (`RUF`).
+  # pyupgrade (`UP`), bugbear (`B`), simplify (`SIM`), pydocstyle (`D`) and
+  # ruff's own (`RUF`).
   "E4",
   "E7",
   "E9",
@@ -16,8 +17,21 @@ select = [
   "UP",
   "B",
   "SIM",
+  "D",
   "RUF",
 ]
+# Docstrings follow Google style (napoleon/IDE readable). Magic methods and
+# ``__init__`` are documented by their class; completeness elsewhere is
+# enforced.
+ignore = ["D105", "D107"]
+
+[lint.pydocstyle]
+convention = "google"
+
+[lint.per-file-ignores]
+# Tests and tooling are not part of the documented public surface.
+"tests/**" = ["D"]
+"tools/**" = ["D"]
 
 [format]
 # Like Black, use double quotes for strings.

@@ -1289,6 +1289,40 @@ class DifficultyConfigTest(unittest.TestCase):
                 HealthTracker.from_snapshot(payload)
 
 
+class DecisionConfigTest(unittest.TestCase):
+    """A bad decision knob fails where it is set, not inside a draw."""
+
+    def test_invalid_decision_config_is_rejected_at_construction(self) -> None:
+        for config in (
+            {"alpha": 0.9},
+            {"alpha": 0.0},
+            {"rope_pp": -1.0},
+            {"max_unresolved_share": 1.5},
+            {"prob_interval": 2.0},
+            {"draws": 0},
+            {"draws": 1},
+            {"ppc_draws": 0},
+            {"pi_points": 0},
+            {"pi_prior": (0.0, 1.0)},
+            {"a0": 0.0},
+            {"b0": -1.0},
+            {"a_d": 0.0},
+            {"b_d": 0.0},
+            {"alpha": "high"},
+            {"draws": True},
+            {"pi_prior": (1.0,)},
+        ):
+            with self.assertRaises(ValueError):
+                HealthTracker(**config)  # type: ignore[arg-type]
+
+    def test_report_overrides_are_validated_too(self) -> None:
+        tracker = HealthTracker(seed=0, draws=96, ppc_draws=96)
+        tracker.observe("v", "answer", "q0", False, True)
+        for override in ({"draws": 0}, {"alpha": 0.9}, {"max_unresolved_share": 2.0}):
+            with self.assertRaises(ValueError):
+                tracker.report(**override)  # type: ignore[arg-type]
+
+
 def _group_views() -> dict[str, str]:
     """Twelve views sharing one upstream table."""
     return {f"v{index}": "table_x" for index in range(12)}

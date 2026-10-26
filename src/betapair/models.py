@@ -16,9 +16,9 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Annotated, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from betapair.hierarchy import Cell
 from betapair.irt import ItemDrift
@@ -50,6 +50,133 @@ DEFAULT_CATEGORY = "tier-2"
 #: pooled movement is positive but the strata credibly disagree: neither a
 #: clean improvement nor a regression, and not stable either.
 Status = Literal["improving", "stable", "regressing", "mixed", "insufficient"]
+
+#: Constrained field aliases for the wire schema. A persisted failure is a
+#: failure to read, so the model enforces the ranges the producers already
+#: guarantee instead of trusting an edited or handwritten payload.
+Score = Annotated[float, Field(ge=0.0, le=100.0)]
+Rate = Annotated[float, Field(ge=0.0, le=1.0)]
+Count = Annotated[int, Field(ge=0)]
+NonNegative = Annotated[float, Field(ge=0.0)]
+Positive = Annotated[float, Field(gt=0.0)]
+
+
+def _as_number(name: str, value: object) -> float:
+    """Coerce a decision knob to ``float``, rejecting bools and non-numbers."""
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be a number, got {value!r}")
+    try:
+        return float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        raise ValueError(f"{name} must be a number, got {value!r}") from None
+
+
+def _as_int(name: str, value: object) -> int:
+    """Require a genuine integer decision knob (no ``True``, no ``2.0``)."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{name} must be an integer, got {value!r}")
+    return value
+
+
+def validate_decision_config(
+    *,
+    alpha: float,
+    rope_pp: float | None,
+    max_unresolved_share: float,
+    unresolved_share: float | None = None,
+    prob_interval: float = 0.95,
+    draws: int = 2,
+    ppc_draws: int = 1,
+    pi_points: int = 199,
+    a0: float = 1.0,
+    b0: float = 1.0,
+    a_d: float = 1.0,
+    b_d: float = 1.0,
+    pi_prior: tuple[float, float] = (1.0, 1.0),
+    sigma_theta: float = 1.5,
+    sigma_d: float = 1.5,
+) -> None:
+    """Validate every numeric decision knob in one place.
+
+    Shared by :class:`~betapair.report.ReportOptions` (direct ``build_report``
+    callers) and :class:`~betapair.tracker.HealthTracker` (its configuration),
+    so a bad value fails where it is set — at construction — rather than deep
+    inside a draw or a quantile. The bounds mirror what the producers require:
+    ``draws >= 2`` because :func:`betapair.hierarchy.cell_posteriors` takes two
+    draws, ``pi_points >= 2`` because the spike-and-slab grid needs two points,
+    and positive prior scales because every beta/gamma sample rejects zero.
+
+    Raises:
+        ValueError: If any knob is out of range.
+    """
+    alpha_value = _as_number("alpha", alpha)
+    if not 0.0 < alpha_value < 0.5:
+        raise ValueError(f"alpha must be in (0, 0.5), got {alpha}")
+    if rope_pp is not None and _as_number("rope_pp", rope_pp) < 0.0:
+        raise ValueError(f"rope_pp must be >= 0, got {rope_pp}")
+    if not 0.0 <= _as_number("max_unresolved_share", max_unresolved_share) <= 1.0:
+        raise ValueError(f"max_unresolved_share must be in [0, 1], got {max_unresolved_share}")
+    if (
+        unresolved_share is not None
+        and not 0.0 <= _as_number("unresolved_share", unresolved_share) <= 1.0
+    ):
+        raise ValueError(f"unresolved_share must be in [0, 1], got {unresolved_share}")
+    if not 0.0 < _as_number("prob_interval", prob_interval) < 1.0:
+        raise ValueError(f"prob_interval must be in (0, 1), got {prob_interval}")
+    if _as_int("draws", draws) < 2:
+        raise ValueError(f"draws must be an integer >= 2, got {draws!r}")
+    if _as_int("ppc_draws", ppc_draws) < 1:
+        raise ValueError(f"ppc_draws must be an integer >= 1, got {ppc_draws!r}")
+    if _as_int("pi_points", pi_points) < 2:
+        raise ValueError(f"pi_points must be an integer >= 2, got {pi_points!r}")
+    for name, value in (
+        ("a0", a0),
+        ("b0", b0),
+        ("a_d", a_d),
+        ("b_d", b_d),
+        ("sigma_theta", sigma_theta),
+        ("sigma_d", sigma_d),
+    ):
+        number = _as_number(name, value)
+        if not math.isfinite(number) or number <= 0.0:
+            raise ValueError(f"{name} must be a positive finite number, got {value}")
+    if len(pi_prior) != 2 or min(_as_number("pi_prior", part) for part in pi_prior) <= 0.0:
+        raise ValueError(f"pi_prior shapes must be positive, got {pi_prior}")
+
+
+__all__ = [
+    "DEFAULT_CATEGORY",
+    "REPORT_VERSION",
+    "Calibration",
+    "CategorySummary",
+    "CellContribution",
+    "CellCoverage",
+    "Coverage",
+    "GroupSummary",
+    "Guardrail",
+    "HealthReport",
+    "HierarchySummary",
+    "IrTSummary",
+    "McNemarSummary",
+    "ReferenceBankSummary",
+    "RetrospectiveWindow",
+    "Status",
+    "UnpairedCell",
+    "Weighting",
+    "validate_decision_config",
+]
+
+
+class _WireModel(BaseModel):
+    """Base for every persisted model: unknown keys are rejected, and frozen.
+
+    ``extra="forbid"`` means a payload with a key the schema does not define
+    is a read error rather than silently dropped data; ``frozen=True`` means a
+    parsed report cannot be mutated after validation. Together they make
+    :data:`REPORT_VERSION` an actual contract instead of a comment.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
 
 
 @dataclass(frozen=True)
@@ -95,45 +222,45 @@ class CellCoverage:
         return self.pending + self.errored
 
 
-class McNemarSummary(BaseModel):
+class McNemarSummary(_WireModel):
     """Posterior summary of a paired comparison."""
 
-    n_improved: int
-    n_regressed: int
-    discordant: int
-    post_mean: float
-    post_median: float
-    eti_low: float
-    eti_high: float
-    bf10_point: float
-    bf10_interval: float
-    p_improved: float
+    n_improved: Count
+    n_regressed: Count
+    discordant: Count
+    post_mean: Rate
+    post_median: Rate
+    eti_low: Rate
+    eti_high: Rate
+    bf10_point: NonNegative
+    bf10_interval: NonNegative
+    p_improved: Rate
     """``P(phi > .5)`` — the probability that switches ran net-improving."""
 
 
-class HierarchySummary(BaseModel):
+class HierarchySummary(_WireModel):
     """Pooled switch rate and between-strata concentration."""
 
-    mu: float
-    mu_eti_low: float
-    mu_eti_high: float
-    kappa: float
-    kappa_eti_low: float
-    kappa_eti_high: float
+    mu: Rate
+    mu_eti_low: Rate
+    mu_eti_high: Rate
+    kappa: NonNegative
+    kappa_eti_low: NonNegative
+    kappa_eti_high: NonNegative
     log_marginal: float
-    cells: int
+    cells: Count
 
 
-class Guardrail(BaseModel):
+class Guardrail(_WireModel):
     """Homogeneity check across strata, plus the cells it flags."""
 
     status: Literal["ok", "heterogeneous", "insufficient"]
-    ppc: float | None = None
+    ppc: Rate | None = None
     """Posterior predictive tail probability; small means the strata disagree.
     A Bayesian model-check quantity, not a sampling p-value."""
-    dispersion: float | None = None
-    expected_dispersion: float | None = None
-    draws: int = 0
+    dispersion: NonNegative | None = None
+    expected_dispersion: NonNegative | None = None
+    draws: Count = 0
     flagged: list[str] = Field(default_factory=list)
     """Cells with a credible regression, as ``stratum/outcome``.
 
@@ -144,7 +271,7 @@ class Guardrail(BaseModel):
     reason: str = ""
 
 
-class CategorySummary(BaseModel):
+class CategorySummary(_WireModel):
     """One criticality tier, expanded from the same cells as the layer score.
 
     Within a tier the category weight is constant, so it cancels out of
@@ -153,24 +280,24 @@ class CategorySummary(BaseModel):
     """
 
     category: str | None = None
-    weight: float = 1.0
-    defaulted: int = 0
+    weight: NonNegative = 1.0
+    defaulted: Count = 0
     """Cells in this tier whose view carried no tag and took ``DEFAULT_CATEGORY``."""
-    views: int = 0
-    cells: int = 0
-    pairs: int = 0
-    score: float | None = None
-    baseline_score: float | None = None
+    views: Count = 0
+    cells: Count = 0
+    pairs: Count = 0
+    score: Score | None = None
+    baseline_score: Score | None = None
     delta_pp: float | None = None
-    discordant: int = 0
-    p_improved: float | None = None
+    discordant: Count = 0
+    p_improved: Rate | None = None
     """Pooled McNemar ``P(phi > .5)`` for this tier alone."""
     status: Status = "insufficient"
-    delta_p_improved: float | None = None
+    delta_p_improved: Rate | None = None
     """Weighted ``P(delta > 0)`` for this tier, from the hierarchical draws."""
 
 
-class GroupSummary(BaseModel):
+class GroupSummary(_WireModel):
     """One shared-dependency group, read as **one** test rather than N cells.
 
     A group is the upstream thing several views depend on (a source table, a
@@ -185,17 +312,17 @@ class GroupSummary(BaseModel):
     """
 
     group: str
-    views: int = 0
-    cells: int = 0
-    pairs: int = 0
-    improved: int = 0
-    regressed: int = 0
-    discordant: int = 0
-    pass_rate: float | None = None
-    baseline_pass_rate: float | None = None
-    score: float | None = None
+    views: Count = 0
+    cells: Count = 0
+    pairs: Count = 0
+    improved: Count = 0
+    regressed: Count = 0
+    discordant: Count = 0
+    pass_rate: Rate | None = None
+    baseline_pass_rate: Rate | None = None
+    score: Score | None = None
     """Candidate-epoch pass rate of the group's cells, 0-100."""
-    baseline_score: float | None = None
+    baseline_score: Score | None = None
     """Baseline-epoch pass rate of the group's cells, 0-100."""
     delta_pp: float | None = None
     """Observed pass-rate change of the group, in percentage points."""
@@ -208,22 +335,22 @@ class GroupSummary(BaseModel):
     members themselves stay in :attr:`HealthReport.contributions` (each tagged
     with ``group``), so a contributing group expands to its cells.
     """
-    weight: float = 1.0
-    p_incident: float = 0.0
+    weight: NonNegative = 1.0
+    p_incident: Rate = 0.0
     """``P(this group is one incident | data)`` from the group-as-unit fit."""
     flagged: bool = False
     """Whether the group is in the FDR-controlled incident set."""
 
 
-class Coverage(BaseModel):
+class Coverage(_WireModel):
     """How much of the comparison actually resolved, and whether that is enough."""
 
-    paired: int = 0
-    pending: int = 0
-    errored: int = 0
-    retired: int = 0
+    paired: Count = 0
+    pending: Count = 0
+    errored: Count = 0
+    retired: Count = 0
     """Items withdrawn from the bank — reported, but never gating."""
-    failed: int = 0
+    failed: Count = 0
     """Paired items scored as failures because the view, not the harness, failed.
 
     Already inside ``paired``: unlike ``pending`` and ``errored`` these did
@@ -231,14 +358,14 @@ class Coverage(BaseModel):
     are surfaced so a view that is *breaking* is distinguishable from one that
     is merely wrong — both cost the same score, but only one is an incident.
     """
-    unresolved_share: float = 0.0
-    critical_unresolved: int = 0
+    unresolved_share: Rate = 0.0
+    critical_unresolved: Count = 0
     """Pending/errored items in the highest-criticality tier present."""
     complete: bool = True
     reason: str = ""
 
 
-class CellContribution(BaseModel):
+class CellContribution(_WireModel):
     """One view x outcome cell, expanded from the pooled metric."""
 
     stratum: str
@@ -254,20 +381,20 @@ class CellContribution(BaseModel):
     """
     defaulted: bool = False
     """True when the view carried no tier tag and fell back to the default."""
-    weight: float = 1.0
+    weight: NonNegative = 1.0
     """Effective aggregation weight: outcome importance x category weight."""
-    pairs: int
-    improved: int
-    regressed: int
-    unchanged: int
-    pass_rate: float
-    baseline_pass_rate: float
+    pairs: Count
+    improved: Count
+    regressed: Count
+    unchanged: Count
+    pass_rate: Rate
+    baseline_pass_rate: Rate
     delta_pp: float
     """Observed pass-rate change in percentage points (improvement positive)."""
     delta_pp_low: float
     delta_pp_high: float
-    p_improved: float
-    p_regressed: float = 0.0
+    p_improved: Rate
+    p_regressed: Rate = 0.0
     """Posterior probability this cell is a true regression, from the
     spike-and-slab model (see :func:`regression_model`)."""
     logit_shift: float
@@ -277,7 +404,7 @@ class CellContribution(BaseModel):
     """This cell's additive share of ``delta_pp``: ``100 * w * (n01 - n10) /
     sum(w * pairs)``. Summing this field over every contribution reproduces
     ``delta_pp`` exactly, even when cells offset."""
-    equated_pass_rate: float | None = None
+    equated_pass_rate: Rate | None = None
     """Candidate pass rate this cell would score on the common reference bank.
 
     Present only when ``build_report(adjust_difficulty=True, responses=...)``
@@ -331,7 +458,7 @@ class Calibration:
         return bool(self.derived)
 
 
-class ReferenceBankSummary(BaseModel):
+class ReferenceBankSummary(_WireModel):
     """Which reference bank defined the adjusted score, and how complete it was.
 
     ``name``/``version`` are set when a versioned
@@ -348,11 +475,11 @@ class ReferenceBankSummary(BaseModel):
     name: str | None = None
     version: str | None = None
     digest: str
-    items: int
-    available: int
+    items: Count
+    available: Count
 
 
-class IrTSummary(BaseModel):
+class IrTSummary(_WireModel):
     """How the difficulty fit linked the views, without the item table.
 
     Carried on :attr:`HealthReport.irt` only when ``adjust_difficulty`` was on.
@@ -373,14 +500,14 @@ class IrTSummary(BaseModel):
     """
 
     outcomes: list[str] = Field(default_factory=list)
-    sigma_theta: float
-    sigma_d: float
+    sigma_theta: Positive
+    sigma_d: Positive
     connected: bool = True
-    components: int = 0
+    components: Count = 0
     """Largest connected-component count over the per-outcome bank graphs."""
-    weakest_link: int = 0
+    weakest_link: Count = 0
     """Fewest shared items over all view pairs and outcomes (0 = prior only)."""
-    shared_items: int = 0
+    shared_items: Count = 0
     """Item keys observed by more than one view, summed over fitted outcomes.
 
     Unlike ``weakest_link`` this is global: a single disjoint view pair no
@@ -396,13 +523,13 @@ class IrTSummary(BaseModel):
     relative health. ``False`` for a single-view fit (there is no cross-view
     comparison) and ``False`` as soon as any item links the banks.
     """
-    prior_dominated: int = 0
+    prior_dominated: Count = 0
     """Views whose responses were perfectly separated, across all fits."""
-    separated_items: int = 0
+    separated_items: Count = 0
     """Items in a perfectly separated all-pass/all-fail set, across all fits."""
-    observed_pairs: int = 0
+    observed_pairs: Count = 0
     """Responses the fit consumed — one per paired (view, outcome, item) row."""
-    items: int = 0
+    items: Count = 0
     """Distinct global items over all fitted outcomes."""
     reference: ReferenceBankSummary | None = None
     """The bank the adjusted score was equated on, and its completeness.
@@ -447,6 +574,7 @@ class UnpairedCell:
 
     @property
     def key(self) -> tuple[str, str]:
+        """``(stratum, outcome)`` — the cell's identity in the report."""
         return (self.stratum, self.outcome)
 
 
@@ -514,14 +642,14 @@ class RetrospectiveWindow:
             raise ValueError(f"unknown retrospective status {self.status!r}")
 
 
-class HealthReport(BaseModel):
+class HealthReport(_WireModel):
     """The assembled paired-comparison report, ready to persist or serve as JSON."""
 
-    version: int = REPORT_VERSION
+    version: Count = REPORT_VERSION
     status: Status
-    score: float | None = None
+    score: Score | None = None
     """Paired candidate-epoch pass rate, 0-100."""
-    score_low: float | None = None
+    score_low: Score | None = None
     """Lower credible bound on ``score``, 0-100.
 
     The equal-tail bound of the one-parameter ``Beta(1 + k, 1 + n - k)``
@@ -530,9 +658,9 @@ class HealthReport(BaseModel):
     the same micro-average, aggregation weights included. ``None`` when the
     report has no paired items at all.
     """
-    score_high: float | None = None
+    score_high: Score | None = None
     """Upper credible bound on ``score``, 0-100 (see ``score_low``)."""
-    score_unpaired: float | None = None
+    score_unpaired: Score | None = None
     """Cold-start level, 0-100: candidate-epoch pass rate with no baseline.
 
     Computed over every row whose candidate side resolved but whose baseline
@@ -542,13 +670,13 @@ class HealthReport(BaseModel):
     view has a number to show while the comparison is still incomplete.
     ``None`` when no such row exists.
     """
-    score_unpaired_low: float | None = None
+    score_unpaired_low: Score | None = None
     """Lower credible bound on ``score_unpaired``, 0-100 (see ``score_low``)."""
-    score_unpaired_high: float | None = None
+    score_unpaired_high: Score | None = None
     """Upper credible bound on ``score_unpaired``, 0-100."""
-    unpaired: int = 0
+    unpaired: Count = 0
     """Rows behind ``score_unpaired``: candidate resolved, baseline absent."""
-    score_adjusted: float | None = None
+    score_adjusted: Score | None = None
     """Difficulty-adjusted level, 0-100: the pass rate the views would score
     on a common reference bank, aggregated with the same weights as ``score``.
 
@@ -557,7 +685,7 @@ class HealthReport(BaseModel):
     differ only through the per-cell rates, and ``difficulty_adjustment_pp``
     is the difference, so a bank-difficulty effect is separable from a change.
     """
-    score_adjusted_low: float | None = None
+    score_adjusted_low: Score | None = None
     """Lower credible bound on ``score_adjusted``, 0-100.
 
     The equal-tail bounds of the seeded posterior draws of ``theta`` propagated
@@ -565,7 +693,7 @@ class HealthReport(BaseModel):
     uncertainty is what sizes the interval. ``None`` alongside
     ``score_adjusted``.
     """
-    score_adjusted_high: float | None = None
+    score_adjusted_high: Score | None = None
     """Upper credible bound on ``score_adjusted``, 0-100 (see
     ``score_adjusted_low``)."""
     difficulty_adjustment_pp: float | None = None
@@ -577,37 +705,37 @@ class HealthReport(BaseModel):
     """
     irt: IrTSummary | None = None
     """The difficulty fit behind ``score_adjusted``, and its linking caveats."""
-    baseline_score: float | None = None
+    baseline_score: Score | None = None
     delta_pp: float | None = None
     delta_pp_low: float | None = None
     delta_pp_high: float | None = None
-    delta_p_improved: float | None = None
+    delta_p_improved: Rate | None = None
     """Weighted ``P(delta_pp > 0)`` from the hierarchical draws — the
     probability behind the layer verdict. ``p_improved`` below is the
     unweighted pooled exact test, kept as a diagnostic only."""
-    p_no_regression: float | None = None
+    p_no_regression: Rate | None = None
     """``P(no cell truly regressed | data)`` from the spike-and-slab model."""
-    bfdr: float | None = None
+    bfdr: Rate | None = None
     """Posterior expected false discovery rate of the flagged set."""
-    pi_mean: float | None = None
+    pi_mean: Rate | None = None
     """Posterior mean share of cells that truly regressed."""
-    rope_pp: float = 0.0
+    rope_pp: NonNegative = 0.0
     """ROPE half-width in percentage points used for the verdict."""
-    p_improved: float | None = None
-    pairs: int = 0
-    pending: int = 0
-    failed: int = 0
+    p_improved: Rate | None = None
+    pairs: Count = 0
+    pending: Count = 0
+    failed: Count = 0
     """Paired items scored as failures because the view itself failed.
 
     A view-caused error (a timeout, a crash) is a result, so it is counted
     against the level instead of being dropped from it — the incentive TS2
     encodes as "quitting is a surrender".
     """
-    retired: int = 0
+    retired: Count = 0
     """Items withdrawn from the bank since the comparison began."""
-    retired_held: int = 0
+    retired_held: Count = 0
     """Retired items with a known outcome — the ones ``score_held`` folds in."""
-    score_held: float | None = None
+    score_held: Score | None = None
     """Level with retired items held at their last known outcome, 0-100.
 
     Equal to ``score`` when nothing was retired. This is what the bank would
@@ -620,7 +748,7 @@ class HealthReport(BaseModel):
     rather than by views changing. Positive means a shrinking bank is
     flattering the score — the failure mode a paired test cannot see.
     """
-    strata: int = 0
+    strata: Count = 0
     outcomes: list[str] = Field(default_factory=list)
     baseline_epoch: str | None = None
     candidate_epoch: str | None = None
@@ -666,7 +794,7 @@ class HealthReport(BaseModel):
     contributions: list[CellContribution] = Field(default_factory=list)
     calibration: Calibration = Field(default_factory=Calibration)
     """The decision thresholds used, and which the metric's history set."""
-    unresolved_share: float | None = None
+    unresolved_share: Rate | None = None
     """Share of tracked rows still unresolved when this report was built.
 
     ``(pending + errored) / all tracked rows``, over every state — the
@@ -674,6 +802,51 @@ class HealthReport(BaseModel):
     coverage threshold is calibrated from. ``None`` when no per-cell coverage
     was supplied and the row count is unknown.
     """
+
+    @model_validator(mode="after")
+    def _check_credible_bounds(self) -> HealthReport:
+        """Credible bounds are all-or-none, and ordered when present.
+
+        A lone ``score_low`` (or ``delta_pp_low``, or an adjusted-bound pair)
+        describes nothing, so a payload carrying exactly one side is rejected
+        rather than half-read.
+        """
+        for low, high in (
+            (self.score_low, self.score_high),
+            (self.score_unpaired_low, self.score_unpaired_high),
+            (self.score_adjusted_low, self.score_adjusted_high),
+        ):
+            if (low is None) != (high is None):
+                raise ValueError("credible bounds must be both present or both absent")
+            if low is not None and high is not None and low > high:
+                raise ValueError(f"credible bound low {low} exceeds high {high}")
+        delta = (self.delta_pp, self.delta_pp_low, self.delta_pp_high)
+        missing = sum(value is None for value in delta)
+        if 0 < missing < len(delta):
+            raise ValueError("delta_pp, delta_pp_low and delta_pp_high are all-or-none")
+        return self
+
+    @classmethod
+    def load_json(cls, text: str) -> HealthReport:
+        """Parse persisted report JSON, refusing another schema version.
+
+        :meth:`pydantic.BaseModel.model_validate_json` answers "is this
+        well-formed JSON for the current fields?"; this additionally answers
+        "was it written by this schema version?", which is what
+        :data:`REPORT_VERSION` exists for. Extra keys already fail through
+        ``extra="forbid"``; a same-shaped payload from an older version fails
+        here.
+
+        Raises:
+            ValueError: If the payload is malformed or its ``version`` is
+                not :data:`REPORT_VERSION`.
+        """
+        report = cls.model_validate_json(text)
+        if report.version != REPORT_VERSION:
+            raise ValueError(
+                f"unsupported report version {report.version!r}; expected {REPORT_VERSION}"
+            )
+        return report
 
 
 @dataclass(frozen=True)
@@ -706,12 +879,15 @@ class Weighting:
     """
 
     def weight(self, cell: Cell | UnpairedCell) -> float:
+        """Effective importance of ``cell`` (outcome importance x tier)."""
         return self.weights[cell.key]
 
     def category(self, cell: Cell | UnpairedCell) -> str | None:
+        """Resolved tier of ``cell`` (the fallback when it carried no tag)."""
         return self.categories[cell.key]
 
     def group(self, cell: Cell | UnpairedCell) -> str | None:
+        """Shared-dependency label of ``cell``, or ``None`` when ungrouped."""
         return self.groups[cell.key]
 
     def defaulted(self, cell: Cell | UnpairedCell) -> bool:

@@ -69,7 +69,7 @@ from betapair.hierarchy import (
     PPC_DRAWS,
     Cell,
     CellPosteriors,
-    Fit,
+    HierarchyFit,
     Homogeneity,
     cell_posteriors,
     fit,
@@ -107,6 +107,7 @@ from betapair.models import (
     Status,
     UnpairedCell,
     Weighting,
+    validate_decision_config,
 )
 from betapair.series import ScorePoint, retrospective, score_band
 
@@ -217,9 +218,14 @@ def weighting(
     untagged cell then takes ``default_category``. A set with no tier anywhere
     stays uniform: every cell weighs 1.0, and nothing is marked defaulted.
 
-    @param tiered: Override the auto-detection. The held-level overlay passes
-        the layer's own decision, so adding cells that exist only because an
-        item was retired cannot flip the policy and re-weight the report.
+    Args:
+        cells: The paired and/or cold-start cells to weight.
+        weights: Per-outcome importance; an unnamed outcome weighs 1.0.
+        category_weights: Weight of each category/tier; a missing tier weighs 1.0.
+        default_category: Tier an untagged cell falls back to when tiers are in use.
+        tiered: Override the auto-detection. The held-level overlay passes
+            the layer's own decision, so adding cells that exist only because an
+            item was retired cannot flip the policy and re-weight the report.
     """
     weight_of = dict(weights or {})
     tier_of = dict(category_weights or {})
@@ -285,26 +291,31 @@ def resolve_calibration(
     the coverage gate from the observed pending share. Resolving in one place
     is what lets the report publish exactly which value it used.
 
-    @note: The ROPE derivation (B2) needs :data:`ROPE_MIN_POINTS` scored points
-        before the band is trusted, and keeps ``rope_pp`` when the band
-        measures no between-epoch movement at all — a series whose spread is
-        pure sampling noise has no dead zone to size, so the hand-set value
-        still stands. ``rope_pp`` is the fallback whenever calibration cannot
-        size it. The import is local because :mod:`betapair.series` imports
-        this module.
-    @note: The prior derivation (B3) averages the ``pi_mean`` of the history
-        points that carry one — the previous epochs' measured base rate of
-        true regressions — and keeps the default ``pi_prior`` strength while
-        moving its mean. The mean is clipped to
-        :data:`PI_PRIOR_MIN` and :data:`PI_PRIOR_MAX` so the prior cannot
-        collapse onto 0 or 1.
-    @note: The coverage derivation (B4) averages the epochs' unresolved shares
-        and adds :data:`COVERAGE_MARGIN`, clamped to
-        :data:`COVERAGE_MIN`/:data:`COVERAGE_MAX`. It waits for
-        :data:`COVERAGE_MIN_POINTS` epochs on purpose: the first runs are
-        mostly unresolved, and sizing the gate from them would gate every
-        early report (the cold-start guard).
-    @return: The resolved :class:`Calibration`.
+    Returns:
+        The resolved :class:`Calibration`.
+
+    Notes:
+        The ROPE derivation (B2) needs :data:`ROPE_MIN_POINTS` scored points
+            before the band is trusted, and keeps ``rope_pp`` when the band
+            measures no between-epoch movement at all — a series whose spread is
+            pure sampling noise has no dead zone to size, so the hand-set value
+            still stands. ``rope_pp`` is the fallback whenever calibration cannot
+            size it. The import is local because :mod:`betapair.series` imports
+            this module.
+
+        The prior derivation (B3) averages the ``pi_mean`` of the history
+            points that carry one — the previous epochs' measured base rate of
+            true regressions — and keeps the default ``pi_prior`` strength while
+            moving its mean. The mean is clipped to
+            :data:`PI_PRIOR_MIN` and :data:`PI_PRIOR_MAX` so the prior cannot
+            collapse onto 0 or 1.
+
+        The coverage derivation (B4) averages the epochs' unresolved shares
+            and adds :data:`COVERAGE_MARGIN`, clamped to
+            :data:`COVERAGE_MIN`/:data:`COVERAGE_MAX`. It waits for
+            :data:`COVERAGE_MIN_POINTS` epochs on purpose: the first runs are
+            mostly unresolved, and sizing the gate from them would gate every
+            early report (the cold-start guard).
     """
     points = 0 if history is None else len(history)
     derived: list[str] = []
@@ -393,10 +404,11 @@ def _difficulty_adjustment(
     and because one draw set serves every outcome, a view's cells move together
     instead of being treated as independent fits.
 
-    @raise ValueError: If ``draws`` is not positive, no responses were given,
-        a pinned bank names no item for a fitted outcome (or none of its items
-        was observed), or a weighted cell has no response behind it (the
-        adjusted average would then be undefined).
+    Raises:
+        ValueError: If ``draws`` is not positive, no responses were given,
+            a pinned bank names no item for a fitted outcome (or none of its items
+            was observed), or a weighted cell has no response behind it (the
+            adjusted average would then be undefined).
     """
     if draws < 1:
         raise ValueError(f"draws must be at least 1, got {draws}")
@@ -554,16 +566,23 @@ class ReportOptions:
     sigma_d: float = DEFAULT_SIGMA
 
     def __post_init__(self) -> None:
-        if not 0.0 < self.alpha < 0.5:
-            raise ValueError(f"alpha must be in (0, 0.5), got {self.alpha}")
-        if self.rope_pp is not None and self.rope_pp < 0.0:
-            raise ValueError(f"rope_pp must be >= 0, got {self.rope_pp}")
-        if not 0.0 <= self.max_unresolved_share <= 1.0:
-            raise ValueError(
-                f"max_unresolved_share must be in [0, 1], got {self.max_unresolved_share}"
-            )
-        if self.unresolved_share is not None and not 0.0 <= self.unresolved_share <= 1.0:
-            raise ValueError(f"unresolved_share must be in [0, 1], got {self.unresolved_share}")
+        validate_decision_config(
+            alpha=self.alpha,
+            rope_pp=self.rope_pp,
+            max_unresolved_share=self.max_unresolved_share,
+            unresolved_share=self.unresolved_share,
+            prob_interval=self.prob_interval,
+            draws=self.draws,
+            ppc_draws=self.ppc_draws,
+            pi_points=self.pi_points,
+            a0=self.a0,
+            b0=self.b0,
+            a_d=self.a_d,
+            b_d=self.b_d,
+            pi_prior=self.pi_prior,
+            sigma_theta=self.sigma_theta,
+            sigma_d=self.sigma_d,
+        )
         if self.reference_bank is not None and self.reference_items is not None:
             raise ValueError("pass reference_bank or reference_items, not both")
         if self.retrospective_window is not None and self.retrospective_window < 1:
@@ -774,7 +793,7 @@ def _score_levels(inputs: _Inputs) -> _Levels:
 class _Hierarchy:
     """The hierarchical pooling fit and the weighted delta draws it produced."""
 
-    fit: Fit
+    fit: HierarchyFit
     posteriors: CellPosteriors
     delta_draws: list[float]
     per_cell_delta: dict[tuple[str, str], list[float]]
@@ -1170,27 +1189,36 @@ def build_report(
     difficulty already cancels in McNemar's discordant pairs, so only the
     headline level is adjusted.
 
-    @note: The layer verdict is derived from the *weighted* hierarchical delta
-        draws — the same quantity as the headline ``delta_pp`` — not from the
-        unweighted pooled test. ``p_improved`` is kept as an unweighted pooled
-        diagnostic; ``delta_p_improved`` is the probability behind the verdict.
-    @note: The delta draws multiply the switch rate by a discordance-rate draw,
-        so the interval and the ROPE are statements about the population, not
-        reconstructions of the observed sample delta.
-    @note: A cell's improving/stable evidence comes from its own exact McNemar
-        posterior, never from the borrowed-strength hierarchy estimate; the
-        regression flag comes from the layer-wide spike-and-slab model. The
-        hierarchy still shapes ``logit_shift`` and the delta interval.
-    @note: A cell with weight 0 is muted: excluded from the score, the pooled
-        diagnostic and the homogeneity check, so a view that does not count
-        cannot make the layer look inconsistent.
-    @note: Coverage gates everything except a credible regression: incomplete
-        data must not manufacture health, but it must never bury a flagged
-        regression either.
-    @return: The assembled :class:`HealthReport`.
-    @raise ValueError: If ``alpha`` is outside (0, 0.5), ``rope_pp`` is
-        negative, ``max_unresolved_share`` is outside [0, 1], or both a
-        reference bank and raw reference items are pinned.
+    Returns:
+        The assembled :class:`HealthReport`.
+
+    Raises:
+        ValueError: If ``alpha`` is outside (0, 0.5), ``rope_pp`` is
+            negative, ``max_unresolved_share`` is outside [0, 1], or both a
+            reference bank and raw reference items are pinned.
+
+    Notes:
+        The layer verdict is derived from the *weighted* hierarchical delta
+            draws — the same quantity as the headline ``delta_pp`` — not from the
+            unweighted pooled test. ``p_improved`` is kept as an unweighted pooled
+            diagnostic; ``delta_p_improved`` is the probability behind the verdict.
+
+        The delta draws multiply the switch rate by a discordance-rate draw,
+            so the interval and the ROPE are statements about the population, not
+            reconstructions of the observed sample delta.
+
+        A cell's improving/stable evidence comes from its own exact McNemar
+            posterior, never from the borrowed-strength hierarchy estimate; the
+            regression flag comes from the layer-wide spike-and-slab model. The
+            hierarchy still shapes ``logit_shift`` and the delta interval.
+
+        A cell with weight 0 is muted: excluded from the score, the pooled
+            diagnostic and the homogeneity check, so a view that does not count
+            cannot make the layer look inconsistent.
+
+        Coverage gates everything except a credible regression: incomplete
+            data must not manufacture health, but it must never bury a flagged
+            regression either.
     """
     if options is not None and overrides:
         raise TypeError("pass ReportOptions as options or as keyword arguments, not both")
@@ -1205,8 +1233,9 @@ def parse_category_weights(text: str | None) -> dict[str, float]:
     A convenience for configuration surfaces that carry one string instead of
     a mapping. Blank means "no category counts for more".
 
-    @raise ValueError: If an entry is not ``name=value``, is not numeric, or
-        carries a negative weight.
+    Raises:
+        ValueError: If an entry is not ``name=value``, is not numeric, or
+            carries a negative weight.
     """
     if text is None:
         return {}
@@ -1257,18 +1286,23 @@ def _held_overlay(
     score_held`` — so a level that only rose because hard questions were deleted
     is visible instead of being read as an improvement.
 
-    @note: The overlay is arithmetic only. Retired items are added to the
-        numerator and denominator of the level and to nothing else, so the
-        paired test, the hierarchy, the guardrail and every interval are
-        bit-identical to a run without retirement.
-    @note: Weights for the cells that exist only because of retirement are
-        resolved with the layer's own ``tiered`` decision, so the overlay can
-        never re-weight the cells that ``score`` is built from.
-    @note: An item retired before it was ever measured has no outcome to hold
-        and is left out; it is still visible through ``retired`` and
-        ``coverage.retired``.
-    @return: The held level, the composition effect, and how many retired items
-        carried a known outcome.
+    Returns:
+        The held level, the composition effect, and how many retired items
+            carried a known outcome.
+
+    Notes:
+        The overlay is arithmetic only. Retired items are added to the
+            numerator and denominator of the level and to nothing else, so the
+            paired test, the hierarchy, the guardrail and every interval are
+            bit-identical to a run without retirement.
+
+        Weights for the cells that exist only because of retirement are
+            resolved with the layer's own ``tiered`` decision, so the overlay can
+            never re-weight the cells that ``score`` is built from.
+
+        An item retired before it was ever measured has no outcome to hold
+            and is left out; it is still visible through ``retired`` and
+            ``coverage.retired``.
     """
     extra = {key: counts for key, counts in (held_counts or {}).items() if counts[0] > 0}
     if not extra or score is None:
@@ -1334,12 +1368,14 @@ def _coverage(
     standard: any unresolved item in the most critical tier present gates the
     verdict regardless of the global share.
 
-    @note: The critical tier is detected from the coverage itself, not from the
-        active cells: a tier-1 view that is entirely pending or errored has no
-        active cell, and that is exactly the case the gate must catch.
-    @note: Retirement is counted but does not gate (see
-        :attr:`CellCoverage.unresolved`). It is reported so a shrinking bank is
-        visible rather than silently redefining the score's denominator.
+    Notes:
+        The critical tier is detected from the coverage itself, not from the
+            active cells: a tier-1 view that is entirely pending or errored has no
+            active cell, and that is exactly the case the gate must catch.
+
+        Retirement is counted but does not gate (see
+            :attr:`CellCoverage.unresolved`). It is reported so a shrinking bank is
+            visible rather than silently redefining the score's denominator.
     """
     if coverage is None:
         total = pairs + pending
@@ -1518,8 +1554,9 @@ def _categories(
     flagged cells — a tier with a credible regression can never read
     ``improving`` while that regression sits inside it.
 
-    @note: Per-cell escalation stays inside the tier, so a tier's verdict is
-        never driven by a cell outside it.
+    Notes:
+        Per-cell escalation stays inside the tier, so a tier's verdict is
+            never driven by a cell outside it.
     """
     grouped: dict[str | None, list[Cell]] = {}
     for cell in cells:

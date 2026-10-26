@@ -16,6 +16,8 @@ extends it to many strata at once:
 * :mod:`betapair.report` — ``build_report()``, the decision policy and the
   assembly steps;
 * :mod:`betapair.series` — score-over-time dispersion and windowed reads;
+* :mod:`betapair.snapshot` — the tracker snapshot wire format (sentinels,
+  record state, ``_parse_*`` helpers);
 * :mod:`betapair.tracker` — streaming/batch accumulation and JSON snapshots.
 
 The intended surface is small::
@@ -32,12 +34,14 @@ Nothing in the numeric core imports numpy/scipy/pandas; ``pydantic`` is used
 only by :mod:`betapair.models` for the serialisable report schema.
 """
 
+from importlib.metadata import PackageNotFoundError, version
+
 from betapair.beta import beta_cdf, beta_pdf, beta_ppf, beta_sf
 from betapair.hierarchy import (
     Cell,
     CellPosterior,
     CellPosteriors,
-    Fit,
+    HierarchyFit,
     Homogeneity,
     cell_posteriors,
     fit,
@@ -92,6 +96,14 @@ from betapair.report import (
 from betapair.series import ScoreBand, ScorePoint, retrospective, score_band
 from betapair.tracker import ERROR, FAILED, RETIRED, HealthTracker, PairRecord
 
+try:
+    __version__ = version("betapair")
+except PackageNotFoundError:  # pragma: no cover - a source checkout never installed
+    __version__ = "0.0.0"
+
+#: The top-level surface. Every name is declared in the ``__all__`` of the
+#: module that owns it; ``tests/test_surface.py`` asserts this list matches the
+#: submodule declarations, so it cannot silently drift.
 __all__ = [
     "DEFAULT_CATEGORY",
     "ERROR",
@@ -107,11 +119,11 @@ __all__ = [
     "CellPosteriors",
     "CellVerdict",
     "Coverage",
-    "Fit",
     "GroupSummary",
     "Guardrail",
     "HealthReport",
     "HealthTracker",
+    "HierarchyFit",
     "HierarchySummary",
     "Homogeneity",
     "IrTSummary",
@@ -134,6 +146,7 @@ __all__ = [
     "SwitchEvidence",
     "UnpairedCell",
     "Weighting",
+    "__version__",
     "bank_digest",
     "beta_cdf",
     "beta_pdf",

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import random
 import unittest
 
@@ -810,6 +811,50 @@ class ReportOptionsTest(unittest.TestCase):
         report = build_report([cell("a", 3, 1, 10)], weights={"answer": 0.0}, **FAST)
         self.assertEqual(report.status, "insufficient")
         self.assertEqual(report.guardrail.reason, "all outcome weights are zero")
+
+
+class SchemaTest(unittest.TestCase):
+    """The persisted JSON is a contract, not a suggestion."""
+
+    def _report(self) -> HealthReport:
+        return build_report([cell("a", 5, 2, 20), cell("b", 1, 3, 12)], **FAST)
+
+    def test_load_json_round_trips_and_checks_the_version(self) -> None:
+        report = self._report()
+        self.assertEqual(
+            HealthReport.load_json(report.model_dump_json()).model_dump(), report.model_dump()
+        )
+        payload = json.loads(report.model_dump_json())
+        payload["version"] = REPORT_VERSION - 1
+        with self.assertRaises(ValueError):
+            HealthReport.load_json(json.dumps(payload))
+
+    def test_unknown_keys_are_rejected(self) -> None:
+        payload = json.loads(self._report().model_dump_json())
+        payload["surprise"] = 1
+        with self.assertRaises(ValueError):
+            HealthReport.model_validate(payload)
+
+    def test_reports_are_frozen(self) -> None:
+        report = self._report()
+        with self.assertRaises(ValueError):
+            report.score = 1.0  # type: ignore[misc]
+
+    def test_out_of_range_scores_are_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            HealthReport(status="stable", score=140.0)
+        with self.assertRaises(ValueError):
+            HealthReport(status="stable", score=-1.0)
+
+    def test_credible_bounds_are_all_or_none(self) -> None:
+        with self.assertRaises(ValueError):
+            HealthReport(status="insufficient", score_low=10.0)
+        with self.assertRaises(ValueError):
+            HealthReport(status="insufficient", delta_pp=1.0)
+
+    def test_credible_bounds_must_be_ordered(self) -> None:
+        with self.assertRaises(ValueError):
+            HealthReport(status="stable", score=50.0, score_low=60.0, score_high=40.0)
 
 
 class CoverageGateTest(unittest.TestCase):
