@@ -1,4 +1,4 @@
-![betapair](docs/betapair.png)
+![betapair](https://raw.githubusercontent.com/nicedata-work/betapair/main/docs/betapair.png)
 
 # betapair
 
@@ -274,7 +274,7 @@ only taken from the series when there is enough history to measure it.
 The seeded operating characteristics behind those three thresholds — verdict
 stability as volatility changes, the prior's power against the measured base
 rate, and the gate's behaviour on a healthy vs stalled pipeline — are
-generated into [`docs/validation.md`](docs/validation.md) by
+generated into [`docs/validation.md`](https://github.com/nicedata-work/betapair/blob/main/docs/validation.md) by
 `uv run python tools/calibration.py --write`.
 
 ## Everyday extras
@@ -468,7 +468,7 @@ bridge the banks — but that is an assumption, not a measurement.
 
 The seeded evidence behind the adjusted interval's coverage, the cost of weak
 linking, and how much bank bias equating removes is generated into
-[`docs/validation.md`](docs/validation.md) by `tools/calibration.py`.
+[`docs/validation.md`](https://github.com/nicedata-work/betapair/blob/main/docs/validation.md) by `tools/calibration.py`.
 
 **Some groups matter more.** Tag them and weight the tags:
 
@@ -580,11 +580,12 @@ uv run ruff format .    # format
 uv run mypy             # type-check
 ```
 
-The seeded operating characteristics in [`docs/validation.md`](docs/validation.md)
+The seeded operating characteristics in
+[`docs/validation.md`](https://github.com/nicedata-work/betapair/blob/main/docs/validation.md)
 are regenerated with `uv run python tools/calibration.py --write`. CI runs
 `uv run python tools/calibration.py --check`, which fails with a diff if that
 document is stale, so a statistical change and its evidence land together.
 
 ## License
 
-Apache-2.0 — see [`LICENSE`](LICENSE).
+Apache-2.0 — see [`LICENSE`](https://github.com/nicedata-work/betapair/blob/main/LICENSE).
